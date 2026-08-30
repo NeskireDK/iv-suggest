@@ -1,0 +1,9 @@
+[Unit]
+Description=Reorder the Invidious suggestion lanes (hourly, no YouTube fetches)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/iv-suggest shuffle
+TimeoutStartSec=600

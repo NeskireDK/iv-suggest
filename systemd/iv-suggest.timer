@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly suggestion lanes (before the 05:00 invidious restart)
+
+[Timer]
+OnCalendar=03:30
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target
