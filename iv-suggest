@@ -1695,8 +1695,13 @@ def cmd_metrics(args):
             out.append("iv_suggest_%s%s %s" % (name, labels, value))
 
     def tag(lane):
-        return '{lane="%s",policy="%s",plid="%s"}' % (
-            lane["id"], lane["policy"], plids.get(lane["id"], ""))
+        # `expand` is exported so an alert can tell a lane whose supply is a
+        # fixed age window (subscription_feed) from one drawing on a growing
+        # recommendation graph. The first legitimately takes no new video for
+        # weeks when nothing was published; the second going quiet is a fault.
+        return '{lane="%s",policy="%s",expand="%s",plid="%s"}' % (
+            lane["id"], lane["policy"], lane["expand"],
+            plids.get(lane["id"], ""))
 
     metric("scrape_timestamp_seconds",
            "When this exporter last read the database.", "gauge",
