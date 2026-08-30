@@ -1,0 +1,851 @@
+From 51b3161f12af9255c6ae1d4734556d8143c7d28a Mon Sep 17 00:00:00 2001
+From: Andre Eriksen <10115530+NeskireDK@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 20:16:22 +0200
+Subject: [PATCH] Record the content kind of subscription feed entries
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Invidious has no way to tell a Short from a long-form upload in a feed.
+`ChannelVideo#to_json` reports `"type": "shortVideo"` for every row —
+legacy naming for "abbreviated video object" — and `VideoType` exists
+only on the full watch-page object, with no Short member. Length cannot
+stand in: `channel_videos.length_seconds` is only filled for entries that
+also appeared in the channel's Videos tab, so Shorts and stream VODs both
+land as 0. On one 75-channel instance that was 531 of 1586 rows (34%).
+
+YouTube publishes the missing signal as a per-channel uploads playlist
+per kind, addressed by replacing the "UC" of the channel ID: UULF
+long-form, UUSH Shorts, UULV live, each served by
+/feeds/videos.xml?playlist_id=. Measured over those 75 channels, 15
+newest entries each: 1114 long-form, 679 Shorts, 299 live, and one Short
+leaking into a UULF feed.
+
+ClassifyChannelVideosJob labels `kind` from those feeds in two passes —
+the Shorts and live windows per channel, then a capped `HEAD /shorts/<id>`
+probe (200 = Short, 303 = not) for rows older than a 15-entry window.
+`feed_kinds` restricts the subscription feed through a predicate in each
+user's materialized view, and ChannelVideo now reports the real type.
+
+Deliberately a separate job rather than an edit to `fetch_channel`, and
+`kind` is absent from the insert's `ON CONFLICT DO UPDATE` set, so a
+channel refresh cannot overwrite a label. Views are rebuilt beside the
+live one and swapped in, never dropped first.
+
+Unclassified entries are always shown and an empty `feed_kinds` admits
+everything, so neither a late job nor a bad value can blank a feed.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ config/config.example.yml                     |  20 ++
+ config/sql/channel_videos.sql                 |   1 +
+ spec/invidious/feed_kinds_spec.cr             | 165 ++++++++++
+ src/invidious.cr                              |   3 +
+ src/invidious/channels/channels.cr            |   8 +-
+ src/invidious/config.cr                       |   5 +
+ src/invidious/database/channels.cr            |   4 +-
+ .../migrations/0011_add_channel_video_kind.cr |  37 +++
+ src/invidious/feed_kinds.cr                   | 124 ++++++++
+ .../jobs/classify_channel_videos_job.cr       | 287 ++++++++++++++++++
+ src/invidious/routes/feeds.cr                 |   1 +
+ src/invidious/users.cr                        |   5 +-
+ 12 files changed, 657 insertions(+), 3 deletions(-)
+ create mode 100644 spec/invidious/feed_kinds_spec.cr
+ create mode 100644 src/invidious/database/migrations/0011_add_channel_video_kind.cr
+ create mode 100644 src/invidious/feed_kinds.cr
+ create mode 100644 src/invidious/jobs/classify_channel_videos_job.cr
+
+diff --git a/config/config.example.yml b/config/config.example.yml
+index 56c5162..5ba3ba2 100644
+--- a/config/config.example.yml
++++ b/config/config.example.yml
+@@ -370,6 +370,26 @@ https_only: false
+ ##
+ #login_enabled: true
+ 
++##
++## Subscription feed content kinds.
++##
++## Which kinds of upload the subscription feed shows. YouTube publishes a
++## per-channel uploads playlist per kind (UULF long-form, UUSH Shorts,
++## UULV live), so ClassifyChannelVideosJob labels each row from YouTube's
++## own classification rather than guessing from the length: a 27-second
++## clip and a 5-hour stream VOD both reach channel_videos with
++## length_seconds = 0.
++##
++## An entry the classifier has not reached yet is ALWAYS shown, and an
++## empty list admits everything, so neither a late job nor a bad value
++## can blank the feed.
++##
++## Accepted values: any of video, short, live
++## Default: ["video"]
++##
++#feed_kinds:
++#  - video
++
+ ##
+ ## Enable/Disable the captcha challenge on the login page.
+ ##
+diff --git a/config/sql/channel_videos.sql b/config/sql/channel_videos.sql
+index cd4e0ff..699e2fa 100644
+--- a/config/sql/channel_videos.sql
++++ b/config/sql/channel_videos.sql
+@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS public.channel_videos
+   live_now boolean,
+   premiere_timestamp timestamp with time zone,
+   views bigint,
++  kind text,
+   CONSTRAINT channel_videos_id_key UNIQUE (id)
+ );
+ 
+diff --git a/spec/invidious/feed_kinds_spec.cr b/spec/invidious/feed_kinds_spec.cr
+new file mode 100644
+index 0000000..e086042
+--- /dev/null
++++ b/spec/invidious/feed_kinds_spec.cr
+@@ -0,0 +1,165 @@
++require "../spec_helper"
++require "../../src/invidious/feed_kinds"
++
++Spectator.describe Invidious::FeedKinds do
++  alias Kinds = Invidious::FeedKinds
++
++  UCID = "UC7qUL2EsTHpNcgsz7woW9Iw"
++
++  describe ".uploads_playlist_id" do
++    it "swaps the UC prefix for the kind's prefix" do
++      expect(Kinds.uploads_playlist_id(UCID, "video")).to eq("UULF7qUL2EsTHpNcgsz7woW9Iw")
++      expect(Kinds.uploads_playlist_id(UCID, "short")).to eq("UUSH7qUL2EsTHpNcgsz7woW9Iw")
++      expect(Kinds.uploads_playlist_id(UCID, "live")).to eq("UULV7qUL2EsTHpNcgsz7woW9Iw")
++    end
++
++    it "keeps the ID length, so the suffix is never truncated" do
++      plid = Kinds.uploads_playlist_id(UCID, "short").not_nil!
++      expect(plid.size).to eq(UCID.size + 2)
++      expect(plid.ends_with?(UCID[2..])).to be_true
++    end
++
++    it "refuses an ID that is not a channel ID" do
++      expect(Kinds.uploads_playlist_id("PL7qUL2EsTHpNcgsz7woW9Iw", "short")).to be_nil
++      expect(Kinds.uploads_playlist_id("UC", "short")).to be_nil
++      expect(Kinds.uploads_playlist_id("UCtooshort", "short")).to be_nil
++      expect(Kinds.uploads_playlist_id("UC7qUL2EsTHpNcgsz7woW9I/", "short")).to be_nil
++    end
++
++    it "refuses a kind it does not know" do
++      expect(Kinds.uploads_playlist_id(UCID, "premiere")).to be_nil
++      expect(Kinds.uploads_playlist_id(UCID, "")).to be_nil
++    end
++  end
++
++  describe ".feed_resource" do
++    it "addresses the playlist feed, not the channel feed" do
++      expect(Kinds.feed_resource(UCID, "short"))
++        .to eq("/feeds/videos.xml?playlist_id=UUSH7qUL2EsTHpNcgsz7woW9Iw")
++    end
++
++    it "is nil for an unusable channel or kind" do
++      expect(Kinds.feed_resource("nonsense", "short")).to be_nil
++      expect(Kinds.feed_resource(UCID, "nonsense")).to be_nil
++    end
++  end
++
++  describe ".kind_from_probe_status" do
++    it "reads YouTube's answer: 200 is a Short, a redirect is not" do
++      expect(Kinds.kind_from_probe_status(200)).to eq("short")
++      expect(Kinds.kind_from_probe_status(303)).to eq("video")
++      expect(Kinds.kind_from_probe_status(301)).to eq("video")
++      expect(Kinds.kind_from_probe_status(302)).to eq("video")
++    end
++
++    it "gives no answer for a status that carries none" do
++      expect(Kinds.kind_from_probe_status(429)).to be_nil
++      expect(Kinds.kind_from_probe_status(500)).to be_nil
++      expect(Kinds.kind_from_probe_status(404)).to be_nil
++    end
++  end
++
++  describe ".visible?" do
++    it "hides a kind the feed does not admit" do
++      expect(Kinds.visible?("short", ["video"])).to be_false
++      expect(Kinds.visible?("live", ["video"])).to be_false
++      expect(Kinds.visible?("video", ["video"])).to be_true
++      expect(Kinds.visible?("live", ["video", "live"])).to be_true
++    end
++
++    it "shows an unclassified entry" do
++      expect(Kinds.visible?(nil, ["video"])).to be_true
++    end
++
++    it "shows an entry whose stored kind is not one we know" do
++      expect(Kinds.visible?("premiere", ["video"])).to be_true
++    end
++
++    it "shows everything when nothing is configured" do
++      expect(Kinds.visible?("short", [] of String)).to be_true
++    end
++  end
++
++  describe ".json_type" do
++    it "reports the kind in the vocabulary clients use for search results" do
++      expect(Kinds.json_type("video")).to eq("video")
++      expect(Kinds.json_type("short")).to eq("shortVideo")
++      expect(Kinds.json_type("live")).to eq("stream")
++    end
++
++    it "calls an unclassified entry a video, not a Short" do
++      expect(Kinds.json_type(nil)).to eq("video")
++      expect(Kinds.json_type("premiere")).to eq("video")
++    end
++  end
++
++  describe ".clean_kinds" do
++    it "accepts the known kinds and fixes their order" do
++      cleaned, errors = Kinds.clean_kinds(["live", "video"])
++      expect(cleaned).to eq(["video", "live"])
++      expect(errors).to be_empty
++    end
++
++    it "drops blanks and duplicates, and normalizes case" do
++      cleaned, errors = Kinds.clean_kinds(["VIDEO", " video ", "", "  "])
++      expect(cleaned).to eq(["video"])
++      expect(errors).to be_empty
++    end
++
++    it "reports anything that is not a kind" do
++      cleaned, errors = Kinds.clean_kinds(["video", "premiere"])
++      expect(cleaned).to eq(["video"])
++      expect(errors.size).to eq(1)
++      expect(errors[0]).to contain("premiere")
++    end
++  end
++
++  describe ".decode_kinds" do
++    it "returns nothing for a missing row, so the config stays authoritative" do
++      kinds, error = Kinds.decode_kinds(nil)
++      expect(kinds).to be_nil
++      expect(error).to be_nil
++    end
++
++    it "decodes a stored list" do
++      kinds, error = Kinds.decode_kinds(%(["video", "live"]))
++      expect(kinds).to eq(["video", "live"])
++      expect(error).to be_nil
++    end
++
++    it "refuses a malformed row instead of raising" do
++      kinds, error = Kinds.decode_kinds(%({"video": true}))
++      expect(kinds).to be_nil
++      expect(error).not_to be_nil
++
++      kinds, error = Kinds.decode_kinds(%(["premiere"]))
++      expect(kinds).to be_nil
++      expect(error.not_nil!).to contain("premiere")
++    end
++  end
++
++  describe ".view_predicate" do
++    it "admits NULL alongside the configured kinds" do
++      predicate = Kinds.view_predicate(["video"], "cv.kind")
++      expect(predicate).to contain("cv.kind IS NULL")
++      expect(predicate).to contain("cv.kind IN ('video')")
++      expect(predicate).to start_with(" AND (")
++    end
++
++    it "lists every configured kind" do
++      predicate = Kinds.view_predicate(["video", "live"], "cv.kind")
++      expect(predicate).to contain("'video', 'live'")
++    end
++
++    it "is empty when the feed admits everything" do
++      expect(Kinds.view_predicate([] of String, "cv.kind")).to eq("")
++      expect(Kinds.view_predicate(["video", "short", "live"], "cv.kind")).to eq("")
++    end
++
++    it "only ever emits the kinds it validated" do
++      cleaned, _ = Kinds.clean_kinds(["video'; DROP TABLE users; --"])
++      expect(cleaned).to be_empty
++      expect(Kinds.view_predicate(cleaned, "cv.kind")).to eq("")
++    end
++  end
++end
+diff --git a/src/invidious.cr b/src/invidious.cr
+index 09fbb62..20351a0 100644
+--- a/src/invidious.cr
++++ b/src/invidious.cr
+@@ -188,6 +188,9 @@ Invidious::Jobs.register Invidious::Jobs::NotificationJob.new(NOTIFICATION_CHANN
+ 
+ Invidious::Jobs.register Invidious::Jobs::ClearExpiredItemsJob.new
+ 
++# Labels subscription feed rows with their content kind.
++Invidious::Jobs.register Invidious::Jobs::ClassifyChannelVideosJob.new(PG_DB)
++
+ Invidious::Jobs.register Invidious::Jobs::InstanceListRefreshJob.new
+ 
+ Invidious::Jobs.start_all
+diff --git a/src/invidious/channels/channels.cr b/src/invidious/channels/channels.cr
+index 64f0484..fffbd64 100644
+--- a/src/invidious/channels/channels.cr
++++ b/src/invidious/channels/channels.cr
+@@ -21,10 +21,14 @@ struct ChannelVideo
+   property live_now : Bool = false
+   property premiere_timestamp : Time? = nil
+   property views : Int64? = nil
++  # content kind, nil until the classifier job has answered.
++  property kind : String? = nil
+ 
+   def to_json(locale, json : JSON::Builder)
+     json.object do
+-      json.field "type", "shortVideo"
++      # upstream hardcodes "shortVideo" for every row, which tells a
++      # client nothing. Report the real kind.
++      json.field "type", Invidious::FeedKinds.json_type(self.kind)
+ 
+       json.field "title", self.title
+       json.field "videoId", self.id
+@@ -239,6 +243,7 @@ def fetch_channel(ucid, pull_all_videos : Bool)
+       live_now:           live_now,
+       premiere_timestamp: premiere_timestamp,
+       views:              views,
++      kind:               nil,
+     })
+ 
+     LOGGER.trace("fetch_channel: #{ucid} : video #{video_id} : Updating or inserting video")
+@@ -274,6 +279,7 @@ def fetch_channel(ucid, pull_all_videos : Bool)
+           live_now:           video.badges.live_now?,
+           premiere_timestamp: video.premiere_timestamp,
+           views:              video.views,
++          kind:               nil,
+         })
+ 
+         # We are notified of Red videos elsewhere (PubSub), which includes a correct published date,
+diff --git a/src/invidious/config.cr b/src/invidious/config.cr
+index 58b77cb..59b1322 100644
+--- a/src/invidious/config.cr
++++ b/src/invidious/config.cr
+@@ -132,6 +132,11 @@ class Config
+   # Subscribe to channels using PubSubHubbub (requires domain, hmac_key)
+   property use_pubsub_feeds : Bool | Int32 = false
+   property popular_enabled : Bool = true
++  # Content kinds the subscription feed admits: "video" (long-form), "short",
++  # "live". An entry the classifier has not reached yet is always shown and an
++  # empty list admits everything, so the feed cannot end up blank.
++  # See Invidious::FeedKinds and Jobs::ClassifyChannelVideosJob.
++  property feed_kinds : Array(String) = ["video"]
+   property captcha_enabled : Bool = true
+   property login_enabled : Bool = true
+   property registration_enabled : Bool = true
+diff --git a/src/invidious/database/channels.cr b/src/invidious/database/channels.cr
+index df44e48..277c49c 100644
+--- a/src/invidious/database/channels.cr
++++ b/src/invidious/database/channels.cr
+@@ -105,9 +105,11 @@ module Invidious::Database::ChannelVideos
+       last_items = "views = $10"
+     end
+ 
++    # `kind` ($11) is set on insert and deliberately absent from the
++    # UPDATE set, so a channel refresh cannot wipe the classifier's answer.
+     request = <<-SQL
+       INSERT INTO channel_videos
+-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
++      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       ON CONFLICT (id) DO UPDATE
+       SET title = $2, published = $3, updated = $4, ucid = $5,
+           author = $6, length_seconds = $7, live_now = $8, #{last_items}
+diff --git a/src/invidious/database/migrations/0011_add_channel_video_kind.cr b/src/invidious/database/migrations/0011_add_channel_video_kind.cr
+new file mode 100644
+index 0000000..a98d2f4
+--- /dev/null
++++ b/src/invidious/database/migrations/0011_add_channel_video_kind.cr
+@@ -0,0 +1,37 @@
++module Invidious::Database::Migrations
++  # Content kind of a subscription feed entry. See `Invidious::FeedKinds`.
++  #
++  # Nullable with no default: NULL means "not classified yet" and the feed
++  # shows those. A default of 'video' would hide which rows still owe an
++  # answer.
++  class AddChannelVideoKind < Migration
++    version 11
++
++    def up(conn : DB::Connection)
++      conn.exec <<-SQL
++      ALTER TABLE public.channel_videos
++        ADD COLUMN IF NOT EXISTS kind text;
++      SQL
++
++      conn.exec <<-SQL
++      CREATE INDEX IF NOT EXISTS channel_videos_unclassified_idx
++        ON public.channel_videos
++        USING btree (ucid COLLATE pg_catalog."default")
++        WHERE kind IS NULL;
++      SQL
++
++      # Records which kinds the subscription views were last built for, so a
++      # restart does no DDL. A materialized view bakes its predicate in at
++      # CREATE time, so the value cannot be read back off the view.
++      conn.exec <<-SQL
++      CREATE TABLE IF NOT EXISTS public.feed_kind_state
++      (
++        key text NOT NULL,
++        value text,
++        updated timestamp with time zone,
++        CONSTRAINT feed_kind_state_key_key PRIMARY KEY (key)
++      );
++      SQL
++    end
++  end
++end
+diff --git a/src/invidious/feed_kinds.cr b/src/invidious/feed_kinds.cr
+new file mode 100644
+index 0000000..4498147
+--- /dev/null
++++ b/src/invidious/feed_kinds.cr
+@@ -0,0 +1,124 @@
++require "json"
++
++# Content kinds for subscription feed entries.
++#
++# Upstream has no usable signal: `ChannelVideo#to_json` reports
++# `"type": "shortVideo"` for every row, and `channel_videos.length_seconds` is
++# 0 for anything absent from the channel's Videos tab — Shorts and stream VODs
++# alike. YouTube's per-channel uploads playlists supply it instead, addressed
++# by replacing the "UC" of the channel ID: UULF long-form, UUSH Shorts, UULV
++# live. Measured over 75 channels: 1 Short leaked into a UULF feed out of 679.
++#
++# Pure module. `Jobs::ClassifyChannelVideosJob` does the IO.
++module Invidious::FeedKinds
++  extend self
++
++  KIND_VIDEO = "video"
++  KIND_SHORT = "short"
++  KIND_LIVE  = "live"
++
++  KINDS = [KIND_VIDEO, KIND_SHORT, KIND_LIVE]
++
++  PLAYLIST_PREFIX = {
++    KIND_VIDEO => "UULF",
++    KIND_SHORT => "UUSH",
++    KIND_LIVE  => "UULV",
++  }
++
++  # Validated, not assumed: a malformed ID would become a playlist ID that
++  # returns somebody else's feed.
++  UCID_REGEX = /\AUC[A-Za-z0-9_-]{22}\z/
++
++  def uploads_playlist_id(ucid : String, kind : String) : String?
++    return nil if !UCID_REGEX.matches?(ucid)
++
++    prefix = PLAYLIST_PREFIX[kind]?
++    return nil if prefix.nil?
++
++    "#{prefix}#{ucid[2..]}"
++  end
++
++  def feed_resource(ucid : String, kind : String) : String?
++    plid = uploads_playlist_id(ucid, kind)
++    return nil if plid.nil?
++
++    "/feeds/videos.xml?playlist_id=#{plid}"
++  end
++
++  def shorts_probe_resource(id : String) : String
++    "/shorts/#{id}"
++  end
++
++  # YouTube answers 200 for a Short, 303 for anything else. A status that says
++  # nothing leaves the row unclassified rather than guessing.
++  def kind_from_probe_status(status : Int32) : String?
++    case status
++    when 200                     then KIND_SHORT
++    when 301, 302, 303, 307, 308 then KIND_VIDEO
++    else                              nil
++    end
++  end
++
++  def known?(kind : String?) : Bool
++    !kind.nil? && KINDS.includes?(kind)
++  end
++
++  def json_type(kind : String?) : String
++    case kind
++    when KIND_SHORT then "shortVideo"
++    when KIND_LIVE  then "stream"
++    else                 "video"
++    end
++  end
++
++  # Fail-open: an unclassified row is shown, and an empty `allowed` shows
++  # everything. A late or broken classifier must never blank a feed.
++  def visible?(kind : String?, allowed : Array(String)) : Bool
++    return true if allowed.empty?
++    return true if !known?(kind)
++
++    allowed.includes?(kind)
++  end
++
++  def clean_kinds(entries : Array(String)) : {Array(String), Array(String)}
++    cleaned = [] of String
++    errors = [] of String
++
++    entries.each do |entry|
++      kind = entry.strip.downcase
++      next if kind.empty?
++
++      if !KINDS.includes?(kind)
++        errors << "'#{kind}' is not a content kind (#{KINDS.join(", ")})"
++        next
++      end
++
++      cleaned << kind if !cleaned.includes?(kind)
++    end
++
++    {KINDS.select { |kind| cleaned.includes?(kind) }, errors}
++  end
++
++  # Never raises: one bad row must not stop the instance from booting.
++  def decode_kinds(raw : String?) : {Array(String)?, String?}
++    return {nil, nil} if raw.nil?
++
++    kinds = Array(String).from_json(raw)
++    cleaned, errors = clean_kinds(kinds)
++    return {nil, errors.join("; ")} if !errors.empty?
++
++    {cleaned, nil}
++  rescue ex
++    {nil, "not a JSON list of content kinds (#{ex.message})"}
++  end
++
++  # `IS NULL` is inside the predicate so the fail-open rule holds within the
++  # materialized view too. Only ever receives `clean_kinds` output.
++  def view_predicate(allowed : Array(String), column : String = "kind") : String
++    return "" if allowed.empty?
++    return "" if KINDS.all? { |kind| allowed.includes?(kind) }
++
++    list = allowed.map { |kind| "'#{kind}'" }.join(", ")
++    " AND (#{column} IS NULL OR #{column} IN (#{list}))"
++  end
++end
+diff --git a/src/invidious/jobs/classify_channel_videos_job.cr b/src/invidious/jobs/classify_channel_videos_job.cr
+new file mode 100644
+index 0000000..e2568dd
+--- /dev/null
++++ b/src/invidious/jobs/classify_channel_videos_job.cr
+@@ -0,0 +1,287 @@
++# Labels subscription feed rows with their content kind.
++#
++# A separate job rather than an edit to `fetch_channel`: this branch rebases
++# onto release tags, and that function is one upstream changes most. `kind` is
++# also absent from the insert's `ON CONFLICT DO UPDATE` set, so a channel
++# refresh cannot overwrite a label.
++#
++# Two passes, because a 15-entry feed window cannot answer for the whole table:
++# the Shorts and live windows per channel, then a capped `/shorts/<id>` probe
++# for rows older than those windows. The probe only answers short/not-short, so
++# a stream VOD in the tail is labelled `video`.
++class Invidious::Jobs::ClassifyChannelVideosJob < Invidious::Jobs::BaseJob
++  private getter db : DB::Database
++
++  INTERVAL          = 15.minutes
++  CHANNELS_PER_TICK = 25
++  PROBES_PER_TICK   = 60
++  REQUEST_DELAY     = 500.milliseconds
++
++  # `oldest` nil means the window carried nothing, which is a valid answer —
++  # no uploads of that kind, so YouTube 404s the playlist. A window that could
++  # not be *read* is a nil window.
++  alias Window = {ids: Array(String), oldest: Time?}
++
++  # Kinds the existing views were built for. In the database, not memory, so a
++  # restart does no DDL.
++  APPLIED_KEY = "feed_kinds_applied"
++
++  def initialize(@db)
++  end
++
++  def begin
++    loop do
++      begin
++        reconcile_subscription_views
++      rescue ex
++        LOGGER.error("ClassifyChannelVideosJob: cannot reconcile the subscription views (#{ex.message})")
++      end
++
++      begin
++        classified = run_window_pass + run_tail_pass
++        LOGGER.debug("ClassifyChannelVideosJob: classified #{classified} video(s)")
++      rescue ex
++        LOGGER.error("ClassifyChannelVideosJob: #{ex.message}")
++      end
++
++      sleep INTERVAL
++    end
++  end
++
++  private def run_window_pass : Int32
++    labelled = 0
++
++    pending_channels.each do |ucid|
++      begin
++        shorts = feed_window(ucid, Invidious::FeedKinds::KIND_SHORT)
++        lives = feed_window(ucid, Invidious::FeedKinds::KIND_LIVE)
++
++        # Eliminating against a half-read pair would call a Short long-form.
++        next if shorts.nil? || lives.nil?
++
++        labelled += apply_window(ucid, shorts, lives)
++      rescue ex
++        LOGGER.error("ClassifyChannelVideosJob: #{ucid} : #{ex.message}")
++      end
++    end
++
++    labelled
++  end
++
++  private def apply_window(ucid : String, shorts : Window, lives : Window) : Int32
++    labelled = write_kind(shorts[:ids], Invidious::FeedKinds::KIND_SHORT)
++    labelled += write_kind(lives[:ids], Invidious::FeedKinds::KIND_LIVE)
++
++    if shorts[:ids].empty? && lives[:ids].empty?
++      # Neither kind exists for this channel, so elimination holds for its
++      # whole history and the tail pass never has to see it.
++      request = <<-SQL
++        UPDATE channel_videos SET kind = $1
++        WHERE ucid = $2 AND kind IS NULL
++      SQL
++
++      return labelled + PG_DB.exec(
++        request, Invidious::FeedKinds::KIND_VIDEO, ucid
++      ).rows_affected.to_i32
++    end
++
++    # Elimination is sound only as far back as both windows saw. Past that a
++    # row's absence proves nothing, so it is left to the tail pass.
++    horizon = [shorts[:oldest], lives[:oldest]].compact.max?
++    return labelled if horizon.nil?
++
++    request = <<-SQL
++      UPDATE channel_videos SET kind = $1
++      WHERE ucid = $2 AND kind IS NULL AND published >= $3
++    SQL
++
++    labelled + PG_DB.exec(
++      request, Invidious::FeedKinds::KIND_VIDEO, ucid, horizon
++    ).rows_affected.to_i32
++  end
++
++  private def run_tail_pass : Int32
++    labelled = 0
++
++    pending_tail_videos.each do |id|
++      begin
++        kind = probe_kind(id)
++        next if kind.nil?
++
++        labelled += write_kind([id], kind)
++      rescue ex
++        LOGGER.error("ClassifyChannelVideosJob: probe #{id} : #{ex.message}")
++      end
++    end
++
++    labelled
++  end
++
++  private def feed_window(ucid : String, kind : String) : Window?
++    resource = Invidious::FeedKinds.feed_resource(ucid, kind)
++    return nil if resource.nil?
++
++    sleep REQUEST_DELAY
++    response = YT_POOL.client &.get(resource)
++
++    return {ids: [] of String, oldest: nil} if response.status_code == 404
++    return nil if response.status_code != 200
++
++    namespaces = {
++      "yt"      => "http://www.youtube.com/xml/schemas/2015",
++      "default" => "http://www.w3.org/2005/Atom",
++    }
++
++    rss = XML.parse(response.body)
++    ids = [] of String
++    oldest = nil.as(Time?)
++
++    rss.xpath_nodes("//default:feed/default:entry", namespaces).each do |entry|
++      id = entry.xpath_node("yt:videoId", namespaces).try &.content
++      next if id.nil?
++      ids << id
++
++      raw = entry.xpath_node("default:published", namespaces).try &.content
++      next if raw.nil?
++
++      published = Time.parse_rfc3339(raw) rescue nil
++      next if published.nil?
++
++      current = oldest
++      oldest = published if current.nil? || published < current
++    end
++
++    {ids: ids, oldest: oldest}
++  rescue ex
++    LOGGER.trace("ClassifyChannelVideosJob: #{ucid} #{kind} feed : #{ex.message}")
++    nil
++  end
++
++  private def probe_kind(id : String) : String?
++    sleep REQUEST_DELAY
++    response = YT_POOL.client &.head(Invidious::FeedKinds.shorts_probe_resource(id))
++    Invidious::FeedKinds.kind_from_probe_status(response.status_code)
++  rescue ex
++    LOGGER.trace("ClassifyChannelVideosJob: probe #{id} : #{ex.message}")
++    nil
++  end
++
++  private def pending_channels : Array(String)
++    request = <<-SQL
++      SELECT ucid FROM channel_videos
++      WHERE kind IS NULL AND ucid IS NOT NULL
++      GROUP BY ucid
++      ORDER BY count(*) DESC
++      LIMIT $1
++    SQL
++
++    PG_DB.query_all(request, CHANNELS_PER_TICK, as: String)
++  end
++
++  private def pending_tail_videos : Array(String)
++    request = <<-SQL
++      SELECT id FROM channel_videos
++      WHERE kind IS NULL
++      ORDER BY published DESC
++      LIMIT $1
++    SQL
++
++    PG_DB.query_all(request, PROBES_PER_TICK, as: String)
++  end
++
++  # Only ever writes over NULL, so a later pass cannot undo the probe's answer.
++  private def write_kind(ids : Array(String), kind : String) : Int32
++    return 0 if ids.empty?
++
++    request = <<-SQL
++      UPDATE channel_videos SET kind = $1
++      WHERE id = ANY($2) AND kind IS NULL
++    SQL
++
++    PG_DB.exec(request, kind, ids).rows_affected.to_i32
++  end
++
++  # A materialized view bakes the predicate in at CREATE time and `REFRESH`
++  # re-runs that stored definition, so a view made before this feature keeps
++  # serving every kind until it is recreated.
++  private def reconcile_subscription_views : Nil
++    wanted = CONFIG.feed_kinds.to_json
++    return if applied_kinds == wanted && views_current?
++
++    # Only on a clean sweep: a marker written after a failed rebuild would
++    # stop the job ever trying again.
++    store_applied_kinds(wanted) if rebuild_subscription_views
++  end
++
++  private def applied_kinds : String?
++    PG_DB.query_one?("SELECT value FROM feed_kind_state WHERE key = $1",
++      APPLIED_KEY, as: String?)
++  rescue ex
++    LOGGER.error("ClassifyChannelVideosJob: cannot read #{APPLIED_KEY} (#{ex.message})")
++    nil
++  end
++
++  private def store_applied_kinds(value : String) : Nil
++    request = <<-SQL
++      INSERT INTO feed_kind_state (key, value, updated)
++      VALUES ($1, $2, now())
++      ON CONFLICT (key) DO UPDATE
++      SET value = EXCLUDED.value, updated = EXCLUDED.updated
++    SQL
++
++    PG_DB.exec(request, APPLIED_KEY, value)
++  end
++
++  # False when any user's view is missing or predates the `kind` column.
++  #
++  # pg_catalog, not information_schema: materialized views do not appear in
++  # information_schema at all, so a check there silently passes for ever.
++  # `left(..., 63)` mirrors the identifier truncation Postgres applies to
++  # these names, which are 77 characters long.
++  private def views_current? : Bool
++    request = <<-SQL
++      SELECT count(*) FROM users u
++      WHERE NOT EXISTS (
++        SELECT 1 FROM pg_class c
++        JOIN pg_attribute a
++          ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
++        WHERE c.relkind = 'm'
++          AND c.relname = left('subscriptions_' || encode(sha256(u.email::bytea), 'hex'), 63)
++          AND a.attname = 'kind'
++      )
++    SQL
++
++    PG_DB.query_one(request, as: Int64) == 0
++  end
++
++  # Builds each view beside the live one and swaps it in, so a CREATE that
++  # fails leaves the user's feed alone. Dropping first cost both subscription
++  # feeds on 2026-08-30, when the column the new definition referenced did not
++  # exist yet.
++  private def rebuild_subscription_views : Bool
++    swept = true
++
++    PG_DB.query_all("SELECT email FROM users", as: String).each do |email|
++      view = "subscriptions_#{sha256(email)}"
++      staging = "arik_staging_#{sha256(email)[0..31]}"
++
++      begin
++        PG_DB.exec("DROP MATERIALIZED VIEW IF EXISTS #{staging}")
++        PG_DB.exec("CREATE MATERIALIZED VIEW #{staging} AS #{MATERIALIZED_VIEW_SQL.call(email)}")
++
++        PG_DB.transaction do |tx|
++          tx.connection.exec("DROP MATERIALIZED VIEW IF EXISTS #{view}")
++          tx.connection.exec("ALTER MATERIALIZED VIEW #{staging} RENAME TO #{view}")
++        end
++
++        LOGGER.info("ClassifyChannelVideosJob: rebuilt #{view} for kinds #{CONFIG.feed_kinds.join(",")}")
++      rescue ex
++        swept = false
++        LOGGER.error("ClassifyChannelVideosJob: cannot rebuild #{view} (#{ex.message})")
++        PG_DB.exec("DROP MATERIALIZED VIEW IF EXISTS #{staging}") rescue nil
++      end
++    end
++
++    swept
++  end
++end
+diff --git a/src/invidious/routes/feeds.cr b/src/invidious/routes/feeds.cr
+index ebb5f04..db6942c 100644
+--- a/src/invidious/routes/feeds.cr
++++ b/src/invidious/routes/feeds.cr
+@@ -443,6 +443,7 @@ module Invidious::Routes::Feeds
+           live_now:           video.live_now,
+           premiere_timestamp: video.premiere_timestamp,
+           views:              video.views,
++          kind:               nil, # the classifier job answers this
+         })
+ 
+         was_insert = Invidious::Database::ChannelVideos.insert(video, with_premiere_timestamp: true)
+diff --git a/src/invidious/users.cr b/src/invidious/users.cr
+index 65566d2..6c856a3 100644
+--- a/src/invidious/users.cr
++++ b/src/invidious/users.cr
+@@ -1,7 +1,10 @@
+ require "crypto/bcrypt/password"
+ 
+ # Materialized views may not be defined using bound parameters (`$1` as used elsewhere)
+-MATERIALIZED_VIEW_SQL = ->(email : String) { "SELECT cv.* FROM channel_videos cv WHERE EXISTS (SELECT subscriptions FROM users u WHERE cv.ucid = ANY (u.subscriptions) AND u.email = E'#{email.gsub({'\'' => "\\'", '\\' => "\\\\"})}') ORDER BY published DESC" }
++# the trailing `view_predicate` restricts the feed to the configured
++# content kinds. Baked in at CREATE time, so ClassifyChannelVideosJob rebuilds
++# every view when the setting changes.
++MATERIALIZED_VIEW_SQL = ->(email : String) { "SELECT cv.* FROM channel_videos cv WHERE EXISTS (SELECT subscriptions FROM users u WHERE cv.ucid = ANY (u.subscriptions) AND u.email = E'#{email.gsub({'\'' => "\\'", '\\' => "\\\\"})}')#{Invidious::FeedKinds.view_predicate(CONFIG.feed_kinds, "cv.kind")} ORDER BY published DESC" }
+ 
+ def create_user(sid, email, password)
+   password = Crypto::Bcrypt::Password.create(password, cost: 10)
+-- 
+2.47.3
+

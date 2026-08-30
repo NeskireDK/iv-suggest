@@ -110,13 +110,16 @@ regardless, and `length_seconds` is 0 for anything absent from the channel's
 Videos tab, so Shorts and stream VODs are indistinguishable from each other and
 from ordinary uploads.
 
-The other lanes work against any Invidious instance. If you want the
-subscription-feed ones, the column is populated by classifying each video from
-YouTube's per-channel uploads playlists — replace the `UC` of a channel ID with
-`UULF` (long-form), `UUSH` (Shorts) or `UULV` (live) and read
-`/feeds/videos.xml?playlist_id=…`. Measured over 75 channels, that misclassified
-1 video in 679. `HEAD /shorts/<id>` is the per-video fallback: 200 means it is a
-Short, 303 means it is not.
+The other lanes work against any Invidious instance. To get the
+subscription-feed ones, apply
+[`patches/0001-feed-kinds-v2.20260804.1.patch`](patches/) — it adds the column
+and a job that fills it from YouTube's per-channel uploads playlists (replace the
+`UC` of a channel ID with `UULF` for long-form, `UUSH` for Shorts, `UULV` for
+live). Measured over 75 channels, that misclassified 1 video in 679;
+`HEAD /shorts/<id>` is the per-video fallback (200 = Short, 303 = not). The patch
+also lets you drop Shorts and live streams out of the subscription feed
+altogether. See [patches/README.md](patches/README.md) — **note the migration
+warning there**, since Invidious does not run migrations at boot.
 
 ## Install
 
