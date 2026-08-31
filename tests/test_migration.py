@@ -11,6 +11,7 @@ Skipped when docker is not available, so the rest of the suite still runs.
 
 import os
 import subprocess
+import time
 import unittest
 import uuid
 
@@ -77,13 +78,17 @@ class Migration(unittest.TestCase):
             capture_output=True, text=True)
         if run.returncode:
             raise unittest.SkipTest("cannot start %s: %s" % (IMAGE, run.stderr))
-        for _ in range(60):
+        # A real query, not pg_isready: the image's entrypoint runs a temporary
+        # server while it initialises the cluster, and pg_isready answers for
+        # that one too -- so the first test would meet "the database system is
+        # starting up" as soon as it restarts.
+        for _ in range(120):
             ready = subprocess.run(
-                ["docker", "exec", cls.name, "pg_isready", "-U", "postgres",
-                 "-d", "t"], capture_output=True)
+                ["docker", "exec", cls.name, "psql", "-U", "postgres", "-d", "t",
+                 "-c", "SELECT 1"], capture_output=True)
             if ready.returncode == 0:
                 break
-            __import__("time").sleep(0.5)
+            time.sleep(0.5)
         else:
             cls.tearDownClass()
             raise unittest.SkipTest("postgres never became ready")

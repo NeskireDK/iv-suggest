@@ -759,6 +759,78 @@ def load_config():
     return lanes
 
 
+def load_users():
+    """The accounts to manage, as [{email, lanes, overrides}, ...].
+
+    No `users:` block means the one account in IV_SUGGEST_ACCOUNT with every
+    lane, which is exactly what the install did before there was a block, so a
+    config written for the single account version keeps working untouched.
+
+    An account absent from the list is UNMANAGED. Never auto-enrol: a household
+    member who opens Invidious and finds a dozen playlists the bot made in their
+    account has been surprised, not served.
+    """
+    import yaml
+    with open(CONFIG) as fh:
+        cfg = yaml.safe_load(fh) or {}
+    raw = cfg.get("users") or []
+    if not raw:
+        if not PRIMARY:
+            sys.exit("no users: block in %s and no IV_SUGGEST_ACCOUNT" % CONFIG)
+        return [{"email": PRIMARY, "lanes": "all", "overrides": {}}]
+    users = []
+    for entry in raw:
+        email = (entry.get("email") or "").strip()
+        if not email:
+            sys.exit("a users: entry in %s has no email" % CONFIG)
+        users.append({"email": email,
+                      "lanes": entry.get("lanes", "all"),
+                      "overrides": entry.get("overrides") or {}})
+    return users
+
+
+def lanes_for(user, lanes):
+    """The lanes one account gets, in lanes.yml order, with its overrides applied.
+
+    `lanes: all` is for the account that wants the whole library; everyone else
+    names the few they want, because a three-lane household member does not
+    need Shorts, Live streams and two mixes.
+
+    The order is lanes.yml's, never the user's list: mix lanes have to run after
+    the lanes they read, and that ordering is a property of the config, not of
+    who is being filled.
+    """
+    want = user.get("lanes", "all")
+    if want != "all":
+        want = set(want or [])
+        missing = want - {lane["id"] for lane in lanes}
+        if missing:
+            log("  %s asks for lanes that do not exist: %s"
+                % (user["email"], ", ".join(sorted(missing))))
+        lanes = [lane for lane in lanes if lane["id"] in want]
+    out = []
+    for lane in lanes:
+        over = (user.get("overrides") or {}).get(lane["id"])
+        if over:
+            lane = dict(lane)
+            lane.update(over)
+        out.append(lane)
+    return out
+
+
+def account_order(users):
+    """Accounts least-recently-succeeded first.
+
+    The fetch budget is global and divided, so whoever is served last is the one
+    an exhausted budget starves. Rotating on the last successful run means that
+    is a different account each night instead of the same one for ever.
+    """
+    seen = dict((r[0], float(r[1] or 0)) for r in query(
+        "SELECT account, extract(epoch FROM max(started)) FROM suggest.runs "
+        "WHERE coalesce(error,'') = '' GROUP BY 1;"))
+    return sorted(users, key=lambda u: seen.get(u["email"], 0.0))
+
+
 def read_user():
     if not ACCOUNT:
         sys.exit("set IV_SUGGEST_ACCOUNT to the Invidious account to fill "
@@ -766,7 +838,9 @@ def read_user():
     row = query("SELECT array_to_string(watched,' '), array_to_string(subscriptions,' ') "
                 "FROM users WHERE email=%s;" % lit(ACCOUNT))
     if not row:
-        sys.exit("account %s not found" % ACCOUNT)
+        # Aborted, not exit: a typo in one users: entry must not cost the
+        # accounts that are spelled correctly their nightly run.
+        raise Aborted("no Invidious account %s" % ACCOUNT)
     watched = row[0][0].split() if row[0][0] else []
     subs = set(row[0][1].split()) if len(row[0]) > 1 and row[0][1] else set()
     return watched, subs
@@ -1535,24 +1609,79 @@ def run_lane_mix(lane, dry):
 
 
 def cmd_run(args):
-    lanes = load_config()
+    """Fill every managed account's lanes, in one paced run.
+
+    One timer, one budget, one metadata cache. The accounts are a loop inside
+    this process rather than a unit each, because the thing that has to stay
+    scarce -- calls that reach YouTube -- is a property of the instance, not of
+    the account.
+    """
+    all_lanes = load_config()
+    users = accounts_wanted(args)
+    fetcher = Fetcher(rate_per_min=args.rate, budget=args.budget, persist=True)
+    seed_override = args.seeds if args.seeds else (DRY_SEEDS if args.dry_run else None)
+    log("cache holds %d videos; budget %d fetches at %d per minute%s%s"
+        % (len(fetcher.meta), args.budget, args.rate,
+           "; seeds capped at %d" % seed_override if seed_override else "",
+           "   [DRY RUN, nothing is written]" if args.dry_run else ""))
+    failed = 0
+    for i, user in enumerate(users):
+        fetcher.budget = fetcher.fetches + budget_slice(
+            args.budget, fetcher.fetches, len(users) - i)
+        try:
+            failed += run_account(user, all_lanes, fetcher, seed_override, args)
+        except Exception as e:            # one account must not cost the others
+            failed += 1
+            log("account %s: ERROR %r" % (user["email"], e))
+    log("\ndone: %d fetches, %d cache hits, %d known-bad skips, %d lane failures"
+        % (fetcher.fetches, fetcher.cache_hits, fetcher.dead_hits, failed))
+    return 1 if failed else 0
+
+
+def budget_slice(total, spent, accounts_left):
+    """One account's share of the run's fetch budget.
+
+    Divide, do not multiply. The pacing is there to keep YouTube calm, which is
+    a property of the instance and not of the account, so a second person does
+    not double the calls -- they halve each share.
+
+    Recomputed from what is left each time, so a light account's unspent slice
+    rolls forward to whoever comes next instead of being lost.
+    """
+    return max(0, total - spent) // max(1, accounts_left)
+
+
+def accounts_wanted(args):
+    """The accounts this invocation should touch, in the order to serve them."""
+    users = load_users()
+    wanted = getattr(args, "account", None)
+    if wanted:
+        users = [u for u in users if u["email"] == wanted]
+        if not users:
+            sys.exit("no account %r in the users: block of %s" % (wanted, CONFIG))
+    return account_order(users)
+
+
+def run_account(user, all_lanes, fetcher, seed_override, args):
+    """One account's lanes. Returns how many of them failed."""
+    use_account(user["email"])
+    lanes = lanes_for(user, all_lanes)
     if args.lane:
         lanes = [l for l in lanes if l["id"] == args.lane]
         if not lanes:
-            sys.exit("no lane named %r in %s" % (args.lane, CONFIG))
+            log("\naccount %s: no lane %r" % (ACCOUNT, args.lane))
+            return 0
     watched, subs = read_user()
     watched_set = set(watched)
     blocked = read_blocked()
-    log("account %s: %d watched, %d subscriptions, %d blocked, %d lanes%s"
+    # The watch count is logged because it is the whole cause of a thin lane on
+    # a new account, and nothing else makes that visible.
+    log("\naccount %s: %d watched, %d subscriptions, %d blocked, %d lanes, "
+        "%d fetches of budget"
         % (ACCOUNT, len(watched), len(subs), len(blocked), len(lanes),
-           "   [DRY RUN, nothing is written]" if args.dry_run else ""))
+           fetcher.budget - fetcher.fetches))
     if blocked:
         log("blocked: %s" % ", ".join(sorted(blocked.values())))
-    fetcher = Fetcher(rate_per_min=args.rate, budget=args.budget, persist=True)
-    seed_override = args.seeds if args.seeds else (DRY_SEEDS if args.dry_run else None)
-    log("cache holds %d videos; budget %d fetches at %d per minute%s"
-        % (len(fetcher.meta), args.budget, args.rate,
-           "; seeds capped at %d" % seed_override if seed_override else ""))
     failed = 0
     for lane in lanes:
         error = None
@@ -1583,15 +1712,28 @@ def cmd_run(args):
                     % (acct(), lit(lane["id"]), added, removed, kept, used,
                        lit(error)))
         if isinstance(error, str) and error and "budget" in error:
-            log("fetch budget spent, stopping before the other lanes")
+            # This account's slice, not the run: the next account has its own.
+            log("fetch budget spent, stopping before %s's other lanes" % ACCOUNT)
             break
-    log("\ndone: %d fetches, %d cache hits, %d known-bad skips, %d lane failures"
-        % (fetcher.fetches, fetcher.cache_hits, fetcher.dead_hits, failed))
-    return 1 if failed else 0
+    return failed
 
 
 def cmd_dedupe(args):
     """Keep one upload per song and remove the rest. The next run refills.
+
+    Per account: two people are each allowed their own copy of a song, and
+    dropping one because the other already has it is exactly the bleed the
+    account column exists to stop.
+    """
+    for user in load_users():
+        use_account(user["email"])
+        log("account %s" % user["email"])
+        dedupe_account(args)
+    return 0
+
+
+def dedupe_account(args):
+    """One account's duplicates.
 
     The keeper is chosen on quality, not on lane order: the artist's own upload
     beats a re-upload, and a lane earlier in lanes.yml beats a later one.
@@ -1659,14 +1801,19 @@ def cmd_views(args):
     treats a lone HTTP 500 as a known upstream parser bug: it logs, skips the
     one video, and keeps going; only 5 consecutive failures of any kind abort.
     """
+    # Every account's lanes into one set: a view count is a property of the
+    # video, so two accounts holding the same video pay for one refresh.
     vids = set()
-    for lane_id, plid in query("SELECT lane, plid FROM suggest.lanes "
-                               "WHERE account=%s;" % acct()):
-        playlist = api("GET", "/api/v1/auth/playlists/" + plid)
-        videos = playlist.get("videos") or []
-        log("lane %-16s %d videos" % (lane_id, len(videos)))
-        vids.update(v["videoId"] for v in videos)
-    log("%d unique videos across every lane" % len(vids))
+    for user in load_users():
+        use_account(user["email"])
+        for lane_id, plid in query("SELECT lane, plid FROM suggest.lanes "
+                                   "WHERE account=%s;" % acct()):
+            playlist = api("GET", "/api/v1/auth/playlists/" + plid)
+            videos = playlist.get("videos") or []
+            log("%-24s lane %-16s %d videos"
+                % (user["email"], lane_id, len(videos)))
+            vids.update(v["videoId"] for v in videos)
+    log("%d unique videos across every lane of every account" % len(vids))
 
     fetcher = Fetcher(rate_per_min=args.rate, budget=args.budget, persist=True)
     updated = skipped_500 = dead = failed = 0
@@ -1852,13 +1999,23 @@ def shuffle_lane(lane, orders, dry):
 
 def cmd_shuffle(args):
     """Reorder every lane. Database only: no API call, no YouTube fetch."""
-    lanes = load_config()
+    all_lanes = load_config()
+    failed = 0
+    for user in accounts_wanted(args):
+        failed += shuffle_account(user, all_lanes, args)
+    return 1 if failed else 0
+
+
+def shuffle_account(user, all_lanes, args):
+    use_account(user["email"])
+    lanes = lanes_for(user, all_lanes)
     if args.lane:
         lanes = [l for l in lanes if l["id"] == args.lane]
         if not lanes:
-            sys.exit("no lane named %r in %s" % (args.lane, CONFIG))
-    log("reordering %d lanes%s"
-        % (len(lanes), "   [DRY RUN, nothing is written]" if args.dry_run else ""))
+            return 0
+    log("account %s: reordering %d lanes%s"
+        % (ACCOUNT, len(lanes),
+           "   [DRY RUN, nothing is written]" if args.dry_run else ""))
     orders, failed = {}, 0
     for lane in lanes:
         if not lane["shuffle"]["enabled"]:
@@ -1875,23 +2032,47 @@ def cmd_shuffle(args):
                 execute("INSERT INTO suggest.shuffles(account,lane,videos,moved,error) "
                         "VALUES (%s,%s,0,0,%s);"
                         % (acct(), lit(lane["id"]), lit(repr(e))))
-    log("done: %d lanes reordered, %d failures" % (len(orders), failed))
-    return 1 if failed else 0
+    log("  %d lanes reordered, %d failures" % (len(orders), failed))
+    return failed
 
 
 def cmd_init(args):
+    """Prepare the schema, then every managed account. Safe to re-run.
+
+    Idempotent throughout: the migration only touches what it has not touched
+    before, a session is opened once and reused, and a playlist is created only
+    when the account has none for that lane. Nothing here recreates anything.
+    """
     execute(SCHEMA_SQL)
     if not PRIMARY:
         sys.exit("set IV_SUGGEST_ACCOUNT: the migration needs to know which "
                  "account the rows written before multi-user belong to")
     execute(MIGRATE_SQL.replace("__ACCOUNT__", lit(PRIMARY)))
     log("schema suggest is ready (rows without an account belong to %s)" % PRIMARY)
-    open_session(PRIMARY)
-    log("account %s is ready" % PRIMARY)
+    users = load_users() if args.all_users else [
+        u for u in load_users() if u["email"] == PRIMARY]
+    all_lanes = load_config() if args.all_users else []
+    for user in users:
+        log("account %s" % user["email"])
+        open_session(user["email"])
+        use_account(user["email"])
+        for lane in lanes_for(user, all_lanes):
+            plid, _ = playlist_of(lane, dry=False)
+            log("  lane %-16s %s" % (lane["id"], plid))
+    log("done: %d accounts ready" % len(users))
     return 0
 
 
 def cmd_status(args):
+    for user in load_users():
+        use_account(user["email"])
+        log("account %s" % user["email"])
+        status_account(args)
+        log("")
+    return 0
+
+
+def status_account(args):
     rows = query("SELECT l.lane, l.plid, count(i.vid) FROM suggest.lanes l "
                  "LEFT JOIN suggest.items i ON i.account=l.account AND i.lane=l.lane "
                  "WHERE l.account=%s GROUP BY 1,2 ORDER BY 1;" % acct())
@@ -1913,54 +2094,26 @@ def cmd_status(args):
 
 
 def cmd_metrics(args):
-    """Print the Prometheus text form. Database only, never a YouTube fetch."""
-    lanes = load_config()
+    """Print the Prometheus text form. Database only, never a YouTube fetch.
 
-    # One query per table keeps this cheap enough to run every 15 minutes.
-    tracked = dict((r[0], int(r[1])) for r in query(
-        "SELECT lane, count(*) FROM suggest.items WHERE account=%s GROUP BY 1;" % acct()))
-    changed = dict((r[0], float(r[1])) for r in query(
-        "SELECT lane, extract(epoch FROM max(added)) FROM suggest.items "
-        "WHERE account=%s GROUP BY 1;" % acct()))
-    last = {}
-    for r in query(
-            "SELECT DISTINCT ON (lane) lane, extract(epoch FROM started), added, "
-            "removed, kept, fetches, coalesce(error,'') FROM suggest.runs "
-            "WHERE account=%s ORDER BY lane, started DESC;" % acct()):
-        last[r[0]] = r
-    plids = dict((r[0], r[1]) for r in query(
-        "SELECT lane, plid FROM suggest.lanes WHERE account=%s;" % acct()))
-
+    Every per-lane series carries an `account` label. The cardinality that adds
+    is a household, not a tenant list, and without it two people's lanes of the
+    same name would collide into one series.
+    """
+    all_lanes = load_config()
+    users = load_users()
     out = []
+    series = {}
+    order = []
 
     def metric(name, help_text, kind, samples):
+        """Collect samples; HELP and TYPE are written once, at the end."""
         if not samples:
             return
-        out.append("# HELP iv_suggest_%s %s" % (name, help_text))
-        out.append("# TYPE iv_suggest_%s %s" % (name, kind))
-        for labels, value in samples:
-            out.append("iv_suggest_%s%s %s" % (name, labels, value))
-
-    def tag(lane):
-        # `expand` is exported so an alert can tell a lane whose supply is a
-        # fixed age window (subscription_feed) from one drawing on a growing
-        # recommendation graph. The first legitimately takes no new video for
-        # weeks when nothing was published; the second going quiet is a fault.
-        return '{lane="%s",policy="%s",expand="%s",plid="%s"}' % (
-            lane["id"], lane["policy"], lane["expand"],
-            plids.get(lane["id"], ""))
-
-    metric("scrape_timestamp_seconds",
-           "When this exporter last read the database.", "gauge",
-           [("", "%d" % time.time())])
-    runs = [float(r[1]) for r in last.values() if r[1]]
-    metric("last_run_timestamp_seconds",
-           "Newest run of any lane. Staleness means the timer did not fire.",
-           "gauge", [("", "%d" % max(runs))] if runs else [])
-    metric("lanes_configured", "Lanes in lanes.yml.", "gauge",
-           [("", len(lanes))])
-    metric("blocked_channels", "Channels the blocklist keeps out of every lane.",
-           "gauge", [("", len(read_blocked()))])
+        if name not in series:
+            series[name] = (help_text, kind, [])
+            order.append(name)
+        series[name][2].extend(samples)
 
     def column(row, index):
         """A field of the last run row, 0 when the lane never ran."""
@@ -1968,67 +2121,126 @@ def cmd_metrics(args):
             return 0
         return int(float(row[index]))
 
-    # 0 lane, 1 started, 2 added, 3 removed, 4 kept, 5 fetches, 6 error
-    per_lane = (
-        # A mix lane holds no suggest.items rows: its videos live in the source
-        # lanes. Count it from its last run and give it no target, so the
-        # underfilled alert never fires on it.
-        ("lane_videos", "Videos the state tracks in this lane.",
-         lambda l, r: (column(r, 4) + column(r, 2)) if l["policy"] == "mix"
-         else tracked.get(l["id"], 0)),
-        ("lane_target", "Wanted size of this lane.",
-         lambda l, r: 0 if l["policy"] == "mix" else l["size"]),
-        ("lane_last_run_timestamp_seconds", "Last run of this lane.",
-         lambda l, r: column(r, 1)),
-        ("lane_last_change_timestamp_seconds",
-         "Last time a video entered this lane. This is the refresh proof.",
-         lambda l, r: int(changed.get(l["id"], 0))),
-        ("lane_last_added", "Videos added by the last run.",
-         lambda l, r: column(r, 2)),
-        ("lane_last_removed", "Videos removed by the last run.",
-         lambda l, r: column(r, 3)),
-        ("lane_last_fetches", "YouTube fetches used by the last run.",
-         lambda l, r: column(r, 5)),
-        ("lane_error", "1 when the last run of this lane failed.",
-         lambda l, r: 1 if (r and r[6]) else 0),
-    )
-    for name, help_text, value_of in per_lane:
-        metric(name, help_text, "gauge",
-               [(tag(lane), value_of(lane, last.get(lane["id"])))
-                for lane in lanes])
+    for user in users:
+        use_account(user["email"])
+        lanes = lanes_for(user, all_lanes)
 
-    metric("fetches_24h", "YouTube fetches in the last day, all lanes.", "gauge",
-           [("", one("SELECT coalesce(sum(fetches),0) FROM suggest.runs "
-                     "WHERE account=%s AND started > now() - interval '1 day';"
-                     % acct()) or 0)])
-    metric("meta_rows", "Rows in the permanent metadata cache.", "gauge",
-           [("", one("SELECT count(*) FROM suggest.video_meta;") or 0)])
-    metric("cooldown_rows", "Videos held back by a cooldown.", "gauge",
-           [("", one("SELECT count(*) FROM suggest.cooldown "
+        # One query per table per account keeps this cheap enough to run every
+        # 15 minutes.
+        tracked = dict((r[0], int(r[1])) for r in query(
+            "SELECT lane, count(*) FROM suggest.items WHERE account=%s GROUP BY 1;"
+            % acct()))
+        changed = dict((r[0], float(r[1])) for r in query(
+            "SELECT lane, extract(epoch FROM max(added)) FROM suggest.items "
+            "WHERE account=%s GROUP BY 1;" % acct()))
+        last = {}
+        for r in query(
+                "SELECT DISTINCT ON (lane) lane, extract(epoch FROM started), added, "
+                "removed, kept, fetches, coalesce(error,'') FROM suggest.runs "
+                "WHERE account=%s ORDER BY lane, started DESC;" % acct()):
+            last[r[0]] = r
+        plids = dict((r[0], r[1]) for r in query(
+            "SELECT lane, plid FROM suggest.lanes WHERE account=%s;" % acct()))
+        shuffled = dict((r[0], r[1]) for r in query(
+            "SELECT DISTINCT ON (lane) lane, moved FROM suggest.shuffles "
+            "WHERE account=%s ORDER BY lane, ran DESC;" % acct()))
+
+        def tag(lane, plids=plids):
+            # `expand` is exported so an alert can tell a lane whose supply is a
+            # fixed age window (subscription_feed) from one drawing on a growing
+            # recommendation graph. The first legitimately takes no new video for
+            # weeks when nothing was published; the second going quiet is a fault.
+            return '{account="%s",lane="%s",policy="%s",expand="%s",plid="%s"}' % (
+                ACCOUNT, lane["id"], lane["policy"], lane["expand"],
+                plids.get(lane["id"], ""))
+
+        metric("lanes_configured", "Lanes this account is given.", "gauge",
+               [('{account="%s"}' % ACCOUNT, len(lanes))])
+        metric("blocked_channels",
+               "Channels the blocklist keeps out of every lane of this account.",
+               "gauge", [('{account="%s"}' % ACCOUNT, len(read_blocked()))])
+
+        # 0 lane, 1 started, 2 added, 3 removed, 4 kept, 5 fetches, 6 error
+        per_lane = (
+            # A mix lane holds no suggest.items rows: its videos live in the source
+            # lanes. Count it from its last run and give it no target, so the
+            # underfilled alert never fires on it.
+            ("lane_videos", "Videos the state tracks in this lane.",
+             lambda l, r: (column(r, 4) + column(r, 2)) if l["policy"] == "mix"
+             else tracked.get(l["id"], 0)),
+            ("lane_target", "Wanted size of this lane.",
+             lambda l, r: 0 if l["policy"] == "mix" else l["size"]),
+            ("lane_last_run_timestamp_seconds", "Last run of this lane.",
+             lambda l, r: column(r, 1)),
+            ("lane_last_change_timestamp_seconds",
+             "Last time a video entered this lane. This is the refresh proof.",
+             lambda l, r: int(changed.get(l["id"], 0))),
+            ("lane_last_added", "Videos added by the last run.",
+             lambda l, r: column(r, 2)),
+            ("lane_last_removed", "Videos removed by the last run.",
+             lambda l, r: column(r, 3)),
+            ("lane_last_fetches", "YouTube fetches used by the last run.",
+             lambda l, r: column(r, 5)),
+            ("lane_error", "1 when the last run of this lane failed.",
+             lambda l, r: 1 if (r and r[6]) else 0),
+            ("lane_last_moved",
+             "Positions changed by the last reorder of this lane.",
+             lambda l, r: shuffled.get(l["id"], 0)),
+        )
+        for name, help_text, value_of in per_lane:
+            metric(name, help_text, "gauge",
+                   [(tag(lane), value_of(lane, last.get(lane["id"])))
+                    for lane in lanes])
+
+        metric("cooldown_rows", "Videos held back by a cooldown.", "gauge",
+               [('{account="%s"}' % ACCOUNT,
+                 one("SELECT count(*) FROM suggest.cooldown "
                      "WHERE account=%s AND until > now();" % acct()) or 0)])
+        metric("watched_videos",
+               "Length of users.watched. It only grows when a client reports "
+               "playback. A thin lane on a new account is this number, not a "
+               "fault.", "gauge",
+               [('{account="%s"}' % ACCOUNT,
+                 one("SELECT coalesce(array_length(watched,1),0) FROM users "
+                     "WHERE email=%s;" % lit(ACCOUNT)) or 0)])
+
+    # Instance wide. The fetch budget and the metadata cache are shared, so
+    # these stay unlabelled and the alerts written against them still work.
+    metric("scrape_timestamp_seconds",
+           "When this exporter last read the database.", "gauge",
+           [("", "%d" % time.time())])
+    metric("accounts_managed", "Accounts in the users: block of lanes.yml.",
+           "gauge", [("", len(users))])
+    metric("last_run_timestamp_seconds",
+           "Newest run of any lane of any account. Staleness means the timer "
+           "did not fire.", "gauge",
+           [("", one("SELECT coalesce(extract(epoch FROM max(started))::bigint,0) "
+                     "FROM suggest.runs;") or 0)])
+    metric("last_shuffle_timestamp_seconds",
+           "Newest reorder of any lane.", "gauge",
+           [("", one("SELECT coalesce(extract(epoch FROM max(ran))::bigint,0) "
+                     "FROM suggest.shuffles;") or 0)])
+    metric("fetches_24h",
+           "YouTube fetches in the last day, every lane of every account. The "
+           "budget is shared, so this is the number that matters.", "gauge",
+           [("", one("SELECT coalesce(sum(fetches),0) FROM suggest.runs "
+                     "WHERE started > now() - interval '1 day';") or 0)])
+    metric("meta_rows", "Rows in the permanent metadata cache, shared by every "
+           "account.", "gauge",
+           [("", one("SELECT count(*) FROM suggest.video_meta;") or 0)])
     metric("dead_rows", "Videos known to be unfetchable, so never retried.",
            "gauge",
            [("", one("SELECT count(*) FROM suggest.video_dead "
                      "WHERE until > now();") or 0)])
-    # The hourly reorder. Staleness here means the shuffle timer died even though
-    # the nightly run is fine, which no other metric would show.
-    metric("last_shuffle_timestamp_seconds",
-           "Newest reorder of any lane.", "gauge",
-           [("", one("SELECT coalesce(extract(epoch FROM max(ran))::bigint,0) "
-                     "FROM suggest.shuffles WHERE account=%s;" % acct()) or 0)])
-    shuffled = dict((r[0], r[1]) for r in query(
-        "SELECT DISTINCT ON (lane) lane, moved FROM suggest.shuffles "
-        "WHERE account=%s ORDER BY lane, ran DESC;" % acct()))
-    metric("lane_last_moved",
-           "Positions changed by the last reorder of this lane.", "gauge",
-           [(tag(lane), shuffled.get(lane["id"], 0)) for lane in lanes])
-    metric("watched_videos",
-           "Length of users.watched. It only grows when a client reports playback.",
-           "gauge",
-           [("", one("SELECT coalesce(array_length(watched,1),0) FROM users "
-                     "WHERE email=%s;" % lit(ACCOUNT)) or 0)])
     metric("up", "1 when this exporter read the database.", "gauge",
            [("", 1)])
+
+    for name in order:
+        help_text, kind, samples = series[name]
+        out.append("# HELP iv_suggest_%s %s" % (name, help_text))
+        out.append("# TYPE iv_suggest_%s %s" % (name, kind))
+        for labels, value in samples:
+            out.append("iv_suggest_%s%s %s" % (name, labels, value))
 
     print("\n".join(out))
     return 0
@@ -2038,11 +2250,15 @@ def main():
     global TOKEN, SESSION
     p = argparse.ArgumentParser(description="lane based suggestion playlists")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("init")
+    i = sub.add_parser("init")
+    i.add_argument("--all-users", action="store_true",
+                   help="prepare every account in the users: block, creating "
+                        "the playlists it is missing")
     r = sub.add_parser("run")
     r.add_argument("--dry-run", action="store_true",
                    help="write no playlist and no state; the metadata cache is still filled")
     r.add_argument("--lane")
+    r.add_argument("--account", help="fill only this account")
     r.add_argument("--seeds", type=int, default=0,
                    help="cap the seed count (a dry run defaults to %d)" % DRY_SEEDS)
     r.add_argument("--rate", type=int, default=RATE_PER_MIN, help="fetches per minute")
@@ -2057,16 +2273,15 @@ def main():
     s = sub.add_parser("shuffle", help="reorder the lanes; database only, no fetches")
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--lane")
+    s.add_argument("--account", help="reorder only this account")
     args = p.parse_args()
     # "metrics" reads only the database, so it must work without the token.
     # The stats timer runs it every 15 minutes as a plain reader. "shuffle" is
     # the same: it permutes playlists.index in SQL and calls no API at all.
-    if args.cmd not in ("metrics", "shuffle", "init"):
+    # Each command picks up the session of the account it is serving as it goes;
+    # the token is only the fallback for an install that has not opened one yet.
+    if args.cmd not in ("metrics", "shuffle"):
         TOKEN = load_token()
-        use_account(PRIMARY)
-        if not SESSION and not TOKEN:
-            sys.exit("no credential for %s: run `iv-suggest init` to open one"
-                     % PRIMARY)
     return {"init": cmd_init, "run": cmd_run, "status": cmd_status,
             "metrics": cmd_metrics, "dedupe": cmd_dedupe,
             "views": cmd_views, "shuffle": cmd_shuffle}[args.cmd](args)

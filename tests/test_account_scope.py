@@ -30,6 +30,13 @@ ALLOWED = (
     # across the whole instance, so this set is deliberately every account's:
     # scoping it would let one account's Blocked playlist eat another's lane.
     "AND p.id NOT IN (SELECT plid FROM suggest.lanes)",
+    # The three instance-wide metrics. The fetch budget and the timers are
+    # shared, so these are meant to aggregate the whole household -- and the
+    # alerts written against them keep working unchanged. Listed one by one
+    # rather than by rule, so a fourth unscoped statement still fails.
+    "SELECT coalesce(extract(epoch FROM max(started))::bigint,0) FROM suggest.runs;",
+    "SELECT coalesce(extract(epoch FROM max(ran))::bigint,0) FROM suggest.shuffles;",
+    "SELECT coalesce(sum(fetches),0) FROM suggest.runs ",
 )
 
 
