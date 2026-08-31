@@ -102,40 +102,31 @@ because auto-enrolment touches most of them.
 swallowed it, and that lane never reordered again. Both paths now go through
 `merge_lane()`.
 
-### code — `matches()` is dead, and `min_seconds` does not do what it says
+### ~~code — `matches()` is dead, `min_seconds` ignores unknown lengths~~ RESOLVED
 
-`matches()` is defined and called from nowhere. The live candidate filter is
-`if lane["min_seconds"] and 0 < secs < lane["min_seconds"]`, so a video whose
-length is unknown or zero **passes** the Shorts guard. `channel_videos` rows
-carry `length_seconds = 0` for anything absent from the channel's Videos tab, so
-this is the common case, not the edge one. Decide which behaviour is wanted,
-then delete `matches()` or call it.
+`matches()` was called from nowhere. The live filter is
+`0 < secs < min_seconds`, so a video of unknown or zero length passes — which is
+the right behaviour and the same fail-open rule the feed-kinds patch uses, so
+the dead stricter copy was deleted rather than wired in. `CONFIG.md` says what
+the filter actually does.
 
-### code — a lane silently accepts keys its policy never reads
+### ~~code — a lane silently accepts keys its policy never reads~~ FIXED
 
-`last_played` reads only `id`, `title`, `size`, `fetch_cap`, `seed.genre`,
-`seed.scan`, `dedupe_songs`, `played_decay` and `privacy`. `mix` reads only
-`id`, `title`, `size`, `exclude_watched`, `mix.*` and `privacy`. Everything else
-is `refill`-only. In this instance's own `lanes.yml`, `music-watched` sets
-`ttl_days: 0`, `exclude_watched: false`, `min_seconds: 0`, `max_per_channel: 0`
-and `expand: none` — all five inert. Nothing warns. Fix: a config check at load
-that logs keys a lane's policy will ignore. Cheap, and it is the only thing that
-stops this recurring every time a lane is copied.
+`init` and `run` now name them: `lane music-watched: policy last_played never
+reads exclude_watched, expand, max_per_channel, min_seconds, ttl_days`. Those
+five were live in this repo's own `lanes.yml` and have been removed.
 
-### code — `iv-suggest init` creates no playlists without `--all-users`
+### ~~code — `iv-suggest init` creates no playlists without `--all-users`~~ FIXED
 
-`all_lanes = load_config() if args.all_users else []`, so a plain `init` runs
-`lanes_for(user, [])` and creates nothing; the playlists appear on the first
-`run`. Either the flag should stop gating this or the argparse help and the
-README walkthrough should stop promising it. Auto-enrolment makes `--all-users`
-the normal case anyway, which probably answers it.
+`all_lanes` is loaded unconditionally, so a plain `init` creates the primary
+account's missing playlists as the help always claimed. `--all-users` now only
+decides *which accounts*.
 
-### code — `seed.from` is read by nothing
+### ~~code — `seed.from` is read by nothing~~ FIXED
 
-Present in `DEFAULTS`, never consulted. Setting it to anything is silently
-inert. Either implement a second source or drop the key.
+Removed from `DEFAULTS`, from `lanes.yml` and from the reference.
 
-### docs — corrected in the CONFIG.md branch
+### docs — corrected in CONFIG.md
 
 | Claim as written | What the code does |
 |---|---|

@@ -22,7 +22,7 @@ One playlist plus the rules that fill it. A new genre is a new block in
 ```yaml
   - id: gaming
     title: "Gaming"
-    seed: {from: watched, limit: 15, scan: 300, genre: "Gaming", shuffle_window: 700}
+    seed: {limit: 15, scan: 300, genre: "Gaming", shuffle_window: 700}
     expand: recommended
     filter: {genre: "Gaming"}
     size: 20
@@ -68,9 +68,9 @@ install -m 600 lanes.yml /etc/iv-suggest/lanes.yml
 cp env.example /etc/iv-suggest/env && chmod 600 /etc/iv-suggest/env
 $EDITOR /etc/iv-suggest/env          # IV_SUGGEST_ACCOUNT is the only required line
 
-iv-suggest init                      # schema, and a session for the account
+iv-suggest init                      # schema, session and playlists
 iv-suggest run --dry-run             # writes nothing, caps seeds at 10
-iv-suggest run                       # create the playlists and fill them
+iv-suggest run                       # fill the lanes
 
 install -m 644 systemd/* /etc/systemd/system/
 systemctl enable --now iv-suggest.timer iv-suggest-shuffle.timer
@@ -86,7 +86,7 @@ you test a change by hand.
 ## Commands
 
 ```
-iv-suggest init [--all-users]                     schema and sessions; playlists only with --all-users
+iv-suggest init [--all-users]                     schema, sessions, playlists
 iv-suggest run [--dry-run] [--lane ID]            fill the lanes
            [--account EMAIL]
            [--seeds N] [--rate N] [--budget N]
