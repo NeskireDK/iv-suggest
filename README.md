@@ -177,14 +177,51 @@ iv-suggest metrics                                Prometheus text, database only
 without the per-tick caps — useful after a bulk import. It needs the patched
 Invidious described above.
 
+## Blocking a channel
+
+Some channel the recommendation graph loves and you do not. The blocklist is an
+ordinary Invidious playlist on your own account, named `Blocked` by default:
+
+```yaml
+blocklist:
+  playlist: Blocked
+  channels: []          # extra channel ids, for a channel with nothing to tap
+```
+
+Open any video from the channel in any client and use **add to playlist →
+Blocked**. That is the whole interface. One video is enough — `playlist_videos`
+records the `ucid` of every entry, so the block lands on the *channel*, and the
+entry can stay in the playlist as the record of why.
+
+Doing it this way rather than as a config list buys three things. The playlist
+is **server side**, so the list is the same on the phone, the TV and the web,
+where a client-side content filter is per device. It needs **no new endpoint and
+no client change**, because "add to playlist" is already in every client's menu.
+And the bot reads it over SQL, so it costs **no API call and no YouTube fetch**.
+
+A blocked channel is refused at four points: it is dropped as a seed, skipped by
+`channel_latest`, subtracted from the `subscription_feed` channel set, and
+rejected as a candidate. Anything of theirs already sitting in a lane is swept
+out on the next run, logged as `- blocked`, and gets **no cooldown row** — so
+removing the video from `Blocked` lets the channel back the same night.
+
+`iv-suggest status` prints the current list, and `iv_suggest_blocked_channels`
+exports it.
+
+A lane playlist is excluded by id, so naming a lane `Blocked` cannot make the
+lane feed itself back as its own blocklist.
+
 ## Playlist privacy
 
 Invidious **ignores `privacy` on playlist create** and always stores `Public`;
 only `PATCH /api/v1/auth/playlists/<plid>` changes it, which the engine sends
-straight after create. A `public` lane is readable by anyone holding the playlist
-ID and enables the Atom feed at `/feed/playlist/<plid>`; a `private` lane returns
-404 there. Choose per lane in `lanes.yml`. What a public lane leaks is watch
-taste, not credentials — but decide deliberately.
+straight after create. The default is `unlisted`: readable by anyone holding
+the playlist ID, absent from any listing. **The Atom feed at
+`/feed/playlist/<plid>` still works** — `rss_playlist` only 404s a `private`
+playlist, so `public` buys nothing the feed needs. Choose per lane in
+`lanes.yml`. What a listed lane leaks is watch taste, not credentials — but
+decide deliberately, and remember the decision is made on somebody's behalf as
+soon as the instance has more than one account.
 
 ## Song identity
 

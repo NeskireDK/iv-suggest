@@ -24,6 +24,19 @@
 #                   max_age_hours, rank: views|published}. `kind` is written by
 #                   the fork's ClassifyChannelVideosJob.
 
+# Channels no lane may offer. The list is an ordinary Invidious playlist on the
+# account named by IV_SUGGEST_ACCOUNT, so any client edits it: open a video from
+# the channel and use "add to playlist" -> Blocked. One video is enough — the
+# block is on its CHANNEL, not on that video — and the entry can stay there as
+# the record of why. Because the playlist is server side the list is the same on
+# the phone, the TV and the web, which a client-side content filter is not.
+#
+# A blocked channel leaves every lane on the next run and gets no cooldown row,
+# so emptying the playlist lets it back the same night.
+blocklist:
+  playlist: Blocked     # playlist title; "" turns the whole mechanism off
+  channels: []          # extra channel ids, for a channel with nothing to tap
+
 defaults:
   size: 30
   ttl_days: 14
@@ -35,7 +48,10 @@ defaults:
   exclude_subscribed: true      # your subscription feed already shows those
   dedupe_across_lanes: true
   min_seconds: 120              # drops Shorts
-  privacy: public               # also enables the RSS feed /feed/playlist/<plid>
+  # Unlisted, not public: a lane is a record of what somebody watches, and
+  # nothing needs it listed. The RSS feed /feed/playlist/<plid> still works —
+  # rss_playlist only refuses a PRIVATE playlist.
+  privacy: unlisted
 
   # Hourly reorder (`iv-suggest shuffle`). Membership is the nightly run's job;
   # this only decides what sits at the top. It permutes `playlists.index` in
