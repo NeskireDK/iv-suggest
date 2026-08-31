@@ -1479,24 +1479,62 @@ def run_lane_last_played(lane, watched, blocked, fetcher, dry):
 
 
 def mix_sources(mix):
-    """The source list of a mix lane, as [{lane, share}, ...].
+    """The source list of a mix lane, as [{user, lane, share, key}, ...].
 
     Preferred form is explicit shares, which is the only way to say "10% music":
 
         mix: {pure: 10, sources: [{lane: suggested, share: 0.9},
                                   {lane: music-discover, share: 0.1}]}
 
+    A source may name another account, which is what makes a household feed:
+
+        mix: {sources: [{user: a@example.com, lane: suggested, share: 0.5},
+                        {user: b@example.com, lane: suggested, share: 0.5}]}
+
+    No `user` means the account being filled, so every config written before
+    this reads the same. `share` is the fairness knob: equal shares are an even
+    split, and weighting the viewer higher keeps the feed feeling like theirs.
+
     The older `base`/`blend`/`ratio` form is still read so a restored pre-2026-08-17
     config keeps working: `ratio: N` means N base per 1 blend.
     """
     if mix.get("sources"):
-        return [{"lane": s["lane"], "share": float(s.get("share", 1.0))}
-                for s in mix["sources"]]
-    base, blend = mix.get("base"), mix.get("blend")
-    if not base or not blend:
-        raise Aborted("a mix lane needs mix.sources, or mix.base and mix.blend")
-    ratio = max(1, int(mix.get("ratio", 2)))
-    return [{"lane": base, "share": float(ratio)}, {"lane": blend, "share": 1.0}]
+        out = [{"user": (s.get("user") or "").strip(), "lane": s["lane"],
+                "share": float(s.get("share", 1.0))} for s in mix["sources"]]
+    else:
+        base, blend = mix.get("base"), mix.get("blend")
+        if not base or not blend:
+            raise Aborted("a mix lane needs mix.sources, or mix.base and mix.blend")
+        ratio = max(1, int(mix.get("ratio", 2)))
+        out = [{"user": "", "lane": base, "share": float(ratio)},
+               {"user": "", "lane": blend, "share": 1.0}]
+    # Two people's "suggested" are two sources, so the key that weighted_mix
+    # counts shares by has to carry the account, not just the lane id.
+    for s in out:
+        s["key"] = "%s/%s" % (s["user"], s["lane"]) if s["user"] else s["lane"]
+    return out
+
+
+def source_order(src):
+    """The current display order of a mix source in another account, or None."""
+    plid = one("SELECT plid FROM suggest.lanes WHERE account=%s AND lane=%s;"
+               % (lit(src["user"]), lit(src["lane"])))
+    return [vid for vid, _ in playlist_videos(plid)] if plid else None
+
+
+def playlist_videos(plid):
+    """A playlist's videos in display order, as [(vid, ucid), ...], over SQL.
+
+    Read from the database rather than /api/v1/auth/playlists, because a mix may
+    read a lane belonging to somebody else: `playlists` joined to
+    `playlist_videos` needs no authentication at all, so the mix never has to
+    hold another account's session.
+    """
+    return [(r[0], r[1]) for r in query(
+        "SELECT pv.id, coalesce(pv.ucid,'') FROM playlists p "
+        "CROSS JOIN LATERAL unnest(p.\"index\") WITH ORDINALITY AS u(idx, ord) "
+        "JOIN playlist_videos pv ON pv.plid = p.id AND pv.\"index\" = u.idx "
+        "WHERE p.id = %s ORDER BY u.ord;" % lit(plid))]
 
 
 def weighted_mix(sources, size, pure=0):
@@ -1517,25 +1555,25 @@ def weighted_mix(sources, size, pure=0):
     A video present in more than one source appears once, at its first claim.
     """
     total = sum(max(s.get("share", 0.0), 0.0) for s in sources) or 1.0
-    share = {s["lane"]: max(s.get("share", 0.0), 0.0) / total for s in sources}
-    cursor = {s["lane"]: 0 for s in sources}
-    taken = {s["lane"]: 0 for s in sources}
+    share = {s["key"]: max(s.get("share", 0.0), 0.0) / total for s in sources}
+    cursor = {s["key"]: 0 for s in sources}
+    taken = {s["key"]: 0 for s in sources}
     placed, out = set(), []
 
     def peek(s):
         """The source's next unplaced video, or None when it is spent."""
-        vids, i = s["vids"], cursor[s["lane"]]
+        vids, i = s["vids"], cursor[s["key"]]
         while i < len(vids) and vids[i] in placed:
             i += 1
-        cursor[s["lane"]] = i
+        cursor[s["key"]] = i
         return vids[i] if i < len(vids) else None
 
     def take(s):
         vid = peek(s)
         placed.add(vid)
         out.append(vid)
-        cursor[s["lane"]] += 1
-        taken[s["lane"]] += 1
+        cursor[s["key"]] += 1
+        taken[s["key"]] += 1
 
     while sources and len(out) < min(pure, size) and peek(sources[0]) is not None:
         take(sources[0])
@@ -1550,46 +1588,59 @@ def weighted_mix(sources, size, pure=0):
         ready = [s for s in sources if peek(s) is not None]
         if not ready:
             break
-        take(max(ready, key=lambda s: share[s["lane"]] * (len(out) + 1)
-                 - taken[s["lane"]]))
+        take(max(ready, key=lambda s: share[s["key"]] * (len(out) + 1)
+                 - taken[s["key"]]))
     return out
 
 
-def run_lane_mix(lane, dry):
-    """Compose one playlist from two source lanes, in a fixed order.
+def run_lane_mix(lane, watched_set, blocked, dry):
+    """Compose one playlist from several source lanes, in a fixed order.
 
-    Positions 1..pure hold the base lane in its own order. After that the
-    blend lane is interleaved at ratio:1 (ratio base videos, then one blend
-    video). When one source runs out, the rest of the other follows. A video
-    present in both sources appears once, at its base position.
+    Positions 1..pure hold the first source in its own order. After that every
+    slot goes to whichever source is furthest behind its share. A video present
+    in more than one source appears once, at its first claim.
+
+    A source may belong to another account, which is what turns this into the
+    household feed: everybody's best, blended, rather than any one person's
+    lane. Contributing is not optional -- an opt-out would only make the mix
+    quietly incomplete and give it a second failure mode to debug -- and it is
+    understood that a shared feed shows the household what each person watches.
+
+    The filtering is per VIEWER, not per source: the same video is dropped for
+    the person who already watched it and kept for the one who has not, and
+    each viewer's own blocklist applies to what they are shown. That is the
+    point of the lane.
 
     The target playlist is rebuilt only when the computed order differs from
-    the current order. The rebuild is local API work only: a mix run never
-    fetches from YouTube and never writes suggest.items, so the other lanes
-    do not see its content as taken. A failure mid-rebuild leaves the lane
-    short; the next nightly run rebuilds it whole. Put mix lanes LAST in
-    lanes.yml so they read their sources after those have refreshed.
+    the current one. A mix run costs zero YouTube fetches -- it reads its
+    sources over SQL and never writes suggest.items, so the other lanes do not
+    see its content as taken. A failure mid-rebuild leaves the lane short; the
+    next nightly run rebuilds it whole. Put mix lanes LAST in lanes.yml so they
+    read their sources after those have refreshed.
     """
     lane_id = lane["id"]
     mix = lane.get("mix") or {}
     pure = int(mix.get("pure", 0))
     log("\nlane %s  (%s)  policy mix" % (lane_id, lane["title"]))
 
-    def source(src_id):
+    def source(src):
+        owner = src["user"] or ACCOUNT
         src_plid = one("SELECT plid FROM suggest.lanes WHERE account=%s AND lane=%s;"
-                       % (acct(), lit(src_id)))
+                       % (lit(owner), lit(src["lane"])))
         if not src_plid:
-            raise Aborted("source lane %r has no playlist yet" % src_id)
-        pl = api("GET", "/api/v1/auth/playlists/" + src_plid)
-        return [v["videoId"] for v in (pl.get("videos") or [])]
+            raise Aborted("source lane %r of %s has no playlist yet"
+                          % (src["lane"], owner))
+        return [vid for vid, ucid in playlist_videos(src_plid)
+                if ucid not in blocked
+                and not (lane["exclude_watched"] and vid in watched_set)]
 
     sources = mix_sources(mix)
     for s in sources:
-        s["vids"] = source(s["lane"])
+        s["vids"] = source(s)
     desired = weighted_mix(sources, lane["size"], pure)
     log("  %d of %d slots; %s"
         % (len(desired), lane["size"],
-           ", ".join("%s %d avail/%.0f%%" % (s["lane"], len(s["vids"]),
+           ", ".join("%s %d avail/%.0f%%" % (s["key"], len(s["vids"]),
                                              s["share"] * 100) for s in sources)))
 
     plid, playlist = playlist_of(lane, dry)
@@ -1690,7 +1741,8 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
                 removed, added, kept, used = run_lane_last_played(
                     lane, watched, blocked, fetcher, args.dry_run)
             elif lane["policy"] == "mix":
-                removed, added, kept, used = run_lane_mix(lane, args.dry_run)
+                removed, added, kept, used = run_lane_mix(
+                    lane, watched_set, blocked, args.dry_run)
             else:
                 removed, added, kept, used = run_lane(
                     lane, watched, watched_set, subs, blocked, fetcher,
@@ -1943,7 +1995,14 @@ def shuffle_lane(lane, orders, dry):
         # move once a night no matter how often the sources are reordered.
         mix = lane.get("mix") or {}
         sources = mix_sources(mix)
-        if any(orders.get(s["lane"]) is None for s in sources):
+        for s in sources:
+            # A source in another account was reordered by that account's own
+            # pass, which may not have happened yet. Read its current order out
+            # of the database instead: that is exactly what a reader of that
+            # lane sees right now, and it costs one query.
+            s["order"] = (orders.get(s["lane"]) if not s["user"]
+                          else source_order(s))
+        if any(s["order"] is None for s in sources):
             log("lane %-16s sources not reordered this run, skipped" % lane_id)
             return before
         # Restrict each source to what this playlist ALREADY holds, and mix over
@@ -1954,7 +2013,7 @@ def shuffle_lane(lane, orders, dry):
         # prevent. Membership stays the nightly run's decision.
         present = {it["vid"] for it in items}
         for s in sources:
-            s["vids"] = [vid for vid in orders[s["lane"]] if vid in present]
+            s["vids"] = [vid for vid in s["order"] if vid in present]
         want = weighted_mix(sources, len(items), int(mix.get("pure", 0)))
         rank = {vid: n for n, vid in enumerate(want)}
         ordered = sorted(items, key=lambda it: rank.get(it["vid"], 10**6))
