@@ -145,6 +145,7 @@ BLOCKLIST_DEFAULTS = {
 # Rate limit, global for the whole run. 20 per minute = one call every 3 s.
 RATE_PER_MIN = 20
 MAX_FETCHES = 320
+DAYS_BEFORE_RETRYING_A_BROKEN_VIDEO = 30
 MAX_CONSECUTIVE_FAILS = 5
 DRY_SEEDS = 10          # a dry run uses few seeds; the nightly run uses the config
 
@@ -319,8 +320,10 @@ def upload_quality(title, author):
     """Lower is better. Picks the artist's own upload over a re-upload."""
     artist, _ = parse_song(title, author)
     chan = _flatten(re.sub(r"(?i)vevo|official|topic", " ", author or "")).replace(" ", "")
-    if artist and chan and (artist == chan or artist in chan or chan in artist):
-        return 0                                   # the artist's own channel
+    is_the_artists_own_channel = bool(
+        artist and chan and (artist == chan or artist in chan or chan in artist))
+    if is_the_artists_own_channel:
+        return 0
     if re.search(r"(?i)\bofficial\b", title or ""):
         return 1
     return 2
@@ -361,6 +364,17 @@ def lit(value):
     if value is None:
         return "NULL"
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _typed_views_literal(views):
+    """A views value for a VALUES row, cast so an all-NULL batch still reads as bigint.
+
+    Postgres types a VALUES-derived column from its literals, not from the
+    insert target, and an untyped all-NULL column resolves to text.
+    """
+    if isinstance(views, (int, float)):
+        return str(int(views))
+    return "NULL::bigint"
 
 
 def parse_published(rec):
@@ -479,6 +493,26 @@ def api(method, path, body=None):
     return json.loads(raw) if raw else None
 
 
+def unfetchable_videos():
+    """Ids no run should try again, so none re-pays the timeouts they already cost."""
+    return {r[0] for r in query(
+        "SELECT vid FROM suggest.video_dead WHERE until > now();")}
+
+
+def cached_video_meta():
+    """The permanent metadata cache, keyed by video id."""
+    return {vid: {"genre": genre or None,
+                  "seconds": int(seconds) if seconds else 0,
+                  "authorId": author_id or None, "author": author,
+                  "title": title or "",
+                  "views": int(views) if views else None,
+                  "genre_known": genre_known == "t"}
+            for vid, genre, seconds, author_id, title, author, views, genre_known
+            in query("SELECT vid, genre, seconds, author_id, title, "
+                     "coalesce(author,''), views, coalesce(genre_known,true) "
+                     "FROM suggest.video_meta;")}
+
+
 class Fetcher:
     """Paces and caches every call that can reach YouTube."""
 
@@ -493,20 +527,8 @@ class Fetcher:
         self.dead_hits = 0
         self.lane_cap = None
         self.lane_used = 0
-        # Videos that could not be fetched. Without this every run pays the same
-        # three seconds again for the same handful of broken ids, for ever.
-        self.dead = {r[0] for r in query(
-            "SELECT vid FROM suggest.video_dead WHERE until > now();")}
-        self.meta = {}
-        for vid, genre, seconds, author_id, title, author, views, gk in query(
-                "SELECT vid, genre, seconds, author_id, title, coalesce(author,''), views, "
-                "coalesce(genre_known,true) FROM suggest.video_meta;"):
-            self.meta[vid] = {"genre": genre or None,
-                              "seconds": int(seconds) if seconds else 0,
-                              "authorId": author_id or None, "author": author,
-                              "title": title or "",
-                              "views": int(views) if views else None,
-                              "genre_known": gk == "t"}
+        self.dead = unfetchable_videos()
+        self.meta = cached_video_meta()
 
     def _pace(self):
         wait = self.interval - (time.monotonic() - self.last)
@@ -521,7 +543,7 @@ class Fetcher:
         """Full API answer. Costs one YouTube fetch. None if the video is gone."""
         if vid in self.dead:
             self.dead_hits += 1
-            return None                          # known bad, costs nothing
+            return None
         if self.fetches >= self.budget:
             raise BudgetSpent("run budget %d spent" % self.budget)
         if self.lane_cap and self.lane_used >= self.lane_cap:
@@ -537,30 +559,32 @@ class Fetcher:
                 if data and not data.get("error"):
                     self._remember(vid, data)
                     return data
-                self.bury(vid, 30, "no such video")
-                return None                      # upstream says: no such video
+                self.bury(vid, DAYS_BEFORE_RETRYING_A_BROKEN_VIDEO, "no such video")
+                return None
             except urllib.error.HTTPError as e:
                 self.fetches += 1
                 if e.code in (404, 410):
                     self.fails = 0
                     self.bury(vid, 365, "http %d" % e.code)
                     return None
-                # A 500 on one video is an upstream parser bug, not an outage.
-                # Ask the health endpoint which of the two this is. Bury it for a
-                # month only: a Watchtower update may well fix the parser.
-                if e.code >= 500 and self._alive():
+                if self._is_a_parser_bug_not_an_outage(e):
                     self.fails = 0
                     self.skipped_500 += 1
-                    self.bury(vid, 30, "upstream 500")
+                    self.bury(vid, DAYS_BEFORE_RETRYING_A_BROKEN_VIDEO,
+                              "upstream 500")
                     log("  skipping %s (upstream 500, Invidious is healthy)" % vid)
                     return None
                 self._trouble(e, delay)
                 delay *= 2
-            except Exception as e:               # timeout, connection reset
+            except Exception as e:
                 self.fetches += 1
                 self._trouble(e, delay)
                 delay *= 2
         return None
+
+    def _is_a_parser_bug_not_an_outage(self, error):
+        """True when Invidious is healthy but fails on this one video."""
+        return error.code >= 500 and self._alive()
 
     def bury(self, vid, days, reason):
         """Remember a video that cannot be fetched, so no later run retries it."""
@@ -655,19 +679,10 @@ class Fetcher:
         for vid, m in entries:
             if not m:
                 continue
-            views = m.get("views")
-            # `views` must be cast, not left as a bare NULL. This is an
-            # INSERT ... SELECT over a VALUES-derived table, so Postgres infers
-            # each column's type from the literals rather than from the target
-            # column. A batch where *every* listing lacked a viewCount gives an
-            # all-NULL column, which resolves to text, and the insert dies with
-            # `column "views" is of type bigint but expression is of type text`.
-            # One row carrying a real number hid the bug the rest of the time.
             rows.append("(%s,%s,%s,%s,%s,%s)" % (
                 lit(vid), int(m.get("seconds") or 0), lit(m.get("authorId")),
                 lit((m.get("title") or "")[:300]), lit((m.get("author") or "")[:120]),
-                str(int(views)) if isinstance(views, (int, float))
-                else "NULL::bigint"))
+                _typed_views_literal(m.get("views"))))
             cached = self.meta.setdefault(vid, dict(m))
             cached.setdefault("genre", None)
             cached.setdefault("genre_known", False)
@@ -708,9 +723,10 @@ class Fetcher:
 
 
 def log(msg):
+    """Print one line. A closed pipe (`iv-suggest status | head`) ends the run quietly."""
     try:
         print(msg, flush=True)
-    except BrokenPipeError:        # `iv-suggest status | head` is normal use
+    except BrokenPipeError:
         os._exit(0)
 
 
@@ -907,14 +923,17 @@ def account_order(users):
 
 
 def read_user():
+    """This account's watch history, newest last, and its subscription ucids.
+
+    A missing account aborts rather than exits: one misspelled `users:` entry
+    must not cost the correctly spelled accounts their nightly run.
+    """
     if not ACCOUNT:
         sys.exit("set IV_SUGGEST_ACCOUNT to the Invidious account to fill "
                  "(the value in users.email)")
     row = query("SELECT array_to_string(watched,' '), array_to_string(subscriptions,' ') "
                 "FROM users WHERE email=%s;" % lit(ACCOUNT))
     if not row:
-        # Aborted, not exit: a typo in one users: entry must not cost the
-        # accounts that are spelled correctly their nightly run.
         raise Aborted("no Invidious account %s" % ACCOUNT)
     watched = row[0][0].split() if row[0][0] else []
     subs = set(row[0][1].split()) if len(row[0]) > 1 and row[0][1] else set()
