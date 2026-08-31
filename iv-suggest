@@ -121,6 +121,7 @@ DEFAULTS = {
     "refresh_per_day": 0,     # retire this many of the oldest entries every run
     "rotate_cooldown_days": 21,
     "keep_min": 0,            # never rotate the lane below this many videos
+    "min_watched": 0,         # skip this lane for an account with less history
     "sample_pool": 0,         # weighted random pick over the top N candidates
     "max_channels": 12,       # expand: channel_latest, channels per run
     "max_age_days": 21,       # expand: channel_latest, how new an upload must be
@@ -724,52 +725,59 @@ def log(msg):
         os._exit(0)
 
 
-def load_config():
+_CONFIG_CACHE = {}
+NESTED_LANE_BLOCKS = ("shuffle", "subscription")
+
+
+def read_config():
+    """The parsed lanes.yml, read once per invocation."""
     import yaml
-    with open(CONFIG) as fh:
-        cfg = yaml.safe_load(fh) or {}
-    defaults = dict(DEFAULTS)
-    defaults.update(cfg.get("defaults") or {})
-    # `shuffle` is the one nested block, so it merges key by key instead of
-    # being replaced wholesale: a lane that sets `shuffle: {jitter: 0}` still
-    # gets every other shuffle default.
-    base_shuffle = dict(SHUFFLE_DEFAULTS)
-    base_shuffle.update((cfg.get("defaults") or {}).get("shuffle") or {})
-    base_subscription = dict(DEFAULTS["subscription"])
-    base_subscription.update((cfg.get("defaults") or {}).get("subscription") or {})
-    lanes = []
-    for raw in cfg.get("lanes") or []:
-        lane = dict(defaults)
-        lane.update(raw)
-        lane["shuffle"] = dict(base_shuffle)
-        lane["shuffle"].update(raw.get("shuffle") or {})
-        lane["subscription"] = dict(base_subscription)
-        lane["subscription"].update(raw.get("subscription") or {})
-        lanes.append(lane)
-    return lanes
+    if "cfg" not in _CONFIG_CACHE:
+        with open(CONFIG) as fh:
+            _CONFIG_CACHE["cfg"] = yaml.safe_load(fh) or {}
+    return _CONFIG_CACHE["cfg"]
 
 
-def load_users():
-    """The accounts to manage, as [{email, lanes, overrides}, ...].
+def merge_lane(base, patch):
+    """Lane settings with `patch` applied, merging the nested blocks key by key.
 
-    No `users:` block means the one account in IV_SUGGEST_ACCOUNT with every
-    lane, which is exactly what the install did before there was a block, so a
-    config written for the single account version keeps working untouched.
-
-    An account absent from the list is UNMANAGED. Never auto-enrol: a household
-    member who opens Invidious and finds a dozen playlists the bot made in their
-    account has been surprised, not served.
+    A patch that sets `shuffle: {jitter: 0}` must keep the other shuffle keys:
+    replacing the block wholesale leaves rank_items() without `fatigue`, which
+    raises inside the per-lane try/except and silently stops that lane
+    reordering for good.
     """
-    import yaml
-    with open(CONFIG) as fh:
-        cfg = yaml.safe_load(fh) or {}
-    raw = cfg.get("users") or []
-    if not raw:
-        if not PRIMARY:
-            sys.exit("no users: block in %s and no IV_SUGGEST_ACCOUNT" % CONFIG)
-        return [{"email": PRIMARY, "lanes": "all", "overrides": {}}]
+    merged = dict(base)
+    merged.update(patch)
+    for block in NESTED_LANE_BLOCKS:
+        if isinstance(patch.get(block), dict):
+            merged[block] = dict(base.get(block) or {})
+            merged[block].update(patch[block])
+    return merged
+
+
+def load_config():
+    cfg = read_config()
+    file_defaults = cfg.get("defaults") or {}
+    defaults = merge_lane(
+        dict(DEFAULTS, shuffle=dict(SHUFFLE_DEFAULTS)), file_defaults)
+    return [merge_lane(defaults, raw) for raw in cfg.get("lanes") or []]
+
+
+def instance_accounts():
+    """Every account registered on the Invidious instance."""
+    return [r[0] for r in query("SELECT email FROM users ORDER BY email;")]
+
+
+def watch_count(email):
+    """How many videos an account has watched."""
+    return int(one("SELECT coalesce(array_length(watched, 1), 0) "
+                   "FROM users WHERE email = %s;" % lit(email)) or 0)
+
+
+def named_users(cfg):
+    """The accounts written out in the users: block."""
     users = []
-    for entry in raw:
+    for entry in cfg.get("users") or []:
         email = (entry.get("email") or "").strip()
         if not email:
             sys.exit("a users: entry in %s has no email" % CONFIG)
@@ -779,7 +787,41 @@ def load_users():
     return users
 
 
-def lanes_for(user, lanes):
+def load_users():
+    """The accounts to manage, as [{email, lanes, overrides}, ...].
+
+    With no `auto_enrol:` block only the accounts written out in `users:` are
+    touched, and no block at all means the single IV_SUGGEST_ACCOUNT with every
+    lane -- exactly what a config written before multi-user did.
+
+    `auto_enrol:` reverses that and takes in every account on the instance,
+    including ones registered later. A `users:` entry still wins, so listing
+    somebody is how you give them different lanes rather than how you opt them
+    in. Lanes they cannot fill yet are held back by `min_watched`, so enrolment
+    does not hand a new account a dozen empty playlists.
+    """
+    cfg = read_config()
+    if "users" in _CONFIG_CACHE:
+        return _CONFIG_CACHE["users"]
+    named = named_users(cfg)
+    auto = cfg.get("auto_enrol")
+    if auto is None:
+        if not named:
+            if not PRIMARY:
+                sys.exit("no users: block in %s and no IV_SUGGEST_ACCOUNT" % CONFIG)
+            named = [{"email": PRIMARY, "lanes": "all", "overrides": {}}]
+        _CONFIG_CACHE["users"] = named
+        return named
+    auto = auto if isinstance(auto, dict) else {}
+    skip = {u["email"] for u in named} | set(auto.get("exclude") or [])
+    lanes = auto.get("lanes", "all")
+    users = named + [{"email": email, "lanes": lanes, "overrides": {}}
+                     for email in instance_accounts() if email not in skip]
+    _CONFIG_CACHE["users"] = users
+    return users
+
+
+def lanes_for(user, lanes, watched=None):
     """The lanes one account gets, in lanes.yml order, with its overrides applied.
 
     `lanes: all` is for the account that wants the whole library; everyone else
@@ -789,6 +831,11 @@ def lanes_for(user, lanes):
     The order is lanes.yml's, never the user's list: mix lanes have to run after
     the lanes they read, and that ordering is a property of the config, not of
     who is being filled.
+
+    Pass `watched` to drop the lanes this account has too little history to
+    fill. That is what keeps auto-enrolment from handing a new account a dozen
+    playlists that come back empty; the lanes appear on their own once the
+    history is there.
     """
     want = user.get("lanes", "all")
     if want != "all":
@@ -798,14 +845,12 @@ def lanes_for(user, lanes):
             log("  %s asks for lanes that do not exist: %s"
                 % (user["email"], ", ".join(sorted(missing))))
         lanes = [lane for lane in lanes if lane["id"] in want]
-    out = []
-    for lane in lanes:
-        over = (user.get("overrides") or {}).get(lane["id"])
-        if over:
-            lane = dict(lane)
-            lane.update(over)
-        out.append(lane)
-    return out
+    overrides = user.get("overrides") or {}
+    lanes = [merge_lane(lane, overrides[lane["id"]]) if lane["id"] in overrides
+             else lane for lane in lanes]
+    if watched is None:
+        return lanes
+    return [lane for lane in lanes if watched >= lane["min_watched"]]
 
 
 def account_order(users):
@@ -1468,6 +1513,19 @@ def run_lane_last_played(lane, watched, blocked, fetcher, dry):
     return len(to_drop), added, kept, fetcher.fetches - started
 
 
+def expand_source(src):
+    """One mix source, or one per household account when it says `users: all`."""
+    share = float(src.get("share", 1.0))
+    if src.get("users") != "all":
+        return [{"user": (src.get("user") or "").strip(), "lane": src["lane"],
+                 "share": share, "optional": False}]
+    household = [u["email"] for u in load_users()]
+    if not household:
+        return []
+    return [{"user": email, "lane": src["lane"], "share": share / len(household),
+             "optional": True} for email in household]
+
+
 def mix_sources(mix):
     """The source list of a mix lane, as [{user, lane, share, key}, ...].
 
@@ -1485,19 +1543,24 @@ def mix_sources(mix):
     this reads the same. `share` is the fairness knob: equal shares are an even
     split, and weighting the viewer higher keeps the feed feeling like theirs.
 
+    `users: all` in place of `user` is the whole household at once, which is
+    what a feed for a new account needs: it names nobody, so it keeps working as
+    accounts are enrolled. The block's share is split evenly between them, and a
+    member who has no such lane yet is skipped rather than aborting the mix.
+
     The older `base`/`blend`/`ratio` form is still read so a restored pre-2026-08-17
     config keeps working: `ratio: N` means N base per 1 blend.
     """
     if mix.get("sources"):
-        out = [{"user": (s.get("user") or "").strip(), "lane": s["lane"],
-                "share": float(s.get("share", 1.0))} for s in mix["sources"]]
+        out = [expanded for src in mix["sources"]
+               for expanded in expand_source(src)]
     else:
         base, blend = mix.get("base"), mix.get("blend")
         if not base or not blend:
             raise Aborted("a mix lane needs mix.sources, or mix.base and mix.blend")
         ratio = max(1, int(mix.get("ratio", 2)))
-        out = [{"user": "", "lane": base, "share": float(ratio)},
-               {"user": "", "lane": blend, "share": 1.0}]
+        out = [{"user": "", "lane": base, "share": float(ratio), "optional": False},
+               {"user": "", "lane": blend, "share": 1.0, "optional": False}]
     # Two people's "suggested" are two sources, so the key that weighted_mix
     # counts shares by has to carry the account, not just the lane id.
     for s in out:
@@ -1618,15 +1681,21 @@ def run_lane_mix(lane, watched_set, blocked, dry):
         src_plid = one("SELECT plid FROM suggest.lanes WHERE account=%s AND lane=%s;"
                        % (lit(owner), lit(src["lane"])))
         if not src_plid:
+            if src["optional"]:
+                return None
             raise Aborted("source lane %r of %s has no playlist yet"
                           % (src["lane"], owner))
         return [vid for vid, ucid in playlist_videos(src_plid)
                 if ucid not in blocked
                 and not (lane["exclude_watched"] and vid in watched_set)]
 
-    sources = mix_sources(mix)
-    for s in sources:
+    sources = []
+    for s in mix_sources(mix):
         s["vids"] = source(s)
+        if s["vids"] is not None:
+            sources.append(s)
+    if not sources:
+        raise Aborted("no source lane of %r exists yet" % lane_id)
     desired = weighted_mix(sources, lane["size"], pure)
     log("  %d of %d slots; %s"
         % (len(desired), lane["size"],
@@ -1706,13 +1775,15 @@ def accounts_wanted(args):
 def run_account(user, all_lanes, fetcher, seed_override, args):
     """One account's lanes. Returns how many of them failed."""
     use_account(user["email"])
-    lanes = lanes_for(user, all_lanes)
+    watched, subs = read_user()
+    lanes = lanes_for(user, all_lanes, len(watched))
+    held_back = [l["id"] for l in lanes_for(user, all_lanes)
+                 if l["id"] not in {k["id"] for k in lanes}]
     if args.lane:
         lanes = [l for l in lanes if l["id"] == args.lane]
         if not lanes:
             log("\naccount %s: no lane %r" % (ACCOUNT, args.lane))
             return 0
-    watched, subs = read_user()
     watched_set = set(watched)
     blocked = read_blocked()
     # The watch count is logged because it is the whole cause of a thin lane on
@@ -1721,6 +1792,8 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
         "%d fetches of budget"
         % (ACCOUNT, len(watched), len(subs), len(blocked), len(lanes),
            fetcher.budget - fetcher.fetches))
+    if held_back:
+        log("held back until there is more history: %s" % ", ".join(held_back))
     if blocked:
         log("blocked: %s" % ", ".join(sorted(blocked.values())))
     failed = 0
@@ -1992,7 +2065,9 @@ def shuffle_lane(lane, orders, dry):
             # lane sees right now, and it costs one query.
             s["order"] = (orders.get(s["lane"]) if not s["user"]
                           else source_order(s))
-        if any(s["order"] is None for s in sources):
+        sources = [s for s in sources
+                   if not (s["optional"] and s["order"] is None)]
+        if not sources or any(s["order"] is None for s in sources):
             log("lane %-16s sources not reordered this run, skipped" % lane_id)
             return before
         # Restrict each source to what this playlist ALREADY holds, and mix over
@@ -2105,7 +2180,7 @@ def cmd_init(args):
         log("account %s" % user["email"])
         open_session(user["email"])
         use_account(user["email"])
-        for lane in lanes_for(user, all_lanes):
+        for lane in lanes_for(user, all_lanes, watch_count(user["email"])):
             plid, _ = playlist_of(lane, dry=False)
             log("  lane %-16s %s" % (lane["id"], plid))
     log("done: %d accounts ready" % len(users))

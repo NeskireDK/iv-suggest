@@ -28,7 +28,7 @@ only in your shell is missing from the nightly run — test with `env -i`.
 
 ## `lanes.yml`
 
-Four top-level keys: `blocklist`, `users`, `defaults`, `lanes`.
+Five top-level keys: `blocklist`, `auto_enrol`, `users`, `defaults`, `lanes`.
 
 ### `blocklist`
 
@@ -39,11 +39,29 @@ Four top-level keys: `blocklist`, `users`, `defaults`, `lanes`.
 
 Per account, because the playlist keys off its owner.
 
+### `auto_enrol`
+
+Take in every account on the instance, including ones registered later. Omit
+the block and only the accounts written out in `users:` are managed.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `lanes` | `all` | `all`, or a list of lane ids — what an unlisted account gets |
+| `exclude` | `[]` | emails to leave alone |
+
+Enrolment is re-checked on every run, so a new account is picked up the same
+night. It is safe because of `min_watched`: a lane an account cannot fill yet is
+held back rather than created empty, and appears on its own once the history is
+there. Give the account something in the meantime — a `mix` lane sourced from
+`users: all` costs nothing and needs no history.
+
 ### `users`
 
-Who the bot manages. Omit the block entirely and it manages the single
-`IV_SUGGEST_ACCOUNT` with every lane — which is what it did before multi-user,
-so an existing config is unchanged. **An account not listed is never touched.**
+Per-account settings. With `auto_enrol` this is how you give somebody
+*different* lanes, not how you opt them in; without it, it is the whole list of
+managed accounts and **an account not listed is never touched**. Omit both
+blocks and the bot manages the single `IV_SUGGEST_ACCOUNT` with every lane,
+which is what it did before multi-user.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -75,6 +93,7 @@ only**.
 | `policy` | `refill` | `refill` \| `last_played` \| `mix` — see [README](../README.md#what-a-lane-is) |
 | `expand` | `recommended` | where candidates come from: `recommended` \| `channel_latest` \| `subscription_feed` \| `none` |
 | `size` | `30` | videos the lane holds |
+| `min_watched` | `0` | skip this lane for an account with fewer watched videos than this. The gate for auto-enrolment — no state to flip, the lane appears once the history exists |
 | `privacy` | `unlisted` | `unlisted` \| `public` \| `private`. Only `private` breaks `/feed/playlist/<plid>`. **Applied when the playlist is created and never again** — changing a live lane is a database edit |
 | `filter` | `{}` | `{genre: X}` — the only filter key, and `refill` only. One fetch per candidate whose genre is not already cached; the loop gives up after `max(20, room × 3)` checks, which can leave a refill short |
 | **Turnover** | | |
@@ -143,10 +162,11 @@ resolves each added video server-side, outside the bot's pacing.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `sources` | — | **Required.** list of `{lane, share}`, optionally `{user, lane, share}` |
+| `sources` | — | **Required.** list of `{lane, share}`, optionally `{user, lane, share}` or `{users: all, lane, share}` |
 | `sources[].lane` | — | lane id to draw from |
 | `sources[].share` | `1.0` | share of the **output**, checked at every slot, so a 10% source lands about every tenth position rather than in a block |
-| `sources[].user` | the account being filled | draw from another account's copy of that lane — this is what makes a household feed |
+| `sources[].user` | the account being filled | draw from another account's copy of that lane. A named account that has no such lane aborts the mix |
+| `sources[].users` | — | `all` expands to one source per managed account, splitting `share` evenly. Names nobody, so it survives enrolment; a member without that lane yet is skipped rather than aborting |
 | `pure` | `0` | first N slots come from the first source alone, in its own order |
 
 The older `{base, blend, ratio}` form is still read so a pre-2026-08-17 config

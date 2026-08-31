@@ -102,15 +102,20 @@ iv-suggest metrics                                Prometheus text, database only
 
 ## More than one account
 
-`lanes.yml` is the shared library of lanes; a `users:` block says who gets
-which, and a `mix` lane whose sources name other accounts is the household feed.
-Both are in [docs/CONFIG.md](docs/CONFIG.md); the reasoning behind the shape is
-in [docs/MULTI-USER.md](docs/MULTI-USER.md). Two things worth knowing before you
-read either:
+`lanes.yml` is the shared library of lanes; `auto_enrol:` takes in every account
+on the instance, `users:` gives named ones something different, and a `mix` lane
+sourced from `users: all` is the household feed. All three are in
+[docs/CONFIG.md](docs/CONFIG.md); the reasoning is in
+[docs/MULTI-USER.md](docs/MULTI-USER.md). Three things worth knowing first:
 
-- **An account absent from `users:` is never touched.** There is no
-  auto-enrolment — finding a dozen playlists the bot made in your account is a
-  bad first impression.
+- **Without `auto_enrol:`, an account absent from `users:` is never touched.**
+  Enrolment is opt-in by default, because finding a dozen playlists the bot made
+  in your account is a bad first impression.
+- **`min_watched` is what makes enrolling everybody safe.** A lane an account
+  has too little history to fill is held back instead of created empty, and
+  appears on its own once the history is there. There is no phase to switch off:
+  give new accounts a `users: all` mix lane at `min_watched: 0` and they open
+  onto the household's feed until their own lanes are worth having.
 - **One timer, one budget.** The accounts are a loop inside one run, the fetch
   budget is divided rather than multiplied, and whoever succeeded least recently
   is served first, so an exhausted budget starves a different person each night.

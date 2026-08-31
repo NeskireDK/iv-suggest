@@ -8,10 +8,15 @@ blocklist:
   playlist: Blocked
   channels: []
 
-# Who the bot manages. Omitted, so it manages IV_SUGGEST_ACCOUNT with every lane.
+# Every account on the instance, including ones registered later. `min_watched`
+# below is what stops a new account being handed a dozen playlists it cannot
+# fill; `household` is what it gets in the meantime.
+auto_enrol:
+  lanes: all
+  exclude: []
+
+# Listing somebody gives them different lanes. It is not how they opt in.
 #users:
-#  - email: you@example.com
-#    lanes: all
 #  - email: them@example.com
 #    lanes: [suggested, music-discover, fresh-uploads]
 #    overrides:
@@ -29,6 +34,10 @@ defaults:
   dedupe_across_lanes: true
   min_seconds: 120              # drops Shorts
   privacy: unlisted             # a lane is a record of what somebody watches
+  # Every lane here seeds from watch history, so below this it returns nothing
+  # worth showing. `household` overrides it to 0 and carries the account until
+  # the history is there.
+  min_watched: 50
 
   # Tuned by simulation over 72 hourly ticks: ~3.4 new videos in the visible top
   # 10 each hour on a 30-video lane. The first draft (fatigue 0.75 / jitter 0.15)
@@ -227,3 +236,18 @@ lanes:
         - {lane: music-discover, share: 0.10}
       # A source may name another account, which makes this the household feed:
       #   - {user: them@example.com, lane: suggested, share: 0.2}
+
+  # What a newly enrolled account opens onto, and a standing household feed for
+  # everyone else. `users: all` names nobody, so it keeps working as accounts
+  # come and go, and a member without the source lane yet is skipped rather
+  # than aborting the mix. Filtered per viewer like any mix, so the same blend
+  # hides what each person has already watched.
+  - id: household
+    title: "Household"
+    policy: mix
+    size: 40
+    min_watched: 0
+    mix:
+      sources:
+        - {users: all, lane: suggested, share: 0.6}
+        - {users: all, lane: fresh-uploads, share: 0.4}
