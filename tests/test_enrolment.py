@@ -259,6 +259,15 @@ class HouseholdSource(ConfigCase):
         self.assertTrue(all(s["optional"] for s in expanded))
         self.assertFalse(named[0]["optional"])
 
+    def test_a_household_with_nobody_in_it_yields_no_source_at_all(self):
+        """An empty household must come back empty, not divide a share by zero."""
+        mod = self.loaded(LANES + "auto_enrol: {}\n", instance=())
+        self.assertEqual([], mod.load_users())
+        self.assertEqual(
+            [], mod.expand_source({"users": "all", "lane": "suggested"}))
+        self.assertEqual(
+            [], mod.mix_sources({"sources": [{"users": "all", "lane": "suggested"}]}))
+
 
 
 class InertKeys(ConfigCase):
@@ -310,6 +319,19 @@ lanes:
     policy: last_played
 """)
         self.assertEqual([], mod.load_config()[0]["ignored"])
+
+    def test_a_mix_lane_is_told_about_a_key_only_refill_reads(self):
+        mod = self.loaded("""
+lanes:
+  - id: home
+    title: Home
+    policy: mix
+    ttl_days: 3
+    exclude_watched: false
+    mix: {base: suggested, blend: music}
+""")
+        self.assertEqual(["ttl_days"], mod.load_config()[0]["ignored"],
+                         "exclude_watched and mix are the two keys mix reads")
 
     def test_the_warning_says_the_lane_and_the_policy(self):
         mod = self.loaded("""

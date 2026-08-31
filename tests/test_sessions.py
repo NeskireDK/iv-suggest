@@ -6,6 +6,7 @@ is the opposite one -- issuing a fresh login on every run, which would fill the
 account's session list with the bot.
 """
 
+import re
 import unittest
 import urllib.error
 
@@ -18,10 +19,10 @@ OTHER = "sofie@example.com"
 class Fake:
     """Stands in for the psql helpers, and records what was written."""
 
-    def __init__(self, sessions=None, users=(ME, OTHER)):
-        # account -> session id, as suggest.accounts joined to session_ids
+    def __init__(self, sessions=None, users=(ME, OTHER), owners=None):
         self.sessions = dict(sessions or {})
         self.users = set(users)
+        self.owners = dict(owners or {})
         self.written = []
 
     def install(self, mod):
@@ -32,10 +33,14 @@ class Fake:
         return self
 
     def one(self, sql):
+        joined = "s.email=a.account" in re.sub(r"\s+", "", sql)
         if "FROM suggest.accounts" in sql:
             for account, sid in self.sessions.items():
-                if mod_lit(account) in sql:
-                    return sid
+                if mod_lit(account) not in sql:
+                    continue
+                if joined and self.owners.get(sid, account) != account:
+                    return ""
+                return sid
             return ""
         if "FROM users WHERE email" in sql:
             return "1" if any(mod_lit(u) in sql for u in self.users) else ""
@@ -95,13 +100,13 @@ class Sessions(unittest.TestCase):
         self.assertIn("ON CONFLICT (account) DO UPDATE", fake.written[0],
                       "the stale row has to be overwritten, not duplicated")
 
-    def test_the_lookup_joins_session_ids(self):
-        captured = []
-        self.mod.one = lambda sql: captured.append(sql) or ""
-        self.mod.session_of(ME)
-        self.assertIn("JOIN session_ids", captured[0])
-        self.assertIn("s.email = a.account", captured[0],
-                      "a session belonging to someone else must not match")
+    def test_a_session_row_owned_by_someone_else_is_not_reused(self):
+        """Acting as one account with another's login would be the worst bug here."""
+        fake = Fake(sessions={ME: "belongs-to-other"},
+                    owners={"belongs-to-other": OTHER}).install(self.mod)
+        self.assertEqual("", self.mod.session_of(ME))
+        self.assertNotEqual("belongs-to-other", self.mod.open_session(ME))
+        self.assertEqual(1, len(fake.written), "a fresh login has to be issued")
 
 
 class Credentials(unittest.TestCase):
