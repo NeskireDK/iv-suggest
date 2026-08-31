@@ -150,10 +150,34 @@ class HistoryGate(ConfigCase):
                          [l["id"] for l in mod.lanes_for(user, mod.load_config(), 900)])
 
     def test_no_count_given_means_no_gate(self):
-        """`iv-suggest status` and the config tests ask for the lanes as written."""
+        """Callers reporting what is held back need the ungated list to subtract."""
         mod = self.loaded(LANES + "auto_enrol: {}\n", instance=(ME, OTHER))
         user = mod.load_users()[0]
         self.assertEqual(3, len(mod.lanes_for(user, mod.load_config())))
+
+
+class EnrolledLanes(ConfigCase):
+    """Every reporter has to see what the filler will run, not what is configured."""
+
+    def gated(self, mod, watched):
+        mod.watch_count = lambda email: watched
+        return [l["id"] for l in
+                mod.enrolled_lanes(mod.load_users()[0], mod.load_config())]
+
+    def test_a_reporter_sees_only_the_lanes_the_filler_will_run(self):
+        mod = self.loaded(LANES + "auto_enrol: {}\n", instance=(ME, OTHER))
+        self.assertEqual(["household"], self.gated(mod, 3))
+
+    def test_history_opens_the_rest_to_the_reporter_too(self):
+        mod = self.loaded(LANES + "auto_enrol: {}\n", instance=(ME, OTHER))
+        self.assertEqual(["suggested", "fresh-uploads", "household"],
+                         self.gated(mod, 900))
+
+    def test_a_named_lane_list_still_narrows_the_gated_result(self):
+        listed = LANES + ("users:\n  - email: %s\n    lanes: [suggested, household]\n"
+                          % ME)
+        mod = self.loaded(listed, instance=(ME,))
+        self.assertEqual(["suggested", "household"], self.gated(mod, 900))
 
 
 class HouseholdSource(ConfigCase):
