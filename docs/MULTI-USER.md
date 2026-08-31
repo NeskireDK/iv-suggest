@@ -1,8 +1,12 @@
 # Multi-user: why it is shaped this way
 
-Status: **built and merged, not yet deployed.** Written and implemented
-2026-08-31. What remains is a `run --dry-run` against the real instance, which
-needs the API and so cannot happen anywhere else.
+Status: **live since 2026-08-31 12:49, running single-account.** The schema, the
+per-account session and the account scoping are deployed and in use. What is not
+exercised is multi-account operation itself: with no `users:` block,
+`load_users()` falls through to the single `IV_SUGGEST_ACCOUNT` path, so the
+`users:` code, session minting for a *new* account and the cross-account mix
+source have never run. Auto-enrolment, which changes that, is in
+[PUBLIC-FEED.md](PUBLIC-FEED.md).
 
 How to configure it is in [CONFIG.md](CONFIG.md). This is the reasoning, the
 findings that are not obvious from the code, and the decisions that were taken
@@ -61,18 +65,23 @@ One timer, one hourly shuffle, both looping internally. No per-account units.
   only make the mix quietly incomplete and give it a second failure mode to
   debug.
 - **Unlisted everywhere, new accounts and existing.** `public` bought nothing —
-  see the README design note. The lanes that already existed were flipped in
-  place with the SQL below.
+  see the README design note. The twelve lanes that already existed were flipped
+  in place with the SQL below, and the fork needed a matching change so a feed
+  could still be backed by an unlisted playlist.
 - **A copy of the mix in each account, not one on a service account.** A mix
   lane is an ordinary lane an account opts into, whose sources happen to name
   other people. No service account, simpler to consume.
 - **No cold-start ladder.** A new account's lanes start thin, and the engine
   needs watch depth rather than tuning. No history-depth gates, no forced
   subscription-only diet. The one concession is a log line: `run_account()`
-  prints `account X: N watched`, so a thin lane has a visible cause. What to
-  serve in the meantime is [PUBLIC-FEED.md](PUBLIC-FEED.md).
+  prints `account X: N watched`, so a thin lane has a visible cause.
+- ~~**Never auto-enrol.**~~ **Reversed 2026-08-31.** The rule was written for a
+  stranger finding a dozen unexplained playlists in their account; on a family
+  instance its only effect was that the second account got nothing for three
+  weeks. Every account is enrolled automatically, and the account with no
+  history gets the compiled mix — both in [PUBLIC-FEED.md](PUBLIC-FEED.md).
 
-## Gotchas for the deploy
+## Verification still owed, after the fact
 
 - **`playlist_of()` only PATCHes privacy at create time**, so changing a live
   lane's privacy is a database edit, not something a run repeats:
@@ -83,14 +92,20 @@ One timer, one hourly shuffle, both looping internally. No per-account units.
   ```
 
   Scoped to registered lanes on purpose — playlists the account made by hand are
-  none of the bot's business.
-- **No `users:` block is a valid deploy** and means exactly today's behaviour,
-  so the first deploy can skip writing one and add the second account after.
-- **Does an issued SID survive the nightly `pg_dump` restore?** `session_ids` is
-  in the dump, so it should. Confirm rather than assume — this is the one thing
-  that would silently log the bot out of every account at once.
+  none of the bot's business. It is also why the code's `privacy` default only
+  governs newly created playlists.
+- **The first timer-driven full `run` has not happened on this code.** The
+  2026-08-31 fill was a manual foreground run straight after the deploy; only the
+  hourly shuffle has run from a timer since.
+- **Does an issued SID survive the nightly 05:00 `pg_dump` restore?** Now a live
+  failure mode rather than a pre-deploy question, and the one thing that would
+  silently log the bot out of every account at once. `session_ids` is in the
+  dump, so it should. Confirm rather than assume.
+- **`IV_SUGGEST_TOKEN` is still in `/etc/iv-suggest/env` and is now dead code** —
+  `api()` prefers the session unconditionally. Remove it after a few clean
+  nights from 2026-08-31.
 
-## Pre-deploy checks that have passed
+## Checks that passed before the deploy
 
 - **Migration against a copy of the real database**, 2026-08-31. `pg_dump
   --schema=suggest` off LXC 109 restored into a throwaway postgres, migrated,
