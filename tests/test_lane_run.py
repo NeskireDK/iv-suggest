@@ -493,6 +493,32 @@ class Filter(LaneCase):
         self.assertEqual(2, len(got))
 
 
+class RunContext(LaneCase):
+    """The values that hold still for a whole account must not be interchangeable."""
+
+    def test_watched_subscribed_and_blocked_each_reject_their_own_candidate(self):
+        recs = {"h0000000000": {"recommendedVideos": [
+            rec("ccccccccccc", author_id="UC-ok"),
+            rec("ddddddddddd", author_id="UC-sub"),
+            rec("eeeeeeeeeee", author_id="UC-bad"),
+            rec("fffffffffff", author_id="UC-ok")]}}
+        self.fill(self.lane(), watched=["h0000000000", "fffffffffff"],
+                  subs=["UC-sub"], blocked={"UC-bad": "Bad"},
+                  db=Db(), api=Api(), fetch=Fetch(recs=recs))
+        self.assertEqual(["ccccccccccc"], self.api.added())
+        rejected = self.logged("rejected")[0]
+        self.assertIn("'watched': 1", rejected)
+        self.assertIn("'subscribed': 1", rejected)
+        self.assertIn("'blocked': 1", rejected)
+
+    def test_one_fetcher_is_shared_by_the_seed_scan_and_the_expansion(self):
+        fetch = Fetch(recs={"h0000000000": {"recommendedVideos": [rec("ccccccccccc")]}})
+        removed, added, kept, used = self.fill(
+            self.lane(), watched=["h0000000000"], db=Db(), api=Api(), fetch=fetch)
+        self.assertEqual(fetch.fetches, used)
+        self.assertEqual(1, added)
+
+
 class GenreAndSampling(LaneCase):
     """The branches that cost extra fetches or bring randomness in."""
 
