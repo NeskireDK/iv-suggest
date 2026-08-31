@@ -34,8 +34,10 @@ import secrets
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.request
+from collections import namedtuple
 from datetime import datetime, timezone
 
 # Deployment specific, all overridable from the environment. The defaults below
@@ -262,16 +264,6 @@ SHUFFLE_DEFAULTS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# song identity: collapse re-uploads of the same song
-#
-# A YouTube music title is nearly always "Artist - Title (qualifiers)". Strip
-# every qualifier, split on the dash, then remove the spaces so "Freebird" meets
-# "Free Bird". The match key is the TITLE alone, because a re-upload channel
-# often replaces the artist ("American Pie Song" by "Hit Usa songs").
-
-import unicodedata
-
 _NOISE = [
     r"official (music )?(video|audio|lyric video|visuali[sz]er)",
     r"music video", r"lyric video", r"lyrics?", r"audio only", r"audio",
@@ -301,7 +293,11 @@ def _flatten(text):
 
 
 def parse_song(title, author=""):
-    """Return (artist, song_key). The artist may be empty."""
+    """Return (artist, song_key) for "Artist - Title (qualifiers)". Artist may be empty.
+
+    The key is the flattened TITLE alone, because a re-upload channel often
+    replaces the artist ("American Pie Song" by "Hit Usa songs").
+    """
     raw = _BRACKETS_RE.sub(" ", title or "").split("|")[0].lstrip("@# ")
     parts = _SPLIT_RE.split(raw)
     if len(parts) >= 2 and len(_flatten(parts[0])) >= 2:
@@ -336,10 +332,6 @@ class Aborted(Exception):
 
 class BudgetSpent(Aborted):
     pass
-
-
-# --------------------------------------------------------------------------
-# database
 
 
 def _psql(flags, sql):
@@ -419,10 +411,6 @@ def parse_views(rec):
         return None
 
 
-# --------------------------------------------------------------------------
-# invidious API
-
-
 # The signed token from the environment, if the install still has one, and the
 # session the bot holds for the account currently being filled. The session
 # wins: it exists for every account, whereas the token only ever covered one.
@@ -450,18 +438,7 @@ def session_of(email):
 
 
 def open_session(email):
-    """Give the bot a login for an account, once. Returns the session id.
-
-    Invidious accepts a bare SID cookie on /api/v1/auth/* and grants it the
-    full scope of whoever owns it, with no HMAC and no password, because the
-    SID *is* the credential. It is 32 random bytes, so a row in session_ids is
-    all the bot needs to act as an account: no new secret to store, no password
-    prompt, and no second copy of the signed token scheme to maintain.
-
-    These are real logins, so there is exactly one per account and it is
-    reused. Issuing one per run would leave a login in the account's session
-    list every night.
-    """
+    """Give the bot a login for an account, once, and return the session id."""
     sid = session_of(email)
     if sid:
         return sid
@@ -496,10 +473,9 @@ def api(method, path, body=None):
 class Fetcher:
     """Paces and caches every call that can reach YouTube."""
 
-    def __init__(self, rate_per_min=RATE_PER_MIN, budget=MAX_FETCHES, persist=True):
+    def __init__(self, rate_per_min=RATE_PER_MIN, budget=MAX_FETCHES):
         self.interval = 60.0 / max(1, rate_per_min)
         self.budget = budget
-        self.persist = persist
         self.fetches = 0
         self.cache_hits = 0
         self.last = 0.0
@@ -532,9 +508,9 @@ class Fetcher:
     def begin_lane(self, cap):
         self.lane_cap, self.lane_used = cap, 0
 
-    def video(self, vid, force=False):
+    def video(self, vid):
         """Full API answer. Costs one YouTube fetch. None if the video is gone."""
-        if vid in self.dead and not force:
+        if vid in self.dead:
             self.dead_hits += 1
             return None                          # known bad, costs nothing
         if self.fetches >= self.budget:
@@ -580,12 +556,11 @@ class Fetcher:
     def bury(self, vid, days, reason):
         """Remember a video that cannot be fetched, so no later run retries it."""
         self.dead.add(vid)
-        if self.persist:
-            execute("INSERT INTO suggest.video_dead(vid,until,reason) VALUES "
-                    "(%s, now() + interval '%d days', %s) ON CONFLICT (vid) DO "
-                    "UPDATE SET until=EXCLUDED.until, reason=EXCLUDED.reason, "
-                    "seen=now(), hits=suggest.video_dead.hits+1;"
-                    % (lit(vid), days, lit(reason)))
+        execute("INSERT INTO suggest.video_dead(vid,until,reason) VALUES "
+                "(%s, now() + interval '%d days', %s) ON CONFLICT (vid) DO "
+                "UPDATE SET until=EXCLUDED.until, reason=EXCLUDED.reason, "
+                "seen=now(), hits=suggest.video_dead.hits+1;"
+                % (lit(vid), days, lit(reason)))
 
     def channel_latest(self, ucid):
         """Recent uploads of one channel: one fetch for about 60 videos.
@@ -640,19 +615,18 @@ class Fetcher:
              "views": int(views) if isinstance(views, (int, float)) else None,
              "genre_known": True}
         self.meta[vid] = m
-        if self.persist:
-            views_lit = str(int(m["views"])) if m["views"] is not None else "NULL"
-            execute(
-                "INSERT INTO suggest.video_meta"
-                "(vid,genre,seconds,author_id,title,author,views,genre_known) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,true) ON CONFLICT (vid) DO UPDATE SET "
-                "genre=EXCLUDED.genre, seconds=EXCLUDED.seconds, "
-                "author_id=EXCLUDED.author_id, title=EXCLUDED.title, "
-                "author=EXCLUDED.author, views=EXCLUDED.views, "
-                "genre_known=true, fetched=now();"
-                % (lit(vid), lit(m["genre"]), int(m["seconds"] or 0),
-                   lit(m["authorId"]), lit(m["title"][:300]), lit(m["author"][:120]),
-                   views_lit))
+        views_lit = str(int(m["views"])) if m["views"] is not None else "NULL"
+        execute(
+            "INSERT INTO suggest.video_meta"
+            "(vid,genre,seconds,author_id,title,author,views,genre_known) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,true) ON CONFLICT (vid) DO UPDATE SET "
+            "genre=EXCLUDED.genre, seconds=EXCLUDED.seconds, "
+            "author_id=EXCLUDED.author_id, title=EXCLUDED.title, "
+            "author=EXCLUDED.author, views=EXCLUDED.views, "
+            "genre_known=true, fetched=now();"
+            % (lit(vid), lit(m["genre"]), int(m["seconds"] or 0),
+               lit(m["authorId"]), lit(m["title"][:300]), lit(m["author"][:120]),
+               views_lit))
 
     def remember_partial(self, entries):
         """Persist metadata that came free with a listing, for many videos at once.
@@ -690,7 +664,7 @@ class Fetcher:
             cached.setdefault("genre_known", False)
             if m.get("views") is not None:
                 cached["views"] = m["views"]
-        if not rows or not self.persist:
+        if not rows:
             return
         execute("INSERT INTO suggest.video_meta"
                 "(vid,seconds,author_id,title,author,views,genre,genre_known) "
@@ -722,10 +696,6 @@ class Fetcher:
             return m
         data = self.video(vid)
         return self.meta.get(vid) if data else None
-
-
-# --------------------------------------------------------------------------
-# helpers
 
 
 def log(msg):
@@ -1028,10 +998,6 @@ def seed_order(watched, seed_cfg):
     pool = hist[recent:window]
     random.shuffle(pool)
     return hist[:recent] + pool + hist[window:]
-
-
-# --------------------------------------------------------------------------
-# the lane run
 
 
 def run_lane(lane, watched, watched_set, subs, blocked, fetcher, dry,
@@ -1572,30 +1538,7 @@ def expand_source(src):
 
 
 def mix_sources(mix):
-    """The source list of a mix lane, as [{user, lane, share, key}, ...].
-
-    Preferred form is explicit shares, which is the only way to say "10% music":
-
-        mix: {pure: 10, sources: [{lane: suggested, share: 0.9},
-                                  {lane: music-discover, share: 0.1}]}
-
-    A source may name another account, which is what makes a household feed:
-
-        mix: {sources: [{user: a@example.com, lane: suggested, share: 0.5},
-                        {user: b@example.com, lane: suggested, share: 0.5}]}
-
-    No `user` means the account being filled, so every config written before
-    this reads the same. `share` is the fairness knob: equal shares are an even
-    split, and weighting the viewer higher keeps the feed feeling like theirs.
-
-    `users: all` in place of `user` is the whole household at once, which is
-    what a feed for a new account needs: it names nobody, so it keeps working as
-    accounts are enrolled. The block's share is split evenly between them, and a
-    member who has no such lane yet is skipped rather than aborting the mix.
-
-    The older `base`/`blend`/`ratio` form is still read so a restored pre-2026-08-17
-    config keeps working: `ratio: N` means N base per 1 blend.
-    """
+    """The source list of a mix lane, as [{user, lane, share, key}, ...]."""
     if mix.get("sources"):
         out = [expanded for src in mix["sources"]
                for expanded in expand_source(src)]
@@ -1692,29 +1635,10 @@ def weighted_mix(sources, size, pure=0):
 
 
 def run_lane_mix(lane, watched_set, blocked, dry):
-    """Compose one playlist from several source lanes, in a fixed order.
+    """Rebuild one playlist from several source lanes, filtered for the viewer.
 
-    Positions 1..pure hold the first source in its own order. After that every
-    slot goes to whichever source is furthest behind its share. A video present
-    in more than one source appears once, at its first claim.
-
-    A source may belong to another account, which is what turns this into the
-    household feed: everybody's best, blended, rather than any one person's
-    lane. Contributing is not optional -- an opt-out would only make the mix
-    quietly incomplete and give it a second failure mode to debug -- and it is
-    understood that a shared feed shows the household what each person watches.
-
-    The filtering is per VIEWER, not per source: the same video is dropped for
-    the person who already watched it and kept for the one who has not, and
-    each viewer's own blocklist applies to what they are shown. That is the
-    point of the lane.
-
-    The target playlist is rebuilt only when the computed order differs from
-    the current one. A mix run costs zero YouTube fetches -- it reads its
-    sources over SQL and never writes suggest.items, so the other lanes do not
-    see its content as taken. A failure mid-rebuild leaves the lane short; the
-    next nightly run rebuilds it whole. Put mix lanes LAST in lanes.yml so they
-    read their sources after those have refreshed.
+    Costs no YouTube fetch and writes no suggest.items row, so the other lanes
+    never see a mix lane's content as taken.
     """
     lane_id = lane["id"]
     mix = lane.get("mix") or {}
@@ -1774,7 +1698,7 @@ def cmd_run(args):
     all_lanes = load_config()
     warn_ignored_keys(all_lanes)
     users = accounts_wanted(args)
-    fetcher = Fetcher(rate_per_min=args.rate, budget=args.budget, persist=True)
+    fetcher = Fetcher(rate_per_min=args.rate, budget=args.budget)
     seed_override = args.seeds if args.seeds else (DRY_SEEDS if args.dry_run else None)
     log("cache holds %d videos; budget %d fetches at %d per minute%s%s"
         % (len(fetcher.meta), args.budget, args.rate,
@@ -1893,6 +1817,9 @@ def cmd_dedupe(args):
     return 0
 
 
+Upload = namedtuple("Upload", "song quality lane_rank title_len lane plid video")
+
+
 def dedupe_account(args):
     """One account's duplicates.
 
@@ -1909,29 +1836,31 @@ def dedupe_account(args):
         for v in videos:
             key = song_key(v.get("title"), v.get("author"))
             if key:
-                entries.append((key, upload_quality(v.get("title"), v.get("author")),
-                                order.get(lane_id, 99), len(v.get("title") or ""),
-                                lane_id, plid, v))
+                entries.append(Upload(
+                    key, upload_quality(v.get("title"), v.get("author")),
+                    order.get(lane_id, 99), len(v.get("title") or ""),
+                    lane_id, plid, v))
 
     groups = {}
     for e in entries:
-        groups.setdefault(e[0], []).append(e)
+        groups.setdefault(e.song, []).append(e)
 
     removed = 0
     for key, members in sorted(groups.items()):
-        members.sort(key=lambda e: (e[1], e[2], e[3]))
+        members.sort(key=lambda e: (e.quality, e.lane_rank, e.title_len))
         keeper = members[0]
         if not args.dry_run:
             execute("UPDATE suggest.items SET song_key=%s "
                     "WHERE account=%s AND lane=%s AND vid=%s;"
-                    % (lit(key), acct(), lit(keeper[4]),
-                       lit(keeper[6]["videoId"])))
+                    % (lit(key), acct(), lit(keeper.lane),
+                       lit(keeper.video["videoId"])))
         if len(members) == 1:
             continue
         log("\nsong %r" % key)
         log("  KEEP [%-14s] %-52s  by %s"
-            % (keeper[4], keeper[6]["title"][:52], keeper[6].get("author")))
-        for _, _, _, _, lane_id, plid, v in members[1:]:
+            % (keeper.lane, keeper.video["title"][:52], keeper.video.get("author")))
+        for dup in members[1:]:
+            lane_id, plid, v = dup.lane, dup.plid, dup.video
             log("  DROP [%-14s] %-52s  by %s" % (lane_id, v["title"][:52], v.get("author")))
             removed += 1
             if not args.dry_run:
@@ -1972,7 +1901,7 @@ def cmd_views(args):
             vids.update(v["videoId"] for v in videos)
     log("%d unique videos across every lane of every account" % len(vids))
 
-    fetcher = Fetcher(rate_per_min=args.rate, budget=args.budget, persist=True)
+    fetcher = Fetcher(rate_per_min=args.rate, budget=args.budget)
     updated = skipped_500 = dead = failed = 0
     stopped = None
     for vid in sorted(vids):
@@ -2451,8 +2380,13 @@ def cmd_metrics(args):
     return 0
 
 
+def needs_credential(cmd):
+    """False for the two commands that only read the database and call no API."""
+    return cmd not in ("metrics", "shuffle")
+
+
 def main():
-    global TOKEN, SESSION
+    global TOKEN
     p = argparse.ArgumentParser(description="lane based suggestion playlists")
     sub = p.add_subparsers(dest="cmd", required=True)
     i = sub.add_parser("init", help="schema, sessions and any missing playlists")
@@ -2483,12 +2417,7 @@ def main():
     s.add_argument("--lane")
     s.add_argument("--account", help="reorder only this account")
     args = p.parse_args()
-    # "metrics" reads only the database, so it must work without the token.
-    # The stats timer runs it every 15 minutes as a plain reader. "shuffle" is
-    # the same: it permutes playlists.index in SQL and calls no API at all.
-    # Each command picks up the session of the account it is serving as it goes;
-    # the token is only the fallback for an install that has not opened one yet.
-    if args.cmd not in ("metrics", "shuffle"):
+    if needs_credential(args.cmd):
         TOKEN = load_token()
     return {"init": cmd_init, "run": cmd_run, "status": cmd_status,
             "metrics": cmd_metrics, "dedupe": cmd_dedupe,

@@ -149,6 +149,13 @@ class Credentials(unittest.TestCase):
         self.mod.api("GET", "/api/v1/auth/playlists")
         self.assertEqual("Bearer {}", self.sent[0].get("Authorization"))
 
+    def test_the_two_pure_readers_need_no_credential(self):
+        """metrics and shuffle read the database and call no API at all."""
+        self.assertFalse(self.mod.needs_credential("metrics"))
+        self.assertFalse(self.mod.needs_credential("shuffle"))
+        for cmd in ("init", "run", "status", "dedupe", "views"):
+            self.assertTrue(self.mod.needs_credential(cmd), cmd)
+
     def test_no_credential_names_the_account_it_is_missing_for(self):
         self.mod.SESSION = None
         self.mod.TOKEN = None
