@@ -120,6 +120,16 @@ DEFAULTS = {
     "played_decay": 0.99,     # last_played: score falloff per rank in play order
 }
 
+# Channels no lane may offer. The list is an ordinary Invidious playlist on the
+# bot's own account, which is what makes it editable from every client: "add to
+# playlist" sits in the same menu as everything else, and `playlist_videos.ucid`
+# records the channel of each entry. Tapping one video therefore blocks its
+# channel. Server side, so it is the same list on the phone, the TV and the web.
+BLOCKLIST_DEFAULTS = {
+    "playlist": "Blocked",    # playlist title on IV_SUGGEST_ACCOUNT; "" disables
+    "channels": [],           # extra channel ids, for a channel with nothing to tap
+}
+
 # Rate limit, global for the whole run. 20 per minute = one call every 3 s.
 RATE_PER_MIN = 20
 MAX_FETCHES = 320
@@ -640,6 +650,43 @@ def read_user():
     return watched, subs
 
 
+def read_blocked():
+    """Channel ids no lane may offer, as {ucid: channel name}.
+
+    Two sources, unioned. The first is a plain Invidious playlist on the bot's
+    own account: every client can already add a video to a playlist, and the
+    playlist is server side, so the list needs no new endpoint, no fork change
+    and no per-device sync. A video is only a handle on its channel here — one
+    entry blocks everything that channel publishes, and the entry can stay in
+    the playlist as the record of why. The second is `blocklist.channels` in
+    the config, for a channel with no video convenient to tap.
+
+    A lane playlist is excluded by id: naming a lane "Blocked" would otherwise
+    feed the lane's own contents back as a blocklist and empty it.
+    """
+    cfg = dict(BLOCKLIST_DEFAULTS)
+    try:
+        import yaml
+        with open(CONFIG) as fh:
+            cfg.update((yaml.safe_load(fh) or {}).get("blocklist") or {})
+    except OSError:
+        pass
+    blocked = {}
+    title = (cfg.get("playlist") or "").strip()
+    if title and ACCOUNT:
+        for ucid, author in query(
+                "SELECT DISTINCT coalesce(pv.ucid,''), coalesce(pv.author,'') "
+                "FROM playlists p JOIN playlist_videos pv ON pv.plid = p.id "
+                "WHERE p.author=%s AND lower(p.title)=lower(%s) "
+                "AND p.id NOT IN (SELECT plid FROM suggest.lanes);"
+                % (lit(ACCOUNT), lit(title))):
+            if ucid:
+                blocked[ucid] = author or ucid
+    for ucid in cfg.get("channels") or []:
+        blocked.setdefault(str(ucid), str(ucid))
+    return blocked
+
+
 def playlist_of(lane, dry):
     """The stable playlist for a lane. Create it once, never recreate it."""
     lane_id, title = lane["id"], lane["title"]
@@ -706,7 +753,8 @@ def matches(meta, lane):
 # the lane run
 
 
-def run_lane(lane, watched, watched_set, subs, fetcher, dry, seed_override=None):
+def run_lane(lane, watched, watched_set, subs, blocked, fetcher, dry,
+             seed_override=None):
     lane_id = lane["id"]
     log("\nlane %s  (%s)" % (lane_id, lane["title"]))
     started = fetcher.fetches
@@ -742,7 +790,11 @@ def run_lane(lane, watched, watched_set, subs, fetcher, dry, seed_override=None)
     for v in current:
         vid = v["videoId"]
         why = None
-        if lane["exclude_watched"] and vid in watched_set:
+        # Blocked first: a channel blocked today must leave the lanes tonight,
+        # not in `ttl_days` time.
+        if v.get("authorId") in blocked:
+            why = "blocked"
+        elif lane["exclude_watched"] and vid in watched_set:
             why = "watched"
         elif ttl and added_at.get(vid, "9999") < old:
             why = "expired"
@@ -766,6 +818,12 @@ def run_lane(lane, watched, watched_set, subs, fetcher, dry, seed_override=None)
         log("  - %-9s %s" % (why, v["title"][:60]))
         if not dry:
             api("DELETE", "/api/v1/auth/playlists/%s/videos/%s" % (plid, v["indexId"]))
+            if why == "blocked":
+                # No cooldown on purpose: the blocklist is what keeps it out, so
+                # unblocking the channel must let its videos back the same night.
+                execute("DELETE FROM suggest.items WHERE lane=%s AND vid=%s;"
+                        % (lit(lane_id), lit(v["videoId"])))
+                continue
             days = {"watched": lane["watched_cooldown_days"],
                     "rotated": lane["rotate_cooldown_days"]}.get(
                         why, lane["cooldown_days"])
@@ -798,6 +856,10 @@ def run_lane(lane, watched, watched_set, subs, fetcher, dry, seed_override=None)
         if len(seeds) >= limit or scan <= 0:
             break
         scan -= 1
+        # Cache only, never a fetch: an unknown seed is worth expanding, and the
+        # candidate check catches its recommendations anyway.
+        if (fetcher.meta.get(vid) or {}).get("authorId") in blocked:
+            continue
         if want_genre:
             try:
                 meta = fetcher.meta_of(vid)
@@ -852,7 +914,7 @@ def run_lane(lane, watched, watched_set, subs, fetcher, dry, seed_override=None)
         counts = {}
         for vid in seeds:
             cid = (fetcher.meta.get(vid) or {}).get("authorId")
-            if cid and cid not in subs:
+            if cid and cid not in subs and cid not in blocked:
                 counts[cid] = counts.get(cid, 0) + 1
         # Weighted draw, not the plain top N: a channel watched twice still gets
         # a turn now and then instead of never.
@@ -896,9 +958,12 @@ def run_lane(lane, watched, watched_set, subs, fetcher, dry, seed_override=None)
         kinds = [k for k in (sub_cfg.get("kinds") or ["video"]) if k in SUB_KINDS]
         hours = int(sub_cfg.get("max_age_hours") or 0)
         rank_by = sub_cfg.get("rank") or "views"
+        # A blocked channel may still be subscribed: the subscription feed is
+        # the one source that reads `subs` directly, so subtract there too.
+        feed_subs = subs - set(blocked)
         if not kinds:
             log("  no valid kinds configured, nothing to do")
-        elif not subs:
+        elif not feed_subs:
             log("  the account has no subscriptions, nothing to do")
         else:
             window = ("AND published > now() - interval '%d hours'" % hours) if hours else ""
@@ -908,11 +973,11 @@ def run_lane(lane, watched, watched_set, subs, fetcher, dry, seed_override=None)
                 "coalesce(length_seconds,0), coalesce(views,0) "
                 "FROM channel_videos WHERE ucid IN (%s) AND kind IN (%s) %s "
                 "ORDER BY %s LIMIT %d;"
-                % (",".join(lit(u) for u in sorted(subs)),
+                % (",".join(lit(u) for u in sorted(feed_subs)),
                    ",".join(lit(k) for k in kinds), window, order,
                    max(60, room * 12)))
             log("  %s: %d candidate(s) over %d channel(s), ranked by %s"
-                % (",".join(kinds), len(rows), len(subs), rank_by))
+                % (",".join(kinds), len(rows), len(feed_subs), rank_by))
             for rank, r in enumerate(rows):
                 rid = r[0]
                 if not VID_RE.match(rid):
@@ -978,7 +1043,7 @@ def run_lane(lane, watched, watched_set, subs, fetcher, dry, seed_override=None)
 
     rejected = {"watched": 0, "subscribed": 0, "cooldown": 0, "in_lane": 0,
                 "other_lane": 0, "short": 0, "long": 0, "genre": 0,
-                "channel_cap": 0, "same_song": 0, "dead": 0}
+                "channel_cap": 0, "same_song": 0, "dead": 0, "blocked": 0}
     chosen = []
     genre_wanted = (lane.get("filter") or {}).get("genre")
     checked = 0
@@ -1001,6 +1066,9 @@ def run_lane(lane, watched, watched_set, subs, fetcher, dry, seed_override=None)
             rejected["other_lane"] += 1
             continue
         meta = fetcher.known(vid) or meta_seen.get(vid) or {}
+        if meta.get("authorId") in blocked:
+            rejected["blocked"] += 1
+            continue
         if lane["exclude_subscribed"] and meta.get("authorId") in subs:
             rejected["subscribed"] += 1
             continue
@@ -1078,7 +1146,7 @@ def run_lane(lane, watched, watched_set, subs, fetcher, dry, seed_override=None)
     return len(drop), len(chosen) - refused, len(keep), fetcher.fetches - started
 
 
-def run_lane_last_played(lane, watched, fetcher, dry):
+def run_lane_last_played(lane, watched, blocked, fetcher, dry):
     """Hold the N most recently PLAYED videos that match the lane.
 
     Invidious does `array_append(array_remove(watched, id), id)` on every play, so
@@ -1116,6 +1184,8 @@ def run_lane_last_played(lane, watched, fetcher, dry):
                 continue
         else:
             meta = fetcher.meta.get(vid) or {}
+        if meta.get("authorId") in blocked:
+            continue
         if lane["dedupe_songs"]:
             key = song_key(meta.get("title"), meta.get("author"))
             if key and key in keys:
@@ -1139,6 +1209,12 @@ def run_lane_last_played(lane, watched, fetcher, dry):
 
     keep_set = set(desired)
     to_drop = [v for vid, v in current.items() if vid not in keep_set] if complete else []
+    # The grow-only rule above protects entries the scan never reached. A blocked
+    # channel is not one of those: its videos leave whether the scan finished or
+    # not, so they are collected separately and merged.
+    dropped = {v["videoId"] for v in to_drop}
+    to_drop += [v for vid, v in current.items()
+                if vid not in dropped and v.get("authorId") in blocked]
     to_add = [v for v in desired if v not in current]
 
     # Give every entry a score from its last-played rank. This lane used to
@@ -1157,7 +1233,9 @@ def run_lane_last_played(lane, watched, fetcher, dry):
                 "WHERE i.lane = x.lane AND i.vid = x.vid;" % values)
 
     for v in to_drop:
-        log("  - not played lately: %s" % (v["title"] or "")[:60])
+        log("  - %s: %s"
+            % ("blocked" if v.get("authorId") in blocked else "not played lately",
+               (v["title"] or "")[:60]))
         if not dry:
             api("DELETE", "/api/v1/auth/playlists/%s/videos/%s" % (plid, v["indexId"]))
             execute("DELETE FROM suggest.items WHERE lane=%s AND vid=%s;"
@@ -1326,9 +1404,12 @@ def cmd_run(args):
             sys.exit("no lane named %r in %s" % (args.lane, CONFIG))
     watched, subs = read_user()
     watched_set = set(watched)
-    log("account %s: %d watched, %d subscriptions, %d lanes%s"
-        % (ACCOUNT, len(watched), len(subs), len(lanes),
+    blocked = read_blocked()
+    log("account %s: %d watched, %d subscriptions, %d blocked, %d lanes%s"
+        % (ACCOUNT, len(watched), len(subs), len(blocked), len(lanes),
            "   [DRY RUN, nothing is written]" if args.dry_run else ""))
+    if blocked:
+        log("blocked: %s" % ", ".join(sorted(blocked.values())))
     fetcher = Fetcher(rate_per_min=args.rate, budget=args.budget, persist=True)
     seed_override = args.seeds if args.seeds else (DRY_SEEDS if args.dry_run else None)
     log("cache holds %d videos; budget %d fetches at %d per minute%s"
@@ -1340,13 +1421,13 @@ def cmd_run(args):
         try:
             if lane["policy"] == "last_played":
                 removed, added, kept, used = run_lane_last_played(
-                    lane, watched, fetcher, args.dry_run)
+                    lane, watched, blocked, fetcher, args.dry_run)
             elif lane["policy"] == "mix":
                 removed, added, kept, used = run_lane_mix(lane, args.dry_run)
             else:
                 removed, added, kept, used = run_lane(
-                    lane, watched, watched_set, subs, fetcher, args.dry_run,
-                    seed_override)
+                    lane, watched, watched_set, subs, blocked, fetcher,
+                    args.dry_run, seed_override)
         except Aborted as e:
             removed = added = kept = used = 0
             error = str(e)
@@ -1657,6 +1738,11 @@ def cmd_status(args):
     log("%-16s %-38s %s" % ("lane", "playlist", "videos"))
     for lane, plid, n in rows:
         log("%-16s %-38s %s" % (lane, plid, n))
+    blocked = read_blocked()
+    log("")
+    log("blocked channels: %d%s"
+        % (len(blocked), "  (" + ", ".join(sorted(blocked.values())) + ")"
+           if blocked else ""))
     log("")
     log("%-20s %-16s %s" % ("last run", "lane", "added/removed/kept/fetches error"))
     for r in query("SELECT to_char(started,'YYYY-MM-DD HH24:MI'), lane, added, removed, "
@@ -1712,6 +1798,8 @@ def cmd_metrics(args):
            "gauge", [("", "%d" % max(runs))] if runs else [])
     metric("lanes_configured", "Lanes in lanes.yml.", "gauge",
            [("", len(lanes))])
+    metric("blocked_channels", "Channels the blocklist keeps out of every lane.",
+           "gauge", [("", len(read_blocked()))])
 
     def column(row, index):
         """A field of the last run row, 0 when the lane never ran."""
