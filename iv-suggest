@@ -1198,6 +1198,15 @@ def sweep_lane(lane, current, plid, run):
     return drop, keep, room
 
 
+def blocked_without_a_fetch(vid, run):
+    """Whether the cache alone already says this video's channel is blocked.
+
+    Cache only, deliberately: an unknown seed is still worth expanding, and the
+    candidate filter catches its recommendations later.
+    """
+    return (run.fetcher.meta.get(vid) or {}).get("authorId") in run.blocked
+
+
 def pick_seeds(lane, run):
     """The history ids this lane expands. A subscription_feed lane needs none."""
     seed_free = lane["expand"] == "subscription_feed"
@@ -1215,9 +1224,7 @@ def pick_seeds(lane, run):
         if len(seeds) >= limit or scan <= 0:
             break
         scan -= 1
-        # Cache only, never a fetch: an unknown seed is worth expanding, and the
-        # candidate check catches its recommendations anyway.
-        if (run.fetcher.meta.get(vid) or {}).get("authorId") in run.blocked:
+        if blocked_without_a_fetch(vid, run):
             continue
         if want_genre:
             try:
@@ -1234,113 +1241,159 @@ def pick_seeds(lane, run):
     return seeds, seed_free
 
 
-def expand_candidates(lane, seeds, room, run):
-    """Candidate ids scored by the lane's expand source, with their listing meta."""
+def is_too_old(rec, cutoff):
+    """Whether a listing entry predates the cutoff.
+
+    Free to ask: a listing carries `published`, so an age filter costs no extra
+    fetch.
+    """
+    if not cutoff:
+        return False
+    published = parse_published(rec)
+    return not published or published < cutoff
+
+
+def channels_to_read(watch_counts, most):
+    """A weighted draw over the watched channels, capped at `most`.
+
+    Weighted rather than the plain top N, so a channel watched twice still gets
+    a turn now and then instead of never.
+    """
+    drawn = sorted(watch_counts.items(),
+                   key=lambda kv: -(random.random() ** (1.0 / max(kv[1], 1))))
+    return drawn[:most]
+
+
+def rank_derived_score(rank):
+    """A score from feed position rather than from raw views.
+
+    The hourly shuffle multiplies score by fatigue and jitter, and a
+    seven-figure view count would swamp both.
+    """
+    return 10.0 * (0.99 ** rank)
+
+
+def expand_by_recommendation(lane, seeds, room, run):
+    """What the recommendation graph offers around each seed, weighted by seed rank."""
     scores, meta_seen = {}, {}
     rec_age = lane["recommend_max_age_days"]
     rec_cutoff = time.time() - rec_age * 86400.0 if rec_age else 0.0
-    if lane["expand"] == "recommended":
-        for rank, vid in enumerate(seeds):
-            try:
-                data = run.fetcher.video(vid)
-            except BudgetSpent as e:
-                log("  %s, expanding only the first %d seeds" % (e, rank))
-                break
-            if not data:
+    for rank, vid in enumerate(seeds):
+        try:
+            data = run.fetcher.video(vid)
+        except BudgetSpent as e:
+            log("  %s, expanding only the first %d seeds" % (e, rank))
+            break
+        if not data:
+            continue
+        weight = 0.97 ** rank
+        for rec in data.get("recommendedVideos") or []:
+            rid = rec.get("videoId")
+            if not rid or not VID_RE.match(rid):
                 continue
-            weight = 0.97 ** rank
-            for rec in data.get("recommendedVideos") or []:
-                rid = rec.get("videoId")
-                if not rid or not VID_RE.match(rid):
-                    continue
-                # `recommendedVideos` carries `published`, so a lane can ask the
-                # graph for recent uploads only and it costs no extra fetch.
-                if rec_cutoff:
-                    pub = parse_published(rec)
-                    if not pub or pub < rec_cutoff:
-                        continue
-                scores[rid] = scores.get(rid, 0.0) + weight
-                meta_seen.setdefault(rid, listing_meta(rec))
-    elif lane["expand"] == "channel_latest":
-        # Channels watched but never subscribed to. The recommendation graph
-        # only ever recycles videos that already existed; this reads what those
-        # channels published since the last run, so the lane gets genuinely new
-        # content without depending on new watch history.
-        counts = {}
-        for vid in seeds:
-            cid = (run.fetcher.meta.get(vid) or {}).get("authorId")
-            if cid and cid not in run.subs and cid not in run.blocked:
-                counts[cid] = counts.get(cid, 0) + 1
-        # Weighted draw, not the plain top N: a channel watched twice still gets
-        # a turn now and then instead of never.
-        picks = sorted(counts.items(),
-                       key=lambda kv: -(random.random() ** (1.0 / max(kv[1], 1))))
-        picks = picks[:lane["max_channels"]]
-        log("  %d unsubscribed channels in the history, taking %d"
-            % (len(counts), len(picks)))
-        cutoff = time.time() - lane["max_age_days"] * 86400.0
-        for rank, (cid, n) in enumerate(picks):
-            try:
-                data = run.fetcher.channel_latest(cid)
-            except BudgetSpent as e:
-                log("  %s, read only the first %d channels" % (e, rank))
-                break
-            for rec in (data or {}).get("videos") or []:
-                rid = rec.get("videoId")
-                if not rid or not VID_RE.match(rid):
-                    continue
-                if rec.get("liveNow") or rec.get("isUpcoming"):
-                    continue
-                pub = parse_published(rec)
-                if pub and pub < cutoff:
-                    continue
-                age = max(0.0, (time.time() - pub) / 86400.0) if pub else 30.0
-                scores[rid] = max(scores.get(rid, 0.0), n * (0.93 ** age))
-                meta_seen.setdefault(rid, listing_meta(rec))
-    elif lane["expand"] == "subscription_feed":
-        # The subscription feed table, straight over SQL: no YouTube fetch at
-        # all. Its `kind` column is what makes a Shorts-only or live-only lane
-        # possible, and `views` comes free from the channel RSS.
-        sub_cfg = lane["subscription"]
-        kinds = [k for k in (sub_cfg.get("kinds") or ["video"]) if k in SUB_KINDS]
-        hours = int(sub_cfg.get("max_age_hours") or 0)
-        rank_by = sub_cfg.get("rank") or "views"
-        # A blocked channel may still be subscribed: the subscription feed is
-        # the one source that reads `subs` directly, so subtract there too.
-        feed_subs = run.subs - set(run.blocked)
-        if not kinds:
-            log("  no valid kinds configured, nothing to do")
-        elif not feed_subs:
-            log("  the account has no subscriptions, nothing to do")
-        else:
-            window = ("AND published > now() - interval '%d hours'" % hours) if hours else ""
-            order = "views DESC NULLS LAST" if rank_by == "views" else "published DESC"
-            rows = query(
-                "SELECT id, coalesce(title,''), coalesce(author,''), coalesce(ucid,''), "
-                "coalesce(length_seconds,0), coalesce(views,0) "
-                "FROM channel_videos WHERE ucid IN (%s) AND kind IN (%s) %s "
-                "ORDER BY %s LIMIT %d;"
-                % (",".join(lit(u) for u in sorted(feed_subs)),
-                   ",".join(lit(k) for k in kinds), window, order,
-                   max(60, room * 12)))
-            log("  %s: %d candidate(s) over %d channel(s), ranked by %s"
-                % (",".join(kinds), len(rows), len(feed_subs), rank_by))
-            for rank, (rid, title, author, ucid, seconds, views) in enumerate(rows):
-                if not VID_RE.match(rid):
-                    continue
-                # A rank-derived score, not the raw view count: the hourly
-                # shuffle multiplies the score by fatigue and jitter, and a
-                # seven-figure weight would swamp both.
-                scores[rid] = 10.0 * (0.99 ** rank)
-                meta_seen.setdefault(rid, listing_meta(
-                    {"lengthSeconds": int(seconds or 0), "authorId": ucid or None,
-                     "author": author, "title": title,
-                     "viewCount": int(views or 0) or None}))
-    else:                                              # expand: none
-        for rank, vid in enumerate(seeds):
-            scores[vid] = 1.0 - rank / 100000.0         # keep the watch order
-            meta_seen[vid] = run.fetcher.meta.get(vid, {})
+            if is_too_old(rec, rec_cutoff):
+                continue
+            scores[rid] = scores.get(rid, 0.0) + weight
+            meta_seen.setdefault(rid, listing_meta(rec))
     return scores, meta_seen
+
+
+def expand_by_channel_uploads(lane, seeds, room, run):
+    """New uploads from channels in the history the account never subscribed to.
+
+    The recommendation graph only recycles videos that already existed, so this
+    is the one source that can offer something published since the last run.
+    """
+    scores, meta_seen = {}, {}
+    watch_counts = {}
+    for vid in seeds:
+        cid = (run.fetcher.meta.get(vid) or {}).get("authorId")
+        if cid and cid not in run.subs and cid not in run.blocked:
+            watch_counts[cid] = watch_counts.get(cid, 0) + 1
+    picks = channels_to_read(watch_counts, lane["max_channels"])
+    log("  %d unsubscribed channels in the history, taking %d"
+        % (len(watch_counts), len(picks)))
+    cutoff = time.time() - lane["max_age_days"] * 86400.0
+    for rank, (cid, watched_times) in enumerate(picks):
+        try:
+            data = run.fetcher.channel_latest(cid)
+        except BudgetSpent as e:
+            log("  %s, read only the first %d channels" % (e, rank))
+            break
+        for rec in (data or {}).get("videos") or []:
+            rid = rec.get("videoId")
+            if not rid or not VID_RE.match(rid):
+                continue
+            if rec.get("liveNow") or rec.get("isUpcoming"):
+                continue
+            published = parse_published(rec)
+            if published and published < cutoff:
+                continue
+            age = max(0.0, (time.time() - published) / 86400.0) if published else 30.0
+            scores[rid] = max(scores.get(rid, 0.0), watched_times * (0.93 ** age))
+            meta_seen.setdefault(rid, listing_meta(rec))
+    return scores, meta_seen
+
+
+def expand_by_subscription_feed(lane, seeds, room, run):
+    """The subscription feed table, straight over SQL and costing no YouTube fetch.
+
+    Its `kind` column is what makes a Shorts-only or live-only lane possible,
+    and `views` comes free from the channel RSS.
+    """
+    scores, meta_seen = {}, {}
+    sub_cfg = lane["subscription"]
+    kinds = [k for k in (sub_cfg.get("kinds") or ["video"]) if k in SUB_KINDS]
+    hours = int(sub_cfg.get("max_age_hours") or 0)
+    rank_by = sub_cfg.get("rank") or "views"
+    subscribed_and_not_blocked = run.subs - set(run.blocked)
+    if not kinds:
+        log("  no valid kinds configured, nothing to do")
+        return scores, meta_seen
+    if not subscribed_and_not_blocked:
+        log("  the account has no subscriptions, nothing to do")
+        return scores, meta_seen
+    window = ("AND published > now() - interval '%d hours'" % hours) if hours else ""
+    order = "views DESC NULLS LAST" if rank_by == "views" else "published DESC"
+    rows = query(
+        "SELECT id, coalesce(title,''), coalesce(author,''), coalesce(ucid,''), "
+        "coalesce(length_seconds,0), coalesce(views,0) "
+        "FROM channel_videos WHERE ucid IN (%s) AND kind IN (%s) %s "
+        "ORDER BY %s LIMIT %d;"
+        % (",".join(lit(u) for u in sorted(subscribed_and_not_blocked)),
+           ",".join(lit(k) for k in kinds), window, order,
+           max(60, room * 12)))
+    log("  %s: %d candidate(s) over %d channel(s), ranked by %s"
+        % (",".join(kinds), len(rows), len(subscribed_and_not_blocked), rank_by))
+    for rank, (rid, title, author, ucid, seconds, views) in enumerate(rows):
+        if not VID_RE.match(rid):
+            continue
+        scores[rid] = rank_derived_score(rank)
+        meta_seen.setdefault(rid, listing_meta(
+            {"lengthSeconds": int(seconds or 0), "authorId": ucid or None,
+             "author": author, "title": title,
+             "viewCount": int(views or 0) or None}))
+    return scores, meta_seen
+
+
+def expand_by_watch_order(lane, seeds, room, run):
+    """The seeds themselves, scored so the lane keeps the order they were watched in."""
+    scores, meta_seen = {}, {}
+    for rank, vid in enumerate(seeds):
+        scores[vid] = 1.0 - rank / 100000.0
+        meta_seen[vid] = run.fetcher.meta.get(vid, {})
+    return scores, meta_seen
+
+
+EXPANDERS = {"recommended": expand_by_recommendation,
+             "channel_latest": expand_by_channel_uploads,
+             "subscription_feed": expand_by_subscription_feed}
+
+
+def expand_candidates(lane, seeds, room, run):
+    """Candidate ids scored by the lane's expand source, with their listing meta."""
+    expand = EXPANDERS.get(lane["expand"], expand_by_watch_order)
+    return expand(lane, seeds, room, run)
 
 
 def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
