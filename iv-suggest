@@ -1890,7 +1890,7 @@ def cmd_run(args):
             args.budget, fetcher.fetches, len(users) - i)
         try:
             failed += run_account(user, all_lanes, fetcher, seed_override, args)
-        except Exception as e:            # one account must not cost the others
+        except Exception as e:
             failed += 1
             log("account %s: ERROR %r" % (user["email"], e))
     log("\ndone: %d fetches, %d cache hits, %d known-bad skips, %d lane failures"
@@ -1922,6 +1922,37 @@ def accounts_wanted(args):
     return account_order(users)
 
 
+def log_account_header(lanes, run):
+    """Announce the account's totals, watch count included.
+
+    The watch count is there because it is why a new account's lanes come out
+    thin, and nothing else makes that visible.
+    """
+    log("\naccount %s: %d watched, %d subscriptions, %d blocked, %d lanes, "
+        "%d fetches of budget"
+        % (ACCOUNT, len(run.watched), len(run.subs), len(run.blocked), len(lanes),
+           run.fetcher.budget - run.fetcher.fetches))
+
+
+def run_one_lane(lane, run):
+    """One lane's (removed, added, kept, fetches), and its error if it had one.
+
+    A lane that raises is recorded and never stops the account's other lanes.
+    """
+    try:
+        if lane["policy"] == "last_played":
+            return run_lane_last_played(lane, run), None
+        if lane["policy"] == "mix":
+            return run_lane_mix(lane, run), None
+        return run_lane(lane, run), None
+    except Aborted as e:
+        log("  ABORTED: %s (the playlist keeps its content)" % e)
+        return (0, 0, 0, 0), str(e)
+    except Exception as e:
+        log("  ERROR: %r" % e)
+        return (0, 0, 0, 0), repr(e)
+
+
 def run_account(user, all_lanes, fetcher, seed_override, args):
     """One account's lanes. Returns how many of them failed."""
     use_account(user["email"])
@@ -1936,44 +1967,24 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
             return 0
     run = LaneRun(watched, set(watched), subs, read_blocked(), fetcher,
                   args.dry_run, seed_override)
-    # The watch count is logged because it is the whole cause of a thin lane on
-    # a new account, and nothing else makes that visible.
-    log("\naccount %s: %d watched, %d subscriptions, %d blocked, %d lanes, "
-        "%d fetches of budget"
-        % (ACCOUNT, len(watched), len(subs), len(run.blocked), len(lanes),
-           fetcher.budget - fetcher.fetches))
+    log_account_header(lanes, run)
     if held_back:
         log("held back until there is more history: %s" % ", ".join(held_back))
     if run.blocked:
         log("blocked: %s" % ", ".join(sorted(run.blocked.values())))
     failed = 0
     for lane in lanes:
-        error = None
-        try:
-            if lane["policy"] == "last_played":
-                removed, added, kept, used = run_lane_last_played(lane, run)
-            elif lane["policy"] == "mix":
-                removed, added, kept, used = run_lane_mix(lane, run)
-            else:
-                removed, added, kept, used = run_lane(lane, run)
-        except Aborted as e:
-            removed = added = kept = used = 0
-            error = str(e)
+        (removed, added, kept, used), error = run_one_lane(lane, run)
+        if error:
             failed += 1
-            log("  ABORTED: %s (the playlist keeps its content)" % e)
-        except Exception as e:                       # never let one lane kill the rest
-            removed = added = kept = used = 0
-            error = repr(e)
-            failed += 1
-            log("  ERROR: %r" % e)
         if not args.dry_run:
             execute("INSERT INTO suggest.runs"
                     "(account,lane,added,removed,kept,fetches,error) "
                     "VALUES (%s,%s,%s,%s,%s,%s,%s);"
                     % (acct(), lit(lane["id"]), added, removed, kept, used,
                        lit(error)))
-        if isinstance(error, str) and error and "budget" in error:
-            # This account's slice, not the run: the next account has its own.
+        this_accounts_budget_is_spent = bool(error) and "budget" in error
+        if this_accounts_budget_is_spent:
             log("fetch budget spent, stopping before %s's other lanes" % ACCOUNT)
             break
     return failed
