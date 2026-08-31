@@ -1142,37 +1142,50 @@ def adopted_item_state(lane_id, current, dry):
     return added_at, added_ts, item_score
 
 
+def why_it_leaves(v, lane, run, added_at, ttl_cutoff):
+    """Why this entry leaves the lane tonight, or None to keep it.
+
+    Blocked is tested first: a channel blocked today has to go tonight rather
+    than in `ttl_days` time.
+    """
+    if v.get("authorId") in run.blocked:
+        return "blocked"
+    if lane["exclude_watched"] and v["videoId"] in run.watched_set:
+        return "watched"
+    if ttl_cutoff and added_at.get(v["videoId"], "9999") < ttl_cutoff:
+        return "expired"
+    return None
+
+
+def oldest_survivors(keep, lane, added_ts, item_score):
+    """The ids a forced daily turnover retires, oldest and lowest scoring first.
+
+    Without a quota a slot frees up only on a watch or on the TTL, and the TTL
+    fires for the whole lane at once because the lane was filled at once; the
+    daily drip is what spreads the ages back out.
+    """
+    rotate = min(lane["refresh_per_day"], max(0, len(keep) - lane["keep_min"]))
+    if rotate <= 0:
+        return set()
+    stale = sorted(keep, key=lambda vw: (added_ts.get(vw[0]["videoId"], 0.0),
+                                         item_score.get(vw[0]["videoId"], 0.0)))
+    return {vw[0]["videoId"] for vw in stale[:rotate]}
+
+
 def sweep_lane(lane, current, plid, run):
     """What leaves the lane tonight, what stays, and the room that opens up."""
     lane_id = lane["id"]
     added_at, added_ts, item_score = adopted_item_state(lane_id, current, run.dry)
     ttl = lane["ttl_days"]
     old = one("SELECT to_char(now() - interval '%d days','YYYY-MM-DD');" % ttl) if ttl else ""
+
     drop, keep = [], []
     for v in current:
-        vid = v["videoId"]
-        why = None
-        # Blocked first: a channel blocked today must leave the lanes tonight,
-        # not in `ttl_days` time.
-        if v.get("authorId") in run.blocked:
-            why = "blocked"
-        elif lane["exclude_watched"] and vid in run.watched_set:
-            why = "watched"
-        elif ttl and added_at.get(vid, "9999") < old:
-            why = "expired"
+        why = why_it_leaves(v, lane, run, added_at, old)
         (drop if why else keep).append((v, why))
 
-    # Forced turnover. Without it a slot frees up only when a video is watched
-    # (which needs a client that reports playback) or when the TTL fires, and
-    # the TTL fires for the whole lane on the same night because the whole lane
-    # was filled on the same night. Retiring the oldest survivors on a fixed
-    # quota gives the lane a steady daily drip and spreads the ages out, which
-    # is what stops the all-at-once expiry in the first place.
-    rotate = min(lane["refresh_per_day"], max(0, len(keep) - lane["keep_min"]))
-    if rotate > 0:
-        stale = sorted(keep, key=lambda vw: (added_ts.get(vw[0]["videoId"], 0.0),
-                                             item_score.get(vw[0]["videoId"], 0.0)))
-        retire = {vw[0]["videoId"] for vw in stale[:rotate]}
+    retire = oldest_survivors(keep, lane, added_ts, item_score)
+    if retire:
         drop.extend((v, "rotated") for v, _ in keep if v["videoId"] in retire)
         keep = [vw for vw in keep if vw[0]["videoId"] not in retire]
 
