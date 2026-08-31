@@ -30,23 +30,115 @@ One playlist plus the rules that fill it. A new genre is a new block in
     sample_pool: 30
 ```
 
-Four policies:
+Three policies, plus an hourly reorder that costs no fetches:
 
-| Policy | Behaviour |
+| `policy` | Behaviour |
 |---|---|
 | `refill` | score candidates, top the lane up to `size`, retire the stale |
 | `last_played` | hold the N most recently *played* videos of a genre |
-| `mix` | interleave other lanes by share of output |
-| — | plus `iv-suggest shuffle`, an hourly reorder that costs no fetches |
+| `mix` | interleave other lanes — or other accounts' lanes — by share of output |
 
-Five ways to find candidates (`expand:`):
+Four ways to find candidates:
 
-| Mode | Source | Fetch cost |
+| `expand` | Source | Fetch cost |
 |---|---|---|
 | `recommended` | each seed's `recommendedVideos` | 1 per seed |
 | `channel_latest` | recent uploads of channels you watch but never subscribed to | 1 per channel, ~60 videos each |
 | `subscription_feed` | the `channel_videos` table over SQL | **zero** |
 | `none` | the seeds themselves, in watch order | zero |
+
+Every key of both is in **[docs/CONFIG.md](docs/CONFIG.md)** — the one place
+settings are documented.
+
+## Requirements
+
+- Invidious with Postgres, reachable over `docker compose exec`
+- An Invidious account for the bot — an ordinary one, made the ordinary way
+- Python 3.9+ with PyYAML, and the `docker` CLI, on the host running the script
+
+`subscription_feed` lanes additionally need a patched Invidious; see
+[patches/README.md](patches/README.md). The other lanes work against any instance.
+
+## Install
+
+```sh
+install -m 700 iv-suggest /usr/local/bin/iv-suggest
+install -d -m 700 /etc/iv-suggest
+install -m 600 lanes.yml /etc/iv-suggest/lanes.yml
+cp env.example /etc/iv-suggest/env && chmod 600 /etc/iv-suggest/env
+$EDITOR /etc/iv-suggest/env          # IV_SUGGEST_ACCOUNT is the only required line
+
+iv-suggest init                      # schema, a session for the account, playlists
+iv-suggest run --dry-run             # writes nothing, caps seeds at 10
+iv-suggest run                       # fill the lanes
+
+install -m 644 systemd/* /etc/systemd/system/
+systemctl enable --now iv-suggest.timer iv-suggest-shuffle.timer
+```
+
+That is the whole setup on a default install. Everything else in
+`/etc/iv-suggest/env` only exists because your paths might differ.
+
+The units read `/etc/iv-suggest/env` off disk rather than through an
+`EnvironmentFile`; [docs/CONFIG.md](docs/CONFIG.md) says why that matters when
+you test a change by hand.
+
+## Commands
+
+```
+iv-suggest init [--all-users]                     schema, sessions, playlists
+iv-suggest run [--dry-run] [--lane ID]            fill the lanes
+           [--account EMAIL]
+           [--seeds N] [--rate N] [--budget N]
+iv-suggest shuffle [--dry-run] [--lane ID]        reorder only, no fetches
+           [--account EMAIL]
+iv-suggest status                                 lane sizes and recent runs
+iv-suggest dedupe [--dry-run]                     one upload per song
+iv-suggest views [--rate N] [--budget N]          backfill missing view counts
+iv-suggest metrics                                Prometheus text, database only
+```
+
+`metrics` takes no token and makes no fetch, so it is safe to scrape often.
+
+## More than one account
+
+`lanes.yml` is the shared library of lanes; a `users:` block says who gets
+which, and a `mix` lane whose sources name other accounts is the household feed.
+Both are in [docs/CONFIG.md](docs/CONFIG.md); the reasoning behind the shape is
+in [docs/MULTI-USER.md](docs/MULTI-USER.md). Two things worth knowing before you
+read either:
+
+- **An account absent from `users:` is never touched.** There is no
+  auto-enrolment — finding a dozen playlists the bot made in your account is a
+  bad first impression.
+- **One timer, one budget.** The accounts are a loop inside one run, the fetch
+  budget is divided rather than multiplied, and whoever succeeded least recently
+  is served first, so an exhausted budget starves a different person each night.
+  The metadata cache is shared, so overlapping taste is nearly free.
+
+## Blocking a channel
+
+Some channel the recommendation graph loves and you do not. Open any of its
+videos in any client and use **add to playlist → Blocked**. That is the whole
+interface. One video is enough — `playlist_videos` records the `ucid` of every
+entry, so the block lands on the *channel*, and the entry can stay in the
+playlist as the record of why.
+
+Doing it this way rather than as a config list buys three things. The playlist
+is **server side**, so the list is the same on the phone, the TV and the web,
+where a client-side content filter is per device. It needs **no new endpoint and
+no client change**, because "add to playlist" is already in every client's menu.
+And the bot reads it over SQL, so it costs **no API call and no YouTube fetch**.
+
+A blocked channel is refused at four points: dropped as a seed, skipped by
+`channel_latest`, subtracted from the `subscription_feed` channel set, and
+rejected as a candidate. Anything of theirs already sitting in a lane is swept
+out on the next run, logged as `- blocked`, and gets **no cooldown row** — so
+removing the video from `Blocked` lets the channel back the same night.
+
+`iv-suggest status` prints the current list and `iv_suggest_blocked_channels`
+exports it. A lane playlist is excluded by id, so naming a lane `Blocked` cannot
+make the lane feed itself back as its own blocklist.
 
 ## Design notes worth reading before you tune it
 
@@ -57,10 +149,9 @@ deliberately ignored — that is what makes the lane yours rather than YouTube's
 **A lane goes static unless you force turnover.** A slot frees up only when a
 video is watched (which needs a client that reports playback) or when the TTL
 fires — and the TTL fires for the whole lane on one night, because the whole lane
-was filled on one night. `refresh_per_day: N` retires the N oldest every run and
-spreads the ages out. `sample_pool: N` draws from a weighted random sample over
-the top N rather than the strict top, because the score order barely moves
-between runs.
+was filled on one night. `refresh_per_day` retires the oldest few every run and
+spreads the ages out; `sample_pool` draws from a weighted random sample rather
+than the strict top, because the score order barely moves between runs.
 
 **But `refresh_per_day` is wrong for a window-bounded lane.** A
 `subscription_feed` lane's candidate pool is capped by `max_age_hours`, so
@@ -76,10 +167,9 @@ ever stream.
 display order in Invidious, so reordering a lane is one SQL `UPDATE` on a
 `bigint[]` — no delete, no re-add, no API call. It is race-safe against the
 nightly run because it permutes whatever the array holds at write time. The
-ranking applies a fatigue discount (an hour on screen without a play is a small
-negative, which decays back once the video drops off screen) and treats slot 1 as
-a rota rather than a ranking, so at least half the lane leads before any video
-returns to the top.
+ranking discounts what has already been on screen and treats slot 1 as a rota
+rather than a ranking, so at least half the lane leads before any video returns
+to the top.
 
 **Rate limiting toward YouTube is the main constraint.** Invidious's `videos`
 cache is unlogged and short-lived, so assume every `/api/v1/videos/<id>` reaches
@@ -94,138 +184,30 @@ endpoint, so each change is one API call plus its state write. A run that stops
 halfway keeps what it applied and the next run refills, because `room = size -
 kept` is recomputed from the live playlist. A short lane beats an empty one.
 
-## Requirements
+**Lanes are unlisted by default.** Invidious ignores `privacy` on playlist create
+and always stores `Public`; only `PATCH /api/v1/auth/playlists/<plid>` changes
+it, which the engine sends straight after create. Unlisted is readable by anyone
+holding the playlist ID and absent from any listing, and the Atom feed at
+`/feed/playlist/<plid>` still works — `rss_playlist` only 404s a `private`
+playlist, so `public` buys nothing. What a listed lane leaks is watch taste, not
+credentials, but the decision is made on somebody else's behalf as soon as the
+instance has more than one account.
 
-- Invidious with Postgres, reachable over `docker compose exec`
-- An Invidious account, and an API token for it (`Authorization: Bearer {"session":…}` — the **raw JSON**; base64 returns 403)
-- Python 3.9+ with PyYAML
-- `docker` CLI on the host running the script
+**The hourly reorder has its own tuning.** `shuffle:` is a block of its own in
+[docs/CONFIG.md](docs/CONFIG.md); the defaults in `lanes.yml` were picked by
+simulation, and the comment there says against what.
 
-### The `subscription_feed` lanes need a patched Invidious
+## Song identity
 
-Those lanes filter on `channel_videos.kind` (`video` / `short` / `live`), which
-**stock Invidious does not have**. Upstream records no content type for a feed
-entry at all: `ChannelVideo#to_json` reports `"type": "shortVideo"` for every row
-regardless, and `length_seconds` is 0 for anything absent from the channel's
-Videos tab, so Shorts and stream VODs are indistinguishable from each other and
-from ordinary uploads.
-
-The other lanes work against any Invidious instance. To get the
-subscription-feed ones, apply
-[`patches/0001-feed-kinds-v2.20260804.1.patch`](patches/) — it adds the column
-and a job that fills it from YouTube's per-channel uploads playlists (replace the
-`UC` of a channel ID with `UULF` for long-form, `UUSH` for Shorts, `UULV` for
-live). Measured over 75 channels, that misclassified 1 video in 679;
-`HEAD /shorts/<id>` is the per-video fallback (200 = Short, 303 = not). The patch
-also lets you drop Shorts and live streams out of the subscription feed
-altogether. See [patches/README.md](patches/README.md) — **note the migration
-warning there**, since Invidious does not run migrations at boot.
-
-## Install
-
-```sh
-install -m 700 iv-suggest /usr/local/bin/iv-suggest
-install -d -m 700 /etc/iv-suggest
-install -m 600 lanes.yml /etc/iv-suggest/lanes.yml
-cp env.example /etc/iv-suggest/env && chmod 600 /etc/iv-suggest/env
-$EDITOR /etc/iv-suggest/env          # account, at minimum
-
-iv-suggest init                      # schema + a session for the account
-iv-suggest run --dry-run             # writes nothing, caps seeds at 10
-iv-suggest run                       # create the playlists and fill them
-
-install -m 644 systemd/* /etc/systemd/system/
-systemctl enable --now iv-suggest.timer iv-suggest-shuffle.timer
-```
-
-The systemd units call the script directly with **no `EnvironmentFile`**, so
-settings are read from `/etc/iv-suggest/env` as well as the environment. A value
-set only in your shell will be missing from the nightly run.
-
-## Configuration
-
-Everything deployment-specific comes from the environment or `/etc/iv-suggest/env`:
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `IV_SUGGEST_ACCOUNT` | — | the account the bot belongs to (`users.email`). **Required** |
-| `IV_SUGGEST_TOKEN` | — | Invidious API token, raw JSON. Optional: only a fallback for an install that has not run `init` since sessions landed |
-| `IV_SUGGEST_API` | `http://localhost:3000` | Invidious base URL |
-| `IV_SUGGEST_COMPOSE_DIR` | `/root/docker/youtube` | directory with Invidious's `docker-compose.yml` |
-| `IV_SUGGEST_DB_SERVICE` | `invidious-db` | compose service name of Postgres |
-| `IV_SUGGEST_DB_USER` | `kemal` | Postgres role |
-| `IV_SUGGEST_DB_NAME` | `invidious` | Postgres database |
-| `IV_SUGGEST_CONFIG` | `/etc/iv-suggest/lanes.yml` | lane config |
-| `IV_SUGGEST_ENVFILE` | `/etc/iv-suggest/env` | file the above are also read from |
-
-## Commands
-
-```
-iv-suggest init [--all-users]                     schema, sessions, playlists
-iv-suggest run [--dry-run] [--lane ID]            fill the lanes
-           [--account EMAIL]
-           [--seeds N] [--rate N] [--budget N]
-iv-suggest shuffle [--dry-run] [--lane ID]        reorder only, no fetches
-           [--account EMAIL]
-iv-suggest status                                 lane sizes and recent runs
-iv-suggest dedupe [--dry-run]                     one upload per song
-iv-suggest views                                  backfill missing view counts
-iv-suggest metrics                                Prometheus text, database only
-```
-
-`metrics` takes no token and makes no fetch, so it is safe to scrape often.
-
-## More than one account
-
-`lanes.yml` is the shared library of lanes; a `users:` block says who gets which.
-
-```yaml
-users:
-  - email: you@example.com
-    lanes: all
-  - email: them@example.com
-    lanes: [suggested, music-discover, fresh-uploads]
-    overrides:
-      fresh-uploads: {size: 15}
-```
-
-- **No `users:` block means the single account in `IV_SUGGEST_ACCOUNT` with
-  every lane** — exactly what the bot did before, so an existing config is
-  unchanged.
-- **An account absent from the block is never touched.** There is no
-  auto-enrolment: finding a dozen playlists the bot made in your account is a
-  bad first impression.
-- `lanes: all` is for the account that wants the library; everyone else names
-  the few they want.
-- The bot issues itself one Invidious session per account and reuses it, so a
-  second person needs no token, no password and no fork change. `init
-  --all-users` opens the sessions and creates the playlists that are missing.
-- **One timer, one budget.** The accounts are a loop inside one run, the fetch
-  budget is divided rather than multiplied, and whoever succeeded least
-  recently is served first — so an exhausted budget starves a different person
-  each night. The metadata cache is shared, so overlapping taste is nearly free.
-- Metrics carry an `account` label; the instance-wide series do not.
-
-### The household mix
-
-A `mix` lane's sources may name other accounts, which blends everyone's best
-into one feed:
-
-```yaml
-  - id: household
-    title: Household
-    policy: mix
-    mix:
-      sources:
-        - {user: you@example.com,  lane: suggested, share: 0.6}
-        - {user: them@example.com, lane: suggested, share: 0.4}
-```
-
-Sources are read over SQL, so the mix never needs anyone else's session, and it
-still costs zero YouTube fetches. What each viewer sees is filtered for *them*:
-their watch history and their blocklist, applied to whatever anyone
-contributed. Contributing is not optional — a shared feed does show the
-household what each person watches.
+Music lanes collapse re-uploads of the same song. Content ID and `musicTracks`
+are absent from the API, and MusicBrainz search proved useless on real titles
+("stairway to heaven" → John Paul Young), so this is a local title parser:
+bracketed qualifiers dropped, everything after `|` dropped, split on the dash,
+~30 noise words removed (official, lyrics, remastered, 4K, live at…, OST, feat…,
+a bare year), accents and articles flattened, spaces removed so "Freebird"
+equals "Free Bird". The match key is the **song alone**, because a re-upload
+channel replaces the artist. Two different songs sharing a title collapse; that
+costs one slot and is accepted.
 
 ## Tests
 
@@ -239,65 +221,16 @@ available.
 
 `kickstart.py` is a one-off that classifies a whole `channel_videos` backlog
 without the per-tick caps — useful after a bulk import. It needs the patched
-Invidious described above.
+Invidious.
 
-## Blocking a channel
+## Documentation
 
-Some channel the recommendation graph loves and you do not. The blocklist is an
-ordinary Invidious playlist on your own account, named `Blocked` by default:
-
-```yaml
-blocklist:
-  playlist: Blocked
-  channels: []          # extra channel ids, for a channel with nothing to tap
-```
-
-Open any video from the channel in any client and use **add to playlist →
-Blocked**. That is the whole interface. One video is enough — `playlist_videos`
-records the `ucid` of every entry, so the block lands on the *channel*, and the
-entry can stay in the playlist as the record of why.
-
-Doing it this way rather than as a config list buys three things. The playlist
-is **server side**, so the list is the same on the phone, the TV and the web,
-where a client-side content filter is per device. It needs **no new endpoint and
-no client change**, because "add to playlist" is already in every client's menu.
-And the bot reads it over SQL, so it costs **no API call and no YouTube fetch**.
-
-A blocked channel is refused at four points: it is dropped as a seed, skipped by
-`channel_latest`, subtracted from the `subscription_feed` channel set, and
-rejected as a candidate. Anything of theirs already sitting in a lane is swept
-out on the next run, logged as `- blocked`, and gets **no cooldown row** — so
-removing the video from `Blocked` lets the channel back the same night.
-
-`iv-suggest status` prints the current list, and `iv_suggest_blocked_channels`
-exports it.
-
-A lane playlist is excluded by id, so naming a lane `Blocked` cannot make the
-lane feed itself back as its own blocklist.
-
-## Playlist privacy
-
-Invidious **ignores `privacy` on playlist create** and always stores `Public`;
-only `PATCH /api/v1/auth/playlists/<plid>` changes it, which the engine sends
-straight after create. The default is `unlisted`: readable by anyone holding
-the playlist ID, absent from any listing. **The Atom feed at
-`/feed/playlist/<plid>` still works** — `rss_playlist` only 404s a `private`
-playlist, so `public` buys nothing the feed needs. Choose per lane in
-`lanes.yml`. What a listed lane leaks is watch taste, not credentials — but
-decide deliberately, and remember the decision is made on somebody's behalf as
-soon as the instance has more than one account.
-
-## Song identity
-
-Music lanes collapse re-uploads of the same song. Content ID and `musicTracks`
-are absent from the API, and MusicBrainz search proved useless on real titles
-("stairway to heaven" → John Paul Young), so this is a local title parser:
-bracketed qualifiers dropped, everything after `|` dropped, split on the dash,
-~30 noise words removed (official, lyrics, remastered, 4K, live at…, OST, feat…,
-a bare year), accents and articles flattened, spaces removed so "Freebird"
-equals "Free Bird". The match key is the **song alone**, because a re-upload
-channel replaces the artist. Two different songs sharing a title collapse; that
-costs one slot and is accepted.
+| | |
+|---|---|
+| [docs/CONFIG.md](docs/CONFIG.md) | every setting, once |
+| [docs/MULTI-USER.md](docs/MULTI-USER.md) | why per-account lanes are shaped the way they are |
+| [docs/PUBLIC-FEED.md](docs/PUBLIC-FEED.md) | TODO: a feed for logged-out visitors and brand new accounts |
+| [patches/README.md](patches/README.md) | the Invidious patch `subscription_feed` needs |
 
 ## Licence
 
