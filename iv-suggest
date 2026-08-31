@@ -959,15 +959,7 @@ def read_blocked():
     blocked = {}
     title = (cfg.get("playlist") or "").strip()
     if title and ACCOUNT:
-        for ucid, author in query(
-                "SELECT DISTINCT coalesce(pv.ucid,''), coalesce(pv.author,'') "
-                "FROM playlists p JOIN playlist_videos pv ON pv.plid = p.id "
-                "WHERE p.author=%s AND lower(p.title)=lower(%s) "
-                # Every account's lanes, deliberately: a playlist id is unique
-                # instance wide, so scoping this would let one account's
-                # "Blocked" playlist swallow another account's lane.
-                "AND p.id NOT IN (SELECT plid FROM suggest.lanes);"
-                % (lit(ACCOUNT), lit(title))):
+        for ucid, author in channels_tapped_by_playlist(title):
             if ucid:
                 blocked[ucid] = author or ucid
     for ucid in cfg.get("channels") or []:
@@ -975,10 +967,34 @@ def read_blocked():
     return blocked
 
 
+def channels_tapped_by_playlist(title):
+    """(ucid, author) of every video in this account's playlist of that title.
+
+    Lanes are excluded across every account, deliberately: a playlist id is
+    unique instance wide, so scoping the exclusion would let one account's
+    "Blocked" playlist swallow another account's lane.
+    """
+    return query("SELECT DISTINCT coalesce(pv.ucid,''), coalesce(pv.author,'') "
+                 "FROM playlists p JOIN playlist_videos pv ON pv.plid = p.id "
+                 "WHERE p.author=%s AND lower(p.title)=lower(%s) "
+                 "AND p.id NOT IN (SELECT plid FROM suggest.lanes);"
+                 % (lit(ACCOUNT), lit(title)))
+
+
 def lane_plid(account, lane_id):
     """The playlist id of one account's lane, or "" when it has none yet."""
     return one("SELECT plid FROM suggest.lanes WHERE account=%s AND lane=%s;"
                % (lit(account), lit(lane_id)))
+
+
+def force_privacy(plid, title, privacy):
+    """Re-apply privacy after a create, which Invidious ignores and stores Public.
+
+    A public playlist is readable by anyone holding the plid, and /api/ has no
+    Authelia in front of it.
+    """
+    api("PATCH", "/api/v1/auth/playlists/" + plid,
+        {"title": title, "privacy": privacy})
 
 
 def playlist_of(lane, dry):
@@ -1001,11 +1017,7 @@ def playlist_of(lane, dry):
     made = api("POST", "/api/v1/auth/playlists",
                {"title": title, "privacy": lane["privacy"]})
     plid = made["playlistId"]
-    # Invidious IGNORES privacy on create and stores Public. A public playlist is
-    # readable by anyone who knows the plid, and /api/ carries no Authelia, so
-    # force the value with the update endpoint.
-    api("PATCH", "/api/v1/auth/playlists/" + plid,
-        {"title": title, "privacy": lane["privacy"]})
+    force_privacy(plid, title, lane["privacy"])
     execute("INSERT INTO suggest.lanes(account,lane,plid,title) VALUES (%s,%s,%s,%s);"
             % (acct(), lit(lane_id), lit(plid), lit(title)))
     log("  created the playlist %r (%s)" % (title, plid))
