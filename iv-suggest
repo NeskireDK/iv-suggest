@@ -5,11 +5,17 @@ iv-suggest - lane based suggestion playlists for Invidious (LXC 109).
 A lane is one server side playlist plus the rules that fill it. Adding a genre
 is a new block in the config file, not new code.
 
-  config : /etc/iv-suggest/lanes.yml
-  token  : /etc/iv-suggest/env      (IV_SUGGEST_TOKEN, raw JSON, mode 600)
+Several accounts share one instance: lanes.yml holds the library of lanes and a
+users: block saying who gets which, and the bot issues itself one Invidious
+session per account rather than holding a token for each. An account not named
+in that block is never touched.
+
+  config : /etc/iv-suggest/lanes.yml   (lanes, and the users: block)
+  auth   : one session per account, in suggest.accounts. IV_SUGGEST_TOKEN in
+           /etc/iv-suggest/env is the fallback for an install predating that.
   state  : PostgreSQL schema "suggest" in the Invidious database
-  usage  : iv-suggest init
-           iv-suggest run [--dry-run] [--lane ID]
+  usage  : iv-suggest init [--all-users]
+           iv-suggest run [--dry-run] [--lane ID] [--account EMAIL]
            iv-suggest status
            iv-suggest metrics     (Prometheus text, database only, no token)
            iv-suggest views [--rate N] [--budget N]   (refresh view counts)
@@ -45,8 +51,10 @@ from datetime import datetime, timezone
 #   IV_SUGGEST_DB_NAME      Postgres database
 #   IV_SUGGEST_API          base URL of the Invidious instance
 #   IV_SUGGEST_CONFIG       lanes.yml path
-#   IV_SUGGEST_ENVFILE      file holding IV_SUGGEST_TOKEN
-#   IV_SUGGEST_ACCOUNT      Invidious account whose playlists are filled
+#   IV_SUGGEST_ENVFILE      file the settings are also read from
+#   IV_SUGGEST_ACCOUNT      the account this bot belongs to. It owns the
+#                           blocklist playlist and every row written before
+#                           multi-user; who else gets lanes is lanes.yml.
 ENVFILE = os.environ.get("IV_SUGGEST_ENVFILE", "/etc/iv-suggest/env")
 
 

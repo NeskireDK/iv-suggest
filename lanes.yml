@@ -33,6 +33,27 @@
 #
 # A blocked channel leaves every lane on the next run and gets no cooldown row,
 # so emptying the playlist lets it back the same night.
+# Who the bot manages. Absent means the single account in IV_SUGGEST_ACCOUNT
+# with every lane below, which is what it did before there was a users: block —
+# so leaving this out changes nothing.
+#
+# An account NOT listed here is never touched. There is no auto-enrolment: a
+# household member who opens Invidious and finds a dozen playlists the bot made
+# in their account has been surprised, not served.
+#
+#   lanes: all          the whole library, for whoever wants it
+#   lanes: [a, b, c]    just these, for everyone else. Order is this file's,
+#                       not the list's, so mix lanes still run last.
+#   overrides:          per-lane changes for that account only
+#
+#users:
+#  - email: you@example.com
+#    lanes: all
+#  - email: them@example.com
+#    lanes: [suggested, music-discover, fresh-uploads]
+#    overrides:
+#      fresh-uploads: {size: 15}
+
 blocklist:
   playlist: Blocked     # playlist title; "" turns the whole mechanism off
   channels: []          # extra channel ids, for a channel with nothing to tap
@@ -291,3 +312,8 @@ lanes:
         # 0.10 of 54 = 5.4, so about the 5 asked for
         - {lane: subs-top48, share: 0.10}
         - {lane: music-discover, share: 0.10}
+      # A source may name another account, which makes this the household feed:
+      #   - {user: them@example.com, lane: suggested, share: 0.2}
+      # Read over SQL, so it needs nobody else's session and still costs zero
+      # fetches. What each viewer sees is filtered for THEM — their watch
+      # history, their blocklist — whoever contributed it.

@@ -1,6 +1,10 @@
-# TODO: multi-user iv-suggest
+# Multi-user iv-suggest
 
-Status: **plan only, nothing implemented.** Written 2026-08-31.
+Status: **built, not yet deployed.** Planned and implemented 2026-08-31, on
+branch `feature/multi-user`. Steps 1-5 of the migration order below are all in
+code and under test; what remains is running it against the real instance. The
+plan text is kept as written because it is the reasoning behind the shape, and
+the sections below still describe what the code does.
 
 One instance, one set of lanes, one account. This is the plan for turning that
 into per-account lanes plus a shared feed, without multiplying the fetch bill.
@@ -165,23 +169,42 @@ in place with SQL.
 
 1. Schema migration with `account` defaulting to the current one → **existing
    rows and playlists survive untouched.** No playlist is recreated.
+   *Done.* `iv-suggest init` runs it; it is idempotent and exercised against a
+   throwaway postgres in `tests/test_migration.py`.
 2. Land SID minting, switch the primary account's calls to it, retire
    `IV_SUGGEST_TOKEN` once proven.
+   *Done except the retiring.* The token is still read and still works as the
+   fallback; delete it from `/etc/iv-suggest/env` once the session path has run
+   a few nights.
 3. Add the `users:` block with one entry. **Verify a run is identical to today.**
+   *Code done, verification outstanding* — this is the step to be careful with
+   on the real instance. No block at all is also valid and means exactly today's
+   behaviour, so the first deploy can skip writing one.
 4. Only then add a second account, unlisted.
 5. Shared mix last — it needs two populated accounts to be worth looking at.
 
 **Steps 1-3 are the risky ones and all invisible from outside.** If step 3 does
 not reproduce today's behaviour, stop.
 
+## Before it goes near the real instance
+
+- **Run `init` on a copy of the database first.** The migration rebuilds three
+  primary keys. It has been proven on synthetic rows, not on the live schema.
+- **Confirm the SID cookie really authenticates.** The auth path was read out of
+  `helpers/handlers.cr`, and the unit tests only prove the bot sends the cookie.
+  One `curl` against the instance settles it.
+- **Then a `run --dry-run`**, which writes nothing, before a real run.
+
 ## Open questions
 
-- **Does a minted SID survive `pg_dump` restore?** `session_ids` is in the dump,
-  so it should. Confirm rather than assume.
+- **Does an issued SID survive `pg_dump` restore?** `session_ids` is in the
+  dump, so it should. Confirm rather than assume — the nightly restore is the
+  one thing that would silently log the bot out of every account at once.
 - **Where does the shared mix live** — one playlist on a service account, or a
-  copy in each account? A copy each is simpler to consume and costs only API
-  writes.
-- **Rough size:** schema + SID + account loop ≈ half a day. Shared mix and
-  privacy defaults ≈ another half.
-
-Land the blocklist branch first; it touches the same `run_lane` signature.
+  copy in each account? *Decided: a copy each.* A mix lane is an ordinary lane
+  an account opts into, whose sources happen to name other people, so it needs
+  no service account and is simpler to consume.
+- **Session labelling.** The plan wanted the sessions tagged `iv-suggest-<email>`;
+  `session_ids` has no column for it (`id`, `email`, `issued` only). Ownership is
+  recorded in `suggest.accounts` instead, which is also what enforces one per
+  account.
