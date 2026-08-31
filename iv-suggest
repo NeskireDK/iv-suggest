@@ -2147,6 +2147,48 @@ def read_order(plid, lane_id):
         "WHERE p.id = %s ORDER BY u.ord;" % (acct(), lit(lane_id), lit(plid)))
 
 
+def display_score(it, cfg):
+    """One item's display weight: its score discounted by fatigue, lifted by recency.
+
+    Fatigue is the main lever -- an hour on screen without a play is a small
+    negative, the same impression discount a ranked feed applies to something
+    it has already shown you.
+    """
+    s = it["score"] * (cfg["fatigue"] ** min(it["top"], cfg["fatigue_cap"]))
+    s *= 1.0 + cfg["recency_boost"] * (0.5 ** (it["age"] / cfg["recency_halflife"]))
+    if cfg["jitter"]:
+        s *= random.uniform(1.0 - cfg["jitter"], 1.0 + cfg["jitter"])
+    return s
+
+
+def rotate_top_slot(ordered, items):
+    """Give slot 1 to the best scorer among the half that has waited longest for it.
+
+    Slot 1 is the scarce resource, so it is a rota and not a ranking: every
+    video reaches the top before any video returns to it.
+    """
+    half = max(1, len(ordered) // 2)
+    waited = sorted(items, key=lambda it: -it["since_top"])[:half]
+    lead = max(waited, key=lambda it: it["display"])
+    return [lead] + [it for it in ordered if it["vid"] != lead["vid"]]
+
+
+def spread_channels(ordered):
+    """Pull the order apart so two videos from one channel rarely sit back to back.
+
+    Back to back is what makes a lane read as repetitive even when its content
+    changed.
+    """
+    out, pool = [], list(ordered)
+    while pool:
+        prev = out[-1]["ucid"] if out else ""
+        pick = next((it for it in pool
+                     if not it["ucid"] or it["ucid"] != prev), pool[0])
+        out.append(pick)
+        pool.remove(pick)
+    return out
+
+
 def rank_items(items, cfg):
     """The display order for one lane. Pure: same input, same distribution.
 
@@ -2154,38 +2196,87 @@ def rank_items(items, cfg):
     was added) and since_top (hours since it last held slot 1).
     """
     for it in items:
-        # Fatigue is the main lever: an hour on screen without being played is a
-        # small negative, the same impression discount a ranked feed applies to
-        # something it has already shown you.
-        s = it["score"] * (cfg["fatigue"] ** min(it["top"], cfg["fatigue_cap"]))
-        s *= 1.0 + cfg["recency_boost"] * (0.5 ** (it["age"] / cfg["recency_halflife"]))
-        if cfg["jitter"]:
-            s *= random.uniform(1.0 - cfg["jitter"], 1.0 + cfg["jitter"])
-        it["display"] = s
+        it["display"] = display_score(it, cfg)
     ordered = sorted(items, key=lambda it: -it["display"])
-
     if cfg["round_robin_top"] and len(ordered) > 2:
-        # Slot 1 is the scarce resource, so it is a rota, not a ranking. The half
-        # of the lane that has waited longest for the top is eligible and the
-        # best display score inside that half takes it, so every video reaches
-        # the top before any video returns to it.
-        half = max(1, len(ordered) // 2)
-        waited = sorted(items, key=lambda it: -it["since_top"])[:half]
-        lead = max(waited, key=lambda it: it["display"])
-        ordered = [lead] + [it for it in ordered if it["vid"] != lead["vid"]]
-
+        ordered = rotate_top_slot(ordered, items)
     if cfg["diversity"]:
-        # Two videos from one channel back to back is what makes a lane read as
-        # repetitive even when its content changed.
-        out, pool = [], list(ordered)
-        while pool:
-            prev = out[-1]["ucid"] if out else ""
-            pick = next((it for it in pool
-                         if not it["ucid"] or it["ucid"] != prev), pool[0])
-            out.append(pick)
-            pool.remove(pick)
-        ordered = out
+        ordered = spread_channels(ordered)
     return ordered
+
+
+def source_current_order(src, orders):
+    """A mix source's order: this run's, when it is ours; otherwise the stored one.
+
+    Another account's pass may not have happened yet, and what the database
+    holds is exactly what a reader of that lane sees right now.
+    """
+    return orders.get(src["lane"]) if not src["user"] else source_order(src)
+
+
+def restrict_to_present(sources, items):
+    """Cut every source down to the videos this playlist already holds.
+
+    A shuffle may only permute. Mixing over the full sources would pick a
+    different subset and leave the rest to sort last, re-creating the tail clump
+    the share model exists to prevent; membership stays the nightly run's call.
+    """
+    present = {it["vid"] for it in items}
+    for s in sources:
+        s["vids"] = [vid for vid in s["order"] if vid in present]
+
+
+def mix_order(lane, items, orders):
+    """A mix lane's order, or None when a source has not been reordered this run.
+
+    A mix lane holds no suggest.items row and no score of its own, so without
+    recomputing from the orders this run just produced its feed would move once
+    a night however often the sources are reordered.
+    """
+    mix = lane.get("mix") or {}
+    sources = mix_sources(mix)
+    for s in sources:
+        s["order"] = source_current_order(s, orders)
+    sources = [s for s in sources if not (s["optional"] and s["order"] is None)]
+    if not sources or any(s["order"] is None for s in sources):
+        return None
+    restrict_to_present(sources, items)
+    want = weighted_mix(sources, len(items), int(mix.get("pure", 0)))
+    rank = {vid: n for n, vid in enumerate(want)}
+    return sorted(items, key=lambda it: rank.get(it["vid"], 10**6))
+
+
+def permute_playlist_index(plid, ordered):
+    """Reorder the playlist's index array in place, in one statement.
+
+    It permutes whatever the array holds at write time rather than replacing it,
+    so a video the nightly run adds between the read and this write sorts last
+    and survives. That is what makes the hourly timer safe to run against the
+    nightly one.
+    """
+    execute("UPDATE playlists SET \"index\" = (SELECT coalesce(array_agg(idx ORDER BY "
+            "array_position(%s, idx)), '{}'::bigint[]) FROM unnest(\"index\") AS idx), "
+            "updated = now() WHERE id = %s;"
+            % (_bigint_array([it["idx"] for it in ordered]), lit(plid)))
+
+
+def age_fatigue(lane_id, cfg, after):
+    """Raise fatigue for what is on screen and lower it for what is not.
+
+    Falling again is what lets a buried video recover instead of being held
+    down for ever.
+    """
+    visible = _text_array(after[:cfg["visible"]])
+    execute("UPDATE suggest.items SET top_hours = "
+            "least(coalesce(top_hours,0)+1, %d) "
+            "WHERE account=%s AND lane=%s AND vid = ANY(%s); "
+            "UPDATE suggest.items SET top_hours = greatest(coalesce(top_hours,0)-1, 0) "
+            "WHERE account=%s AND lane=%s AND NOT (vid = ANY(%s)); "
+            "UPDATE suggest.items SET last_top = now() "
+            "WHERE account=%s AND lane=%s AND vid=%s;"
+            % (cfg["fatigue_cap"], acct(), lit(lane_id), visible,
+               acct(), lit(lane_id), visible,
+               acct(), lit(lane_id), lit(after[0])))
 
 
 def shuffle_lane(lane, orders, dry):
@@ -2209,36 +2300,10 @@ def shuffle_lane(lane, orders, dry):
     before = [it["vid"] for it in items]
 
     if lane["policy"] == "mix":
-        # A mix lane holds no suggest.items rows and no score of its own: its
-        # order is the interleave of its sources. Recompute it from the orders
-        # THIS run just produced, otherwise the feed that reads it would only
-        # move once a night no matter how often the sources are reordered.
-        mix = lane.get("mix") or {}
-        sources = mix_sources(mix)
-        for s in sources:
-            # A source in another account was reordered by that account's own
-            # pass, which may not have happened yet. Read its current order out
-            # of the database instead: that is exactly what a reader of that
-            # lane sees right now, and it costs one query.
-            s["order"] = (orders.get(s["lane"]) if not s["user"]
-                          else source_order(s))
-        sources = [s for s in sources
-                   if not (s["optional"] and s["order"] is None)]
-        if not sources or any(s["order"] is None for s in sources):
+        ordered = mix_order(lane, items, orders)
+        if ordered is None:
             log("lane %-16s sources not reordered this run, skipped" % lane_id)
             return before
-        # Restrict each source to what this playlist ALREADY holds, and mix over
-        # exactly that many slots. A shuffle can only permute; it cannot add or
-        # remove. Mixing over the full sources would choose a different subset
-        # than the playlist contains, leaving the videos it did not choose to
-        # sort last — re-creating the very tail clump the share model exists to
-        # prevent. Membership stays the nightly run's decision.
-        present = {it["vid"] for it in items}
-        for s in sources:
-            s["vids"] = [vid for vid in s["order"] if vid in present]
-        want = weighted_mix(sources, len(items), int(mix.get("pure", 0)))
-        rank = {vid: n for n, vid in enumerate(want)}
-        ordered = sorted(items, key=lambda it: rank.get(it["vid"], 10**6))
     else:
         ordered = rank_items(items, cfg)
 
@@ -2249,30 +2314,9 @@ def shuffle_lane(lane, orders, dry):
     if dry:
         return after
 
-    # One statement, and it PERMUTES whatever the array holds right now rather
-    # than replacing it. A video the nightly run adds between the read and this
-    # write has no position in the desired list, sorts last and survives; none
-    # can be lost or duplicated. That is what makes the hourly timer safe to run
-    # against the nightly one.
-    execute("UPDATE playlists SET \"index\" = (SELECT coalesce(array_agg(idx ORDER BY "
-            "array_position(%s, idx)), '{}'::bigint[]) FROM unnest(\"index\") AS idx), "
-            "updated = now() WHERE id = %s;"
-            % (_bigint_array([it["idx"] for it in ordered]), lit(plid)))
-
+    permute_playlist_index(plid, ordered)
     if lane["policy"] != "mix":
-        visible = _text_array(after[:cfg["visible"]])
-        # Fatigue rises while a video is on screen and falls once it is not, so
-        # a buried video recovers instead of being held down for ever.
-        execute("UPDATE suggest.items SET top_hours = "
-                "least(coalesce(top_hours,0)+1, %d) "
-                "WHERE account=%s AND lane=%s AND vid = ANY(%s); "
-                "UPDATE suggest.items SET top_hours = greatest(coalesce(top_hours,0)-1, 0) "
-                "WHERE account=%s AND lane=%s AND NOT (vid = ANY(%s)); "
-                "UPDATE suggest.items SET last_top = now() "
-                "WHERE account=%s AND lane=%s AND vid=%s;"
-                % (cfg["fatigue_cap"], acct(), lit(lane_id), visible,
-                   acct(), lit(lane_id), visible,
-                   acct(), lit(lane_id), lit(after[0])))
+        age_fatigue(lane_id, cfg, after)
     execute("INSERT INTO suggest.shuffles(account,lane,videos,moved) "
             "VALUES (%s,%s,%s,%s);" % (acct(), lit(lane_id), len(after), moved))
     return after
