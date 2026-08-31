@@ -754,6 +754,9 @@ def ignored_keys(policy, lane_block):
 
 
 def load_config():
+    """Every configured lane with the defaults merged in, built once per invocation."""
+    if "lanes" in _CONFIG_CACHE:
+        return _CONFIG_CACHE["lanes"]
     cfg = read_config()
     file_defaults = cfg.get("defaults") or {}
     defaults = merge_lane(
@@ -763,6 +766,7 @@ def load_config():
         lane = merge_lane(defaults, raw)
         lane["ignored"] = ignored_keys(lane["policy"], raw)
         lanes.append(lane)
+    _CONFIG_CACHE["lanes"] = lanes
     return lanes
 
 
@@ -932,12 +936,7 @@ def read_blocked():
     feed the lane's own contents back as a blocklist and empty it.
     """
     cfg = dict(BLOCKLIST_DEFAULTS)
-    try:
-        import yaml
-        with open(CONFIG) as fh:
-            cfg.update((yaml.safe_load(fh) or {}).get("blocklist") or {})
-    except OSError:
-        pass
+    cfg.update(read_config().get("blocklist") or {})
     blocked = {}
     title = (cfg.get("playlist") or "").strip()
     if title and ACCOUNT:
