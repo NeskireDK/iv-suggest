@@ -6,7 +6,9 @@ the run row records -- rather than on how the pipeline is spelled, so the same
 tests hold however it is split into functions.
 """
 
+import os
 import re
+import tempfile
 import unittest
 import urllib.error
 
@@ -534,6 +536,137 @@ class Reconcile(LaneCase):
         removed, added, kept, used = self.fill(
             self.lane(), watched=["h0000000000"], db=db, api=api, fetch=fetch)
         self.assertEqual((1, 1, 0, 1), (removed, added, kept, used))
+
+
+class LastPlayed(LaneCase):
+    """policy: last_played holds the top of the play order and nothing else."""
+
+    def play(self, lane, watched, blocked=None, dry=False, db=None, api=None,
+             fetch=None):
+        self.db = db or Db()
+        self.api = api or Api()
+        self.fetch = fetch or Fetch()
+        self.db.install(self.mod)
+        self.api.install(self.mod)
+        return self.mod.run_lane_last_played(lane, list(watched), blocked or {},
+                                             self.fetch, dry)
+
+    def test_the_most_recently_played_become_the_lane_newest_first(self):
+        self.play(self.lane(policy="last_played", size=2),
+                  ["h0000000000", "h0000000001", "h0000000002"])
+        self.assertEqual(["h0000000002", "h0000000001"], self.api.added())
+
+    def test_a_video_that_fell_out_of_the_window_is_evicted(self):
+        api = Api(videos=[entry("h0000000000")])
+        self.play(self.lane(policy="last_played", size=1),
+                  ["h0000000000", "h0000000001"], api=api)
+        self.assertEqual(["ix-h0000000000"], api.removed())
+        self.assertEqual(["h0000000000"], self.db.forgotten())
+
+    def test_an_evicted_video_gets_no_cooldown_so_a_replay_brings_it_back(self):
+        api = Api(videos=[entry("h0000000000")])
+        self.play(self.lane(policy="last_played", size=1),
+                  ["h0000000000", "h0000000001"], api=api)
+        self.assertEqual([], self.db.cooldowns())
+
+    def test_a_blocked_channel_leaves_even_though_it_was_just_played(self):
+        api = Api(videos=[entry("h0000000000", author_id="UC-bad")])
+        fetch = Fetch(meta={"h0000000000": {"authorId": "UC-bad"}})
+        self.play(self.lane(policy="last_played", size=5), ["h0000000000"],
+                  blocked={"UC-bad": "Bad"}, api=api, fetch=fetch)
+        self.assertEqual(["ix-h0000000000"], api.removed())
+
+    def test_the_score_falls_off_with_the_play_rank(self):
+        self.play(self.lane(policy="last_played", size=2, played_decay=0.5),
+                  ["h0000000000", "h0000000001"])
+        rows = self.db.item_rows()
+        self.assertEqual([("h0000000001", 10.0), ("h0000000000", 5.0)],
+                         [(vid, score) for vid, score, _ in rows])
+
+    def test_a_dry_run_writes_nothing_and_changes_no_playlist(self):
+        api = Api(videos=[entry("h0000000000")])
+        self.play(self.lane(policy="last_played", size=1),
+                  ["h0000000000", "h0000000001"], dry=True, api=api)
+        self.assertEqual([], self.db.written)
+        self.assertEqual([], api.removed())
+        self.assertEqual([], api.added())
+
+    def test_a_refused_add_is_buried_and_does_not_count_as_added(self):
+        api = Api(refuse=["h0000000001"])
+        fetch = Fetch()
+        removed, added, kept, used = self.play(
+            self.lane(policy="last_played", size=1), ["h0000000001"],
+            api=api, fetch=fetch)
+        self.assertEqual((0, 0, 0), (removed, added, kept))
+        self.assertEqual([("h0000000001", 30, "playlist add 500")], fetch.buried)
+
+    def test_the_returned_counts_are_removed_added_kept_and_fetches(self):
+        api = Api(videos=[entry("h0000000000"), entry("h0000000009")])
+        removed, added, kept, used = self.play(
+            self.lane(policy="last_played", size=2),
+            ["h0000000000", "h0000000001"], api=api)
+        self.assertEqual((1, 1, 1, 0), (removed, added, kept, used))
+
+
+class Dedupe(LaneCase):
+    """One upload per song per account, the artist's own copy preferred."""
+
+    def account(self, lanes=("music",)):
+        fh = tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False)
+        fh.write("lanes:\n" + "".join(
+            "  - id: %s\n    title: %s\n" % (l, l.title()) for l in lanes))
+        fh.close()
+        self.addCleanup(os.unlink, fh.name)
+        self.mod = load(IV_SUGGEST_CONFIG=fh.name, IV_SUGGEST_ACCOUNT=ME)
+        self.said = []
+        self.mod.log = self.said.append
+
+    def dedupe(self, lane_videos, dry=False):
+        self.account(tuple(lane_videos))
+        self.db = Db()
+        self.db.query = lambda sql: (
+            [[lane, "PL-" + lane] for lane in lane_videos]
+            if "FROM suggest.lanes" in sql else [])
+        self.db.install(self.mod)
+        self.api = Api()
+        self.api.playlist = None
+        self.api.call = lambda method, path, body=None: (
+            self.api.calls.append((method, path, body))
+            or {"videos": lane_videos[path.rsplit("/", 1)[1][3:]]}
+            if method == "GET" else
+            self.api.calls.append((method, path, body)) or {})
+        self.mod.api = self.api.call
+        return self.mod.dedupe_account(Args(dry))
+
+    def test_the_artists_own_upload_is_kept_over_a_re_upload(self):
+        self.dedupe({"music": [
+            entry("aaaaaaaaaaa", title="Queen - Bohemian Rhapsody"),
+            entry("bbbbbbbbbbb", title="Bohemian Rhapsody (Full HD)")]})
+        self.assertEqual(["ix-bbbbbbbbbbb"], self.api.removed())
+
+    def test_an_earlier_lane_in_the_file_keeps_the_song(self):
+        self.dedupe({"music": [entry("aaaaaaaaaaa", title="Artist - Song")],
+                     "other": [entry("bbbbbbbbbbb", title="Artist - Song")]})
+        self.assertEqual(["ix-bbbbbbbbbbb"], self.api.removed())
+
+    def test_a_song_held_once_is_left_alone_but_its_key_is_recorded(self):
+        self.dedupe({"music": [entry("aaaaaaaaaaa", title="Artist - Song")]})
+        self.assertEqual([], self.api.removed())
+        self.assertTrue([sql for sql in self.db.flat()
+                         if "UPDATE suggest.items SET song_key" in sql])
+
+    def test_a_dry_run_removes_nothing(self):
+        self.dedupe({"music": [
+            entry("aaaaaaaaaaa", title="Artist - Song"),
+            entry("bbbbbbbbbbb", title="Artist - Song (Official Video)")]},
+            dry=True)
+        self.assertEqual([], self.api.removed())
+        self.assertEqual([], self.db.written)
+
+
+class Args:
+    def __init__(self, dry_run=False):
+        self.dry_run = dry_run
 
 
 if __name__ == "__main__":
