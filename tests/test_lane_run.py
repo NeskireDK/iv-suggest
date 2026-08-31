@@ -493,6 +493,67 @@ class Filter(LaneCase):
         self.assertEqual(2, len(got))
 
 
+class GenreAndSampling(LaneCase):
+    """The branches that cost extra fetches or bring randomness in."""
+
+    def test_a_seed_must_match_the_seed_genre_before_it_is_expanded(self):
+        fetch = Fetch(
+            meta={"h0000000000": {"genre": "Music", "authorId": "UC-1"},
+                  "h0000000001": {"genre": "Gaming", "authorId": "UC-2"}},
+            recs={"h0000000000": {"recommendedVideos": [rec("ccccccccccc")]},
+                  "h0000000001": {"recommendedVideos": [rec("ddddddddddd")]}})
+        self.fill(self.lane(seed={"genre": "Music", "limit": 5}),
+                  watched=["h0000000001", "h0000000000"],
+                  db=Db(), api=Api(), fetch=fetch)
+        self.assertEqual(["ccccccccccc"], self.api.added())
+
+    def test_a_candidate_must_match_the_lane_filter_genre(self):
+        fetch = Fetch(
+            meta={"ccccccccccc": {"genre": "Gaming", "authorId": "UC-c",
+                                  "seconds": 600, "title": "C", "author": "c"},
+                  "ddddddddddd": {"genre": "Music", "authorId": "UC-d",
+                                  "seconds": 600, "title": "D", "author": "d"}},
+            recs={"h0000000000": {"recommendedVideos": [
+                rec("ccccccccccc"), rec("ddddddddddd", author_id="UC-d")]}})
+        self.fill(self.lane(filter={"genre": "Music"}), watched=["h0000000000"],
+                  db=Db(), api=Api(), fetch=fetch)
+        self.assertEqual(["ddddddddddd"], self.api.added())
+
+    def test_the_genre_check_gives_up_at_its_cap_rather_than_walking_them_all(self):
+        many = [rec("c%010d" % i, author_id="UC-%d" % i) for i in range(25)]
+        fetch = Fetch(recs={"h0000000000": {"recommendedVideos": many}})
+        self.fill(self.lane(size=1, filter={"genre": "Music"}),
+                  watched=["h0000000000"], db=Db(), api=Api(), fetch=fetch)
+        self.assertTrue(self.logged("genre check cap reached after 20"))
+        self.assertEqual([], self.api.added())
+
+    def test_a_weighted_sample_still_fills_the_room_the_sweep_left(self):
+        many = [rec("c%010d" % i, title="Track %d" % i, author_id="UC-%d" % i)
+                for i in range(10)]
+        fetch = Fetch(recs={"h0000000000": {"recommendedVideos": many}})
+        self.fill(self.lane(size=3, sample_pool=8), watched=["h0000000000"],
+                  db=Db(), api=Api(), fetch=fetch)
+        self.assertEqual(3, len(self.api.added()))
+        self.assertTrue(self.logged("weighted sample over the top 8"))
+
+    def test_a_spent_budget_expands_fewer_seeds_and_keeps_what_it_found(self):
+        mod = self.mod
+
+        class Broke(Fetch):
+            def video(self, vid):
+                if vid == "h0000000001":
+                    raise mod.BudgetSpent("run budget 1 spent")
+                return super().video(vid)
+
+        fetch = Broke(recs={"h0000000000": {"recommendedVideos": [
+            rec("ccccccccccc")]}})
+        self.fill(self.lane(seed={"limit": 5}),
+                  watched=["h0000000000", "h0000000001"],
+                  db=Db(), api=Api(), fetch=fetch)
+        self.assertTrue(self.logged("expanding only the first 0 seeds"))
+        self.assertEqual([], self.api.added())
+
+
 class Reconcile(LaneCase):
     """Putting the chosen videos in the playlist, and what is recorded."""
 

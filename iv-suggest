@@ -1071,17 +1071,31 @@ def run_lane(lane, watched, watched_set, subs, blocked, fetcher, dry,
     fetcher.begin_lane(lane["fetch_cap"])
     plid, playlist = playlist_of(lane, dry)
     current = playlist.get("videos") or []
+    drop, keep, room = sweep_lane(lane, current, watched_set, blocked, plid, dry)
+    if room <= 0:
+        return len(drop), 0, len(keep), fetcher.fetches - started
+    seeds, seed_free = pick_seeds(lane, watched, blocked, fetcher, seed_override)
+    if not seeds and not seed_free:
+        return len(drop), 0, len(keep), fetcher.fetches - started
+    scores, meta_seen = expand_candidates(lane, seeds, subs, blocked, fetcher, room)
+    chosen = choose_candidates(lane, scores, meta_seen, keep, drop, watched_set,
+                               subs, blocked, fetcher, room)
+    refused = reconcile_playlist(lane, chosen, plid, fetcher, dry)
+    return len(drop), len(chosen) - refused, len(keep), fetcher.fetches - started
 
+
+def adopted_item_state(lane_id, current, dry):
+    """Age and score per playlist entry, adopting any the state has no row for.
+
+    A crash landing between the add call and the state write leaves an entry
+    with no age, which the TTL sweep could then never reach.
+    """
     rows = query("SELECT vid, to_char(added,'YYYY-MM-DD'), extract(epoch FROM added), "
                  "coalesce(score,0) FROM suggest.items "
                  "WHERE account=%s AND lane=%s;" % (acct(), lit(lane_id)))
     added_at = {r[0]: r[1] for r in rows}
     added_ts = {r[0]: float(r[2] or 0) for r in rows}
     item_score = {r[0]: float(r[3] or 0) for r in rows}
-
-    # Adopt an entry that is in the playlist but has no state row. That happens
-    # if a crash lands between the add call and the state write. Without this the
-    # entry has no age and the TTL sweep can never remove it.
     today = one("SELECT to_char(now(),'YYYY-MM-DD');")
     for v in current:
         if v["videoId"] not in added_at:
@@ -1093,8 +1107,13 @@ def run_lane(lane, watched, watched_set, subs, blocked, fetcher, dry,
                 execute("INSERT INTO suggest.items(account,lane,vid,score) VALUES "
                         "(%s,%s,%s,0) ON CONFLICT (account,lane,vid) DO NOTHING;"
                         % (acct(), lit(lane_id), lit(v["videoId"])))
+    return added_at, added_ts, item_score
 
-    # 1. sweep -------------------------------------------------------------
+
+def sweep_lane(lane, current, watched_set, blocked, plid, dry):
+    """What leaves the lane tonight, what stays, and the room that opens up."""
+    lane_id = lane["id"]
+    added_at, added_ts, item_score = adopted_item_state(lane_id, current, dry)
     ttl = lane["ttl_days"]
     old = one("SELECT to_char(now() - interval '%d days','YYYY-MM-DD');" % ttl) if ttl else ""
     drop, keep = [], []
@@ -1131,12 +1150,11 @@ def run_lane(lane, watched, watched_set, subs, blocked, fetcher, dry,
             retire_item(lane_id, plid, v, cooldown_days_for(lane, why), why)
     room = lane["size"] - len(keep)
     log("  swept %d, kept %d, room for %d" % (len(drop), len(keep), room))
-    if room <= 0:
-        return len(drop), 0, len(keep), fetcher.fetches - started
+    return drop, keep, room
 
-    # 2. seeds -------------------------------------------------------------
-    # `subscription_feed` needs none: its candidates come from the feed table,
-    # not from what was watched.
+
+def pick_seeds(lane, watched, blocked, fetcher, seed_override):
+    """The history ids this lane expands. A subscription_feed lane needs none."""
     seed_free = lane["expand"] == "subscription_feed"
     seeds = []
     if seed_free:
@@ -1168,10 +1186,11 @@ def run_lane(lane, watched, watched_set, subs, blocked, fetcher, dry,
     if not seed_free:
         log("  seeds %d (lane fetches %d, cache hits %d)%s"
             % (len(seeds), fetcher.lane_used, fetcher.cache_hits, short))
-    if not seeds and not seed_free:
-        return len(drop), 0, len(keep), fetcher.fetches - started
+    return seeds, seed_free
 
-    # 3. expand and score --------------------------------------------------
+
+def expand_candidates(lane, seeds, subs, blocked, fetcher, room):
+    """Candidate ids scored by the lane's expand source, with their listing meta."""
     scores, meta_seen = {}, {}
     rec_age = lane["recommend_max_age_days"]
     rec_cutoff = time.time() - rec_age * 86400.0 if rec_age else 0.0
@@ -1276,8 +1295,13 @@ def run_lane(lane, watched, watched_set, subs, blocked, fetcher, dry,
         for rank, vid in enumerate(seeds):
             scores[vid] = 1.0 - rank / 100000.0         # keep the watch order
             meta_seen[vid] = fetcher.meta.get(vid, {})
+    return scores, meta_seen
 
-    # 4. filter ------------------------------------------------------------
+
+def choose_candidates(lane, scores, meta_seen, keep, drop, watched_set, subs,
+                      blocked, fetcher, room):
+    """The candidates that pass every filter, as [(vid, score, meta, song), ...]."""
+    lane_id = lane["id"]
     cool = {r[0] for r in query(
         "SELECT vid FROM suggest.cooldown "
         "WHERE account=%s AND lane=%s AND until > now();" % (acct(), lit(lane_id)))}
@@ -1393,8 +1417,12 @@ def run_lane(lane, watched, watched_set, subs, blocked, fetcher, dry,
         chosen.append((vid, score, meta, skey))
 
     log("  candidates %d, rejected %s" % (len(ranked), {k: v for k, v in rejected.items() if v}))
+    return chosen
 
-    # 5. reconcile ---------------------------------------------------------
+
+def reconcile_playlist(lane, chosen, plid, fetcher, dry):
+    """Add the chosen videos to the lane's playlist. Returns how many were refused."""
+    lane_id = lane["id"]
     refused, added = 0, []
     for vid, score, meta, skey in chosen:
         log("  + %5.2f  %-52s %s" % (score, (meta.get("title") or vid)[:52],
@@ -1413,7 +1441,7 @@ def run_lane(lane, watched, watched_set, subs, blocked, fetcher, dry,
     # row per candidate would cost hundreds of psql round trips for nothing.
     if not dry and added:
         fetcher.remember_partial(added)
-    return len(drop), len(chosen) - refused, len(keep), fetcher.fetches - started
+    return refused
 
 
 def run_lane_last_played(lane, watched, blocked, fetcher, dry):
