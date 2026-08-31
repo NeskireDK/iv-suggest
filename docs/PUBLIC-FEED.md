@@ -126,6 +126,17 @@ decides *which accounts*.
 
 Removed from `DEFAULTS`, from `lanes.yml` and from the reference.
 
+### code — `iv-suggest status` reports 0 videos for a mix lane
+
+The `videos` column counts `suggest.items`, which a mix lane never writes: it
+rebuilds from its sources every run and stores no membership of its own. So
+`home-mix` and `household` read as empty in `status` while the playlists hold
+54 and 40. `cmd_metrics` already special-cases the same thing
+(`0 if lane["policy"] == "mix"`), so the shape of the fix is known — count
+`array_length(playlists."index", 1)` for a mix lane. Cosmetic, but it reads as
+a broken lane at exactly the moment somebody is checking whether a deploy
+worked.
+
 ### docs — corrected in CONFIG.md
 
 | Claim as written | What the code does |
