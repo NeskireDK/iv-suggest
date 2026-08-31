@@ -24,7 +24,6 @@ only in your shell is missing from the nightly run — test with `env -i`.
 | `IV_SUGGEST_CONFIG` | `/etc/iv-suggest/lanes.yml` | lane config path |
 | `IV_SUGGEST_ENVFILE` | `/etc/iv-suggest/env` | file the above are also read from |
 | `IV_SUGGEST_DB_CONTAINER` | `youtube-invidious-db-1` | `kickstart.py` only, which talks to the container directly and reads the environment alone — not this file |
-| `IV_SUGGEST_TOKEN` | — | Invidious API token, **raw JSON** (base64 returns 403). Only a fallback for an install predating `init`-minted sessions |
 
 ## `lanes.yml`
 
