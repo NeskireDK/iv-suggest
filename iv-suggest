@@ -10,15 +10,11 @@ users: block saying who gets which, and the bot issues itself one Invidious
 session per account rather than holding a token for each. An account not named
 in that block is never touched.
 
-  config : /etc/iv-suggest/lanes.yml   (lanes, and the users: block)
-  auth   : one session per account, in suggest.accounts. IV_SUGGEST_TOKEN in
-           /etc/iv-suggest/env is the fallback for an install predating that.
+  config : /etc/iv-suggest/lanes.yml and /etc/iv-suggest/env (docs/CONFIG.md)
+  auth   : one session per account, in suggest.accounts. IV_SUGGEST_TOKEN is
+           the fallback for an install predating that.
   state  : PostgreSQL schema "suggest" in the Invidious database
-  usage  : iv-suggest init [--all-users]
-           iv-suggest run [--dry-run] [--lane ID] [--account EMAIL]
-           iv-suggest status
-           iv-suggest metrics     (Prometheus text, database only, no token)
-           iv-suggest views [--rate N] [--budget N]   (refresh view counts)
+  usage  : iv-suggest --help
 
 Rate limiting: every call to /api/v1/videos/<id> makes Invidious fetch from
 YouTube, because the Invidious video cache is UNLOGGED and short lived. The
@@ -42,19 +38,9 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-# Deployment specific, all overridable from the environment. The defaults
-# describe the reference install: Invidious under docker compose, this script
-# running on the same host.
-#   IV_SUGGEST_COMPOSE_DIR  directory holding the Invidious docker-compose.yml
-#   IV_SUGGEST_DB_SERVICE   compose service name of the Postgres container
-#   IV_SUGGEST_DB_USER      Postgres role (Invidious ships as "kemal")
-#   IV_SUGGEST_DB_NAME      Postgres database
-#   IV_SUGGEST_API          base URL of the Invidious instance
-#   IV_SUGGEST_CONFIG       lanes.yml path
-#   IV_SUGGEST_ENVFILE      file the settings are also read from
-#   IV_SUGGEST_ACCOUNT      the account this bot belongs to. It owns the
-#                           blocklist playlist and every row written before
-#                           multi-user; who else gets lanes is lanes.yml.
+# Deployment specific, all overridable from the environment. The defaults below
+# describe the reference install: Invidious under docker compose, this script on
+# the same host. Each setting is documented once, in docs/CONFIG.md.
 ENVFILE = os.environ.get("IV_SUGGEST_ENVFILE", "/etc/iv-suggest/env")
 
 
@@ -129,9 +115,8 @@ DEFAULTS = {
     "seed": {"from": "watched", "limit": 30},
     "expand": "recommended",  # recommended | none | channel_latest | subscription_feed
     "filter": {},
-    "order": "score",
     "policy": "refill",       # refill | last_played | mix
-    "privacy": "public",      # public also enables /feed/playlist/<plid> (RSS)
+    "privacy": "unlisted",    # only "private" breaks /feed/playlist/<plid> (RSS)
     "fetch_cap": 80,          # most fetches one lane may take from the run budget
     "refresh_per_day": 0,     # retire this many of the oldest entries every run
     "rotate_cooldown_days": 21,
@@ -147,13 +132,10 @@ DEFAULTS = {
     "played_decay": 0.99,     # last_played: score falloff per rank in play order
 }
 
-# Channels no lane may offer. The list is an ordinary Invidious playlist on the
-# bot's own account, which is what makes it editable from every client: "add to
-# playlist" sits in the same menu as everything else, and `playlist_videos.ucid`
-# records the channel of each entry. Tapping one video therefore blocks its
-# channel. Server side, so it is the same list on the phone, the TV and the web.
+# Channels no lane may offer. An ordinary playlist on the account, so any client
+# can edit it; `playlist_videos.ucid` is what turns one video into a channel block.
 BLOCKLIST_DEFAULTS = {
-    "playlist": "Blocked",    # playlist title on IV_SUGGEST_ACCOUNT; "" disables
+    "playlist": "Blocked",    # playlist title on the account; "" disables
     "channels": [],           # extra channel ids, for a channel with nothing to tap
 }
 
@@ -2110,10 +2092,10 @@ def cmd_init(args):
     before, a session is opened once and reused, and a playlist is created only
     when the account has none for that lane. Nothing here recreates anything.
     """
-    execute(SCHEMA_SQL)
     if not PRIMARY:
         sys.exit("set IV_SUGGEST_ACCOUNT: the migration needs to know which "
                  "account the rows written before multi-user belong to")
+    execute(SCHEMA_SQL)
     execute(MIGRATE_SQL.replace("__ACCOUNT__", lit(PRIMARY)))
     log("schema suggest is ready (rows without an account belong to %s)" % PRIMARY)
     users = load_users() if args.all_users else [
