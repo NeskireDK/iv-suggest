@@ -128,9 +128,9 @@ install -m 700 iv-suggest /usr/local/bin/iv-suggest
 install -d -m 700 /etc/iv-suggest
 install -m 600 lanes.yml /etc/iv-suggest/lanes.yml
 cp env.example /etc/iv-suggest/env && chmod 600 /etc/iv-suggest/env
-$EDITOR /etc/iv-suggest/env          # token + account, at minimum
+$EDITOR /etc/iv-suggest/env          # account, at minimum
 
-iv-suggest init                      # create the schema
+iv-suggest init                      # schema + a session for the account
 iv-suggest run --dry-run             # writes nothing, caps seeds at 10
 iv-suggest run                       # create the playlists and fill them
 
@@ -148,8 +148,8 @@ Everything deployment-specific comes from the environment or `/etc/iv-suggest/en
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `IV_SUGGEST_TOKEN` | — | Invidious API token, raw JSON. **Required** |
-| `IV_SUGGEST_ACCOUNT` | — | account whose playlists are filled (`users.email`). **Required** |
+| `IV_SUGGEST_ACCOUNT` | — | the account the bot belongs to (`users.email`). **Required** |
+| `IV_SUGGEST_TOKEN` | — | Invidious API token, raw JSON. Optional: only a fallback for an install that has not run `init` since sessions landed |
 | `IV_SUGGEST_API` | `http://localhost:3000` | Invidious base URL |
 | `IV_SUGGEST_COMPOSE_DIR` | `/root/docker/youtube` | directory with Invidious's `docker-compose.yml` |
 | `IV_SUGGEST_DB_SERVICE` | `invidious-db` | compose service name of Postgres |
@@ -161,10 +161,12 @@ Everything deployment-specific comes from the environment or `/etc/iv-suggest/en
 ## Commands
 
 ```
-iv-suggest init                                   create the schema
+iv-suggest init [--all-users]                     schema, sessions, playlists
 iv-suggest run [--dry-run] [--lane ID]            fill the lanes
+           [--account EMAIL]
            [--seeds N] [--rate N] [--budget N]
 iv-suggest shuffle [--dry-run] [--lane ID]        reorder only, no fetches
+           [--account EMAIL]
 iv-suggest status                                 lane sizes and recent runs
 iv-suggest dedupe [--dry-run]                     one upload per song
 iv-suggest views                                  backfill missing view counts
@@ -172,6 +174,68 @@ iv-suggest metrics                                Prometheus text, database only
 ```
 
 `metrics` takes no token and makes no fetch, so it is safe to scrape often.
+
+## More than one account
+
+`lanes.yml` is the shared library of lanes; a `users:` block says who gets which.
+
+```yaml
+users:
+  - email: you@example.com
+    lanes: all
+  - email: them@example.com
+    lanes: [suggested, music-discover, fresh-uploads]
+    overrides:
+      fresh-uploads: {size: 15}
+```
+
+- **No `users:` block means the single account in `IV_SUGGEST_ACCOUNT` with
+  every lane** — exactly what the bot did before, so an existing config is
+  unchanged.
+- **An account absent from the block is never touched.** There is no
+  auto-enrolment: finding a dozen playlists the bot made in your account is a
+  bad first impression.
+- `lanes: all` is for the account that wants the library; everyone else names
+  the few they want.
+- The bot issues itself one Invidious session per account and reuses it, so a
+  second person needs no token, no password and no fork change. `init
+  --all-users` opens the sessions and creates the playlists that are missing.
+- **One timer, one budget.** The accounts are a loop inside one run, the fetch
+  budget is divided rather than multiplied, and whoever succeeded least
+  recently is served first — so an exhausted budget starves a different person
+  each night. The metadata cache is shared, so overlapping taste is nearly free.
+- Metrics carry an `account` label; the instance-wide series do not.
+
+### The household mix
+
+A `mix` lane's sources may name other accounts, which blends everyone's best
+into one feed:
+
+```yaml
+  - id: household
+    title: Household
+    policy: mix
+    mix:
+      sources:
+        - {user: you@example.com,  lane: suggested, share: 0.6}
+        - {user: them@example.com, lane: suggested, share: 0.4}
+```
+
+Sources are read over SQL, so the mix never needs anyone else's session, and it
+still costs zero YouTube fetches. What each viewer sees is filtered for *them*:
+their watch history and their blocklist, applied to whatever anyone
+contributed. Contributing is not optional — a shared feed does show the
+household what each person watches.
+
+## Tests
+
+```sh
+python3 -m unittest discover -s tests -t tests
+```
+
+No dependencies beyond PyYAML. The schema migration is exercised against a
+throwaway postgres container; those tests skip themselves when docker is not
+available.
 
 `kickstart.py` is a one-off that classifies a whole `channel_videos` backlog
 without the per-tick caps — useful after a bulk import. It needs the patched
