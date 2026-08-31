@@ -1,51 +1,14 @@
-# iv-suggest lanes. One lane = one playlist + the rules that fill it.
-# Add a genre by copying a block. No code change is needed.
+# iv-suggest lanes. One lane = one playlist + the rules that fill it; adding a
+# genre is a new block below, not new code.
 #
-# seed.from       : watched            (the only source today)
-# seed.limit      : how many seed videos to use
-# seed.scan       : how deep to walk the history to find them (genre seeds only)
-# seed.recent     : pin the N newest history entries in front of the shuffle
-# seed.shuffle_window : draw seeds in random order from the N most recent
-#                   entries, so the candidate set differs every night even
-#                   when nothing new was watched
-# expand          : recommended | none | channel_latest
-# filter          : {genre: X}         verified per candidate, costs one fetch each
-# ttl_days        : 0 = never expire an unwatched entry
-# refresh_per_day : retire this many of the OLDEST entries every run, whatever
-#                   the TTL says. This is what keeps a lane moving: a watch
-#                   event frees at most one slot a day, and the TTL frees the
-#                   whole lane at once because the whole lane was filled at once.
-# sample_pool     : pick from a weighted random draw over the top N candidates
-#                   instead of the strict top of the score order
-# recommend_max_age_days : expand: recommended, drop a recommendation older than
-#                   this. recommendedVideos carries `published`, so it is free.
-# subscription    : expand: subscription_feed — reads channel_videos over SQL,
-#                   ZERO YouTube fetches. {kinds: [video|short|live],
-#                   max_age_hours, rank: views|published}. `kind` is written by
-#                   the fork's ClassifyChannelVideosJob.
+# Every key is documented once, in docs/CONFIG.md. The comments here only say
+# why THIS instance chose THESE values.
 
-# Channels no lane may offer. The list is an ordinary Invidious playlist on the
-# account named by IV_SUGGEST_ACCOUNT, so any client edits it: open a video from
-# the channel and use "add to playlist" -> Blocked. One video is enough — the
-# block is on its CHANNEL, not on that video — and the entry can stay there as
-# the record of why. Because the playlist is server side the list is the same on
-# the phone, the TV and the web, which a client-side content filter is not.
-#
-# A blocked channel leaves every lane on the next run and gets no cooldown row,
-# so emptying the playlist lets it back the same night.
-# Who the bot manages. Absent means the single account in IV_SUGGEST_ACCOUNT
-# with every lane below, which is what it did before there was a users: block —
-# so leaving this out changes nothing.
-#
-# An account NOT listed here is never touched. There is no auto-enrolment: a
-# household member who opens Invidious and finds a dozen playlists the bot made
-# in their account has been surprised, not served.
-#
-#   lanes: all          the whole library, for whoever wants it
-#   lanes: [a, b, c]    just these, for everyone else. Order is this file's,
-#                       not the list's, so mix lanes still run last.
-#   overrides:          per-lane changes for that account only
-#
+blocklist:
+  playlist: Blocked
+  channels: []
+
+# Who the bot manages. Omitted, so it manages IV_SUGGEST_ACCOUNT with every lane.
 #users:
 #  - email: you@example.com
 #    lanes: all
@@ -53,10 +16,6 @@
 #    lanes: [suggested, music-discover, fresh-uploads]
 #    overrides:
 #      fresh-uploads: {size: 15}
-
-blocklist:
-  playlist: Blocked     # playlist title; "" turns the whole mechanism off
-  channels: []          # extra channel ids, for a channel with nothing to tap
 
 defaults:
   size: 30
@@ -66,27 +25,14 @@ defaults:
   rotate_cooldown_days: 21
   max_per_channel: 2
   exclude_watched: true
-  exclude_subscribed: true      # your subscription feed already shows those
+  exclude_subscribed: true
   dedupe_across_lanes: true
   min_seconds: 120              # drops Shorts
-  # Unlisted, not public: a lane is a record of what somebody watches, and
-  # nothing needs it listed. The RSS feed /feed/playlist/<plid> still works —
-  # rss_playlist only refuses a PRIVATE playlist.
-  privacy: unlisted
+  privacy: unlisted             # a lane is a record of what somebody watches
 
-  # Hourly reorder (`iv-suggest shuffle`). Membership is the nightly run's job;
-  # this only decides what sits at the top. It permutes `playlists.index` in
-  # SQL, so it costs one UPDATE per lane and never touches YouTube.
-  #   fatigue  — an hour on screen without a play is a small negative, the same
-  #              impression discount a ranked feed applies to what it already
-  #              showed you. It decays back once the video drops off screen.
-  #   round_robin_top — slot 1 is a rota, not a ranking: the half of the lane
-  #              that has waited longest is eligible, so at least half the lane
-  #              leads before any video returns to the top (>=16 h on a 30 lane).
-  # Tuned by simulation over 72 hourly ticks: these values give ~3.4 new videos
-  # in the visible top 10 each hour on a 30-video lane. The first draft
-  # (fatigue 0.75 / jitter 0.15) replaced 8.5 of 10 every hour, which reads as
-  # random rather than refreshed. Raise `fatigue` toward 1.0 for a calmer lane.
+  # Tuned by simulation over 72 hourly ticks: ~3.4 new videos in the visible top
+  # 10 each hour on a 30-video lane. The first draft (fatigue 0.75 / jitter 0.15)
+  # replaced 8.5 of 10 an hour, which reads as random rather than refreshed.
   shuffle:
     visible: 10
     fatigue: 0.95
@@ -117,14 +63,13 @@ lanes:
     min_seconds: 0
     max_per_channel: 0
     fetch_cap: 150              # fills over about 3 nights, then costs nothing
-    # 100 videos competing for 10 visible slots churns the top far harder than a
-    # 30 lane does. A proportionally wider fatigue window brings it back to
-    # ~3.7 new in the top 10 per hour instead of 7.4.
+    # 100 videos competing for 10 visible slots churn the top far harder than a
+    # 30 lane; a proportionally wider window brings it back to ~3.7/hour.
     shuffle: {visible: 40}
 
   - id: music-discover
     title: "Music: discover"
-    # shuffle_window 700 matches the window music-watched already caches, so a
+    # shuffle_window 700 matches what music-watched already caches, so a
     # shuffled seed almost never costs an extra genre fetch.
     seed: {from: watched, limit: 15, scan: 300, genre: Music, shuffle_window: 700}
     expand: recommended
@@ -140,8 +85,7 @@ lanes:
 
   # Channels watched but never subscribed to. Everything else in this file
   # recycles videos that already existed; this lane reads what those channels
-  # published since yesterday. One fetch per channel returns ~60 uploads, so a
-  # whole refill costs about a dozen fetches.
+  # published since yesterday. ~60 uploads per fetch, ~a dozen fetches a refill.
   - id: fresh-uploads
     title: "Fresh uploads"
     seed: {from: watched, limit: 400}
@@ -154,11 +98,9 @@ lanes:
     max_per_channel: 2
     fetch_cap: 20
 
-  # The 5 biggest things his subscriptions put out in the last 48 hours.
-  # Every other lane excludes subscribed channels on purpose; this one is the
-  # deliberate exception, which is why exclude_subscribed is off. Pure SQL over
-  # channel_videos, so it costs no YouTube fetch and the view counts come free
-  # from the channel RSS. kinds: [video] is what keeps Shorts out.
+  # The 5 biggest things the subscriptions put out in the last 48 hours. Every
+  # other lane excludes subscribed channels; this one is the deliberate
+  # exception, which is why exclude_subscribed is off.
   - id: subs-top48
     title: "Subscriptions: biggest 48h"
     expand: subscription_feed
@@ -173,10 +115,8 @@ lanes:
     rotate_cooldown_days: 3
     dedupe_songs: false
 
-  # "New for you": the recommendation graph, but only uploads from the last
-  # fortnight. `suggested` takes the whole graph and mostly returns older
-  # videos; this is the same discovery restricted to new content. NOT a home-mix
-  # source — it is a playlist of its own, off the front page.
+  # The recommendation graph restricted to the last fortnight. `suggested` takes
+  # the whole graph and mostly returns older videos. NOT a home-mix source.
   - id: new-for-you
     title: "New for you"
     seed: {from: watched, limit: 30, recent: 10, shuffle_window: 300}
@@ -188,38 +128,30 @@ lanes:
     sample_pool: 40
     keep_min: 15
 
-  # Shorts are out of the subscription feed (feed_kinds: [video]) but not
-  # thrown away — they land here instead, ranked by view count.
+  # Shorts are out of the subscription feed (feed_kinds: [video]) but not thrown
+  # away — they land here instead.
   - id: subs-shorts
     title: "Shorts"
     expand: subscription_feed
     subscription: {kinds: [short], max_age_hours: 168, rank: views}
     size: 30
     ttl_days: 7
-    # refresh_per_day 0 ON PURPOSE, unlike every recommendation lane. Forced
-    # rotation exists to unstick a lane whose candidate pool keeps growing; here
-    # the pool is bounded by max_age_hours, so retiring 6 a night into a 21-day
-    # cooldown would put more videos on cooldown than the window can supply and
-    # empty the lane in under a week. The window itself is the turnover.
-    refresh_per_day: 0
+    refresh_per_day: 0          # window-bounded lane: max_age_hours IS the turnover
     exclude_subscribed: false
     min_seconds: 0              # the whole point of this lane
     max_per_channel: 3
     dedupe_songs: false
 
-  # Same for live streams, newest first rather than biggest: a stream is worth
-  # seeing because it is on or just finished, not because it is popular.
+  # Live streams, newest first rather than biggest: a stream is worth seeing
+  # because it is on or just finished, not because it is popular.
   - id: subs-live
     title: "Live streams"
     expand: subscription_feed
-    # Sized to the real supply, not to a round number: only 35 of the 75
-    # channels ever stream, and a 14-day window yielded 12 candidates from
-    # about 4 channels. size 20 filled to 3 and would have tripped
-    # IvSuggestLaneUnderfilled every day for no reason.
     subscription: {kinds: [live], max_age_hours: 720, rank: published}
+    # Only 35 of the 75 channels ever stream: size 20 filled to 3.
     size: 10
     ttl_days: 21
-    refresh_per_day: 0          # same starvation trap as subs-shorts, worse
+    refresh_per_day: 0          # window-bounded, same as subs-shorts
     exclude_subscribed: false
     min_seconds: 0
     # 1: a channel that re-streams reuses the title verbatim, so any higher
@@ -229,20 +161,13 @@ lanes:
     max_per_channel: 1
     dedupe_songs: false
 
-  # Interest lanes. Same shape as music-discover: seed from watched videos of
-  # that genre, expand through the recommendation graph, verify the genre per
-  # candidate. Playlists only — none of these feed the front page.
+  # Interest lanes, same shape as music-discover. Playlists only — none of these
+  # feed the front page.
   #
-  # shuffle_window 700 is deliberate, for the same reason music-discover uses
-  # it: the most recent 700 history entries are fully genre-cached (Gaming 176,
-  # Autos 55, Science & Tech 53), so seeding costs ZERO fetches and only the
-  # candidate verification spends budget.
-  #
-  # size 20, not 30: the genre check is one fetch per candidate, capped at
-  # max(20, room * 3). Three lanes at size 30 would want ~270 checks on the
-  # first fill and blow the 320-fetch run budget; at 20 they fit alongside the
-  # existing lanes. Once video_meta has seen the candidates the checks are
-  # cache hits and cost almost nothing.
+  # shuffle_window 700: the most recent 700 history entries are fully
+  # genre-cached, so seeding costs zero fetches.
+  # size 20, not 30: the genre check is one fetch per candidate. Three lanes at
+  # 30 would want ~270 checks on the first fill and blow the 320-fetch budget.
 
   - id: gaming
     title: "Gaming"
@@ -278,33 +203,21 @@ lanes:
     fetch_cap: 60
 
   # THE LANDING PAGE: this lane IS the Popular feed (popular_playlists in the
-  # compose file points at its plid). Spec: ~10% music, the
-  # rest from the recommendation graph.
-  #
-  # `share` is a share of the OUTPUT, checked at every slot, so music lands about
-  # every tenth position instead of in a block. The old
-  # `pure: 20, ratio: 2` form produced 30 suggested + 30 music (50%) with
-  # positions 35-60 a solid music block, because once the base ran out the ratio
-  # rule appended the entire rest of the blend.
-  #
-  # Both non-music sources are recommendation driven: `suggested` is the
-  # recommendation graph, `fresh-uploads` is what watched channels have
-  # published since yesterday. Music stays at 10%.
+  # compose file points at its plid). Spec: ~10% music, the rest recommendation
+  # driven.
   #
   # size 54 is what the shares and the source sizes agree on: suggested supplies
-  # its full 30 (55% of 54 = 29.7), fresh-uploads 19 of its 25 (35% = 18.9),
-  # music 5 (10% = 5.4). Growing `suggested` or `fresh-uploads` is what makes the
-  # page longer from here; raising `size` alone would only pull in more music.
-  # Mix lanes come LAST: they read their sources after those refreshed.
+  # its full 30, fresh-uploads 19 of its 25, music 5. Growing `suggested` or
+  # `fresh-uploads` is what makes the page longer; raising `size` alone would
+  # only pull in more music.
   - id: home-mix
     title: "Home mix"
     policy: mix
     size: 54
     mix:
-      # A big head makes the other sources catch up in one block right after it
-      # (pure 10 gave a 4-long fresh-uploads run at 11-14, pure 20 was worse).
-      # 5 keeps the top pure, holds the longest run to 2 and puts the first music
-      # video at position 8 — just off the first screen on the TV.
+      # A bigger head makes the other sources catch up in one block right after
+      # it. 5 holds the longest run to 2 and puts the first music video at
+      # position 8 — just off the first screen on the TV.
       pure: 5
       sources:
         - {lane: suggested, share: 0.50}
@@ -314,6 +227,3 @@ lanes:
         - {lane: music-discover, share: 0.10}
       # A source may name another account, which makes this the household feed:
       #   - {user: them@example.com, lane: suggested, share: 0.2}
-      # Read over SQL, so it needs nobody else's session and still costs zero
-      # fetches. What each viewer sees is filtered for THEM — their watch
-      # history, their blocklist — whoever contributed it.
