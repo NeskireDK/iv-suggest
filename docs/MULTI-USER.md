@@ -189,11 +189,19 @@ not reproduce today's behaviour, stop.
 ## Before it goes near the real instance
 
 - **Run `init` on a copy of the database first.** The migration rebuilds three
-  primary keys. It has been proven on synthetic rows, not on the live schema.
-- **Confirm the SID cookie really authenticates.** The auth path was read out of
-  `helpers/handlers.cr`, and the unit tests only prove the bot sends the cookie.
-  One `curl` against the instance settles it.
-- **Then a `run --dry-run`**, which writes nothing, before a real run.
+  primary keys. *Done 2026-08-31:* `pg_dump --schema=suggest` off LXC 109
+  restored into a throwaway postgres, migrated, and then driven with the real
+  `init`, `status` and `metrics` against the live `lanes.yml`. All 12 lanes kept
+  their playlist ids, 2745 rows backfilled to `neskire`, `video_meta` untouched,
+  and a second `init` opened no second session. Only the `suggest` schema was
+  copied -- no watch history left the instance.
+- **Confirm the SID cookie really authenticates.** *Done 2026-08-31:* one
+  temporary session for `neskire`, `GET /api/v1/auth/playlists` with
+  `Cookie: SID=` returned **200** and the real playlist list; the same call with
+  no cookie returned **403**; the session was deleted and the count returned to
+  what it was. The bot's 44-character urlsafe base64 value is accepted as is.
+- **Then a `run --dry-run`**, which writes nothing, before a real run. *Still
+  outstanding* -- it needs the API, so it has to happen on the instance.
 
 ## Open questions
 
