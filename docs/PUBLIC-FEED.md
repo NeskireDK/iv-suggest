@@ -46,11 +46,14 @@ several mixes agree on ranks higher.**
   a stranger with.
 - **It lives on the bot's own account**, because nobody in particular owns it.
 
-## 2. Auto-enrol every account, and carry the ones with no history
+## 2. Auto-enrol every account, and carry the ones with no history — BUILT
 
-**Decided 2026-08-31: enrol every Invidious account automatically, including
-future ones, on the nightly run.** The `users:` block stays as the way to
-override what somebody gets; absent from it now means "the defaults", not
+**Built 2026-08-31, not yet deployed.** `auto_enrol:` in `lanes.yml` takes in
+every account on the instance including ones registered later; `min_watched`
+holds back a lane an account cannot fill yet; and a `mix` source of
+`{users: all, lane: X}` expands to one source per account, so the `household`
+lane needs no names and survives enrolment. The `users:` block stays as the way
+to give somebody *different* lanes; absent from it now means "the defaults", not
 "untouched".
 
 This reverses [MULTI-USER.md](MULTI-USER.md)'s "never auto-enrol". That rule was
@@ -72,9 +75,9 @@ mix from part 1 as its home feed.**
 - Cheapest form: a `mix` lane whose only source is the compiled feed, given to
   any account under a watch-count threshold. Zero fetches, since a mix reads its
   sources over SQL.
-- **Enrolment must be idempotent and quiet.** It runs nightly, so it has to
-  create what is missing and nothing else, and it must not re-create a playlist
-  somebody deleted on purpose.
+- **Enrolment is idempotent.** It is recomputed every run; `playlist_of()`
+  creates only what is missing, and `min_watched` is a filter rather than stored
+  state, so nothing has to be migrated when an account warms up.
 - **A Takeout import remains the real fix** and lands the whole history at once.
   The fallback covers the days before somebody gets round to it.
 
@@ -90,16 +93,14 @@ Each verified against the code, not inferred. The `docs` ones are fixed on the
 branch that added [CONFIG.md](CONFIG.md); the `code` ones are open and land here
 because auto-enrolment touches most of them.
 
-### code — per-account `overrides` can silently kill a lane's shuffle
+### ~~code — per-account `overrides` can silently kill a lane's shuffle~~ FIXED
 
-`lanes_for()` applies overrides with a shallow `lane.update(over)` *after*
-`load_config()` has deep-merged `shuffle:` and `subscription:` key by key. So
-`overrides: {gaming: {shuffle: {jitter: 0}}}` leaves a `shuffle` dict holding
-only `jitter`, `rank_items()` raises `KeyError: 'fatigue'`, the per-lane
-try/except swallows it, and that lane never reorders again with nothing in the
-log to say why. **Blocks auto-enrolment** — `overrides` is the per-account knob,
-so this is the first thing a second account would trip. Fix: deep-merge
-overrides the same way `load_config()` merges defaults.
+`lanes_for()` applied overrides with a shallow `lane.update(over)` *after*
+`load_config()` had deep-merged `shuffle:` and `subscription:` key by key, so
+`overrides: {gaming: {shuffle: {jitter: 0}}}` left a `shuffle` dict holding only
+`jitter`, `rank_items()` raised `KeyError: 'fatigue'`, the per-lane try/except
+swallowed it, and that lane never reordered again. Both paths now go through
+`merge_lane()`.
 
 ### code — `matches()` is dead, and `min_seconds` does not do what it says
 
