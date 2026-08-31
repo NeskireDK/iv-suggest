@@ -109,20 +109,35 @@ account, not any single person's lane.
   watched, and drop their own blocklist. Same video, different verdict per
   person — that is the point.
 
-**Privacy is the real decision here.** A shared feed publishes what each person
-watches to everyone else in the household. Make contributing **opt-in per
-account**, not a default, and say so in the config comment.
+**Contributing is always on and not configurable.** A shared feed does publish
+what each person watches to everyone else in the household — that is understood
+and accepted, and it is the household's own instance. An opt-out would only make
+the mix quietly incomplete and give it a second failure mode to debug. Do not
+add the toggle.
 
 ## Privacy of the playlists themselves
 
-Lanes are currently `privacy: public`, deliberately, so `/feed/playlist/<plid>`
-gives RSS. Fine for your own account. **Not fine to provision for someone else
-without asking.**
+**Decided: unlisted everywhere, new accounts and existing.** `lanes.yml` now
+defaults to `privacy: unlisted`, and the lanes that already exist were flipped
+in place with SQL.
 
-- Default new accounts to **unlisted**; opt in to public per account.
+- **`public` bought nothing.** The Atom feed was the reason to keep it, and
+  `rss_playlist` only 404s a **private** playlist — unlisted feeds work. The
+  README used to imply otherwise; that has been corrected.
+- Unlisted is still readable by anyone holding the playlist ID. That is the
+  right level for a lane: linkable, not listed.
 - Existing gotcha, already handled in `playlist_of()`: Invidious ignores
-  `privacy` on create, so it must be forced with the PATCH call. Do not let the
-  default flip.
+  `privacy` on create, so it must be forced with the PATCH call that follows.
+- **`playlist_of()` only PATCHes at create time**, so a privacy change to a live
+  lane has to be made in the database. One-off, not something the run repeats:
+
+  ```sql
+  UPDATE playlists SET privacy = 'Unlisted'
+  WHERE id IN (SELECT plid FROM suggest.lanes) AND privacy <> 'Unlisted';
+  ```
+
+  Scoped to registered lanes on purpose — playlists the account made by hand are
+  none of the bot's business.
 
 ## Fetch budget
 
