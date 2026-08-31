@@ -1,0 +1,46 @@
+# Lanes for the synthetic harness (tests/synthetic.py).
+#
+# Small and deterministic on purpose: no sample_pool and no shuffle_window, so a
+# lane that comes out different is a defect rather than a reshuffle.
+# min_watched 50 is the value the boundary accounts sit either side of; it has
+# to stay equal to MIN_WATCHED in tests/synthetic.py.
+
+blocklist:
+  playlist: Blocked
+  channels: []
+
+auto_enrol:
+  lanes: all
+  exclude: []
+
+defaults:
+  size: 8
+  seed: {limit: 4}
+  fetch_cap: 10
+  sample_pool: 0
+  refresh_per_day: 0
+  min_watched: 50
+
+lanes:
+  - id: suggested
+    title: "Suggested"
+    expand: recommended
+
+  - id: subs-top48
+    title: "Subscriptions: biggest 48h"
+    expand: subscription_feed
+    subscription: {kinds: [video], max_age_hours: 48, rank: views}
+    size: 5
+    exclude_subscribed: false
+    max_per_channel: 1
+    dedupe_songs: false
+
+  # Names nobody, so a newly enrolled account joins it without a config change.
+  - id: household
+    title: "Household"
+    policy: mix
+    size: 12
+    min_watched: 0
+    mix:
+      sources:
+        - {users: all, lane: suggested, share: 1.0}
