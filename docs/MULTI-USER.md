@@ -26,8 +26,7 @@ person.
 `Base64.urlsafe_encode(Random::Secure.random_bytes(32))` in `session_ids`.
 
 → **one INSERT is a login for any account.** No new secret, no password prompt,
-no fork change, no second copy of the signed token scheme. `IV_SUGGEST_TOKEN`
-survives only as the fallback for an install that has not run `init` since.
+no fork change, no second copy of the signed token scheme.
 
 These are real logins, so there is exactly one per account and it is reused.
 The plan wanted them tagged `iv-suggest-<email>`, but `session_ids` has no
@@ -97,13 +96,17 @@ One timer, one hourly shuffle, both looping internally. No per-account units.
 - **The first timer-driven full `run` has not happened on this code.** The
   2026-08-31 fill was a manual foreground run straight after the deploy; only the
   hourly shuffle has run from a timer since.
-- **Does an issued SID survive the nightly 05:00 `pg_dump` restore?** Now a live
-  failure mode rather than a pre-deploy question, and the one thing that would
-  silently log the bot out of every account at once. `session_ids` is in the
-  dump, so it should. Confirm rather than assume.
-- **`IV_SUGGEST_TOKEN` is still in `/etc/iv-suggest/env` and is now dead code** —
-  `api()` prefers the session unconditionally. Remove it after a few clean
-  nights from 2026-08-31.
+- **Does an issued SID survive the nightly 05:00 job?** The question was
+  written assuming that job restores the database. It does not: `iv-nightly.sh`
+  takes a `pg_dump --clean` *backup*, recomputes `IV_CHANNEL_REFRESH`, and
+  force-recreates the `invidious` container only. `invidious-db` is never
+  restarted and `session_ids` is never rewritten, so a recreate of the app
+  container cannot invalidate a session that lives as a database row. Confirmed
+  empirically rather than argued: `iv-sid-check.timer` on LXC 109 runs at 05:34,
+  re-joins `suggest.accounts.sid` to `session_ids`, and compares `issued`
+  against `iv-nightly.service`'s real exit timestamp. Result lands in
+  `/var/lib/iv-suggest/sid-check.json`; a non-zero exit means a session was
+  actually lost.
 
 ## Checks that passed before the deploy
 

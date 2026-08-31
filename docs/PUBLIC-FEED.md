@@ -1,6 +1,6 @@
 # TODO: the public feed, and what a brand new account sees
 
-Status: **section 2 built and live; section 1 not started.** Written
+Status: **section 2 built and live; section 1 specified, not built.** Written
 2026-08-31.
 
 Two gaps, one moment: somebody opens the instance and the engine has nothing
@@ -23,25 +23,79 @@ is what the scoring below already wants — not as an access control.
 This unblocks section 1: the compiled playlist can be `privacy: public` and can
 be what `popular_playlists` points at.
 
-## 1. A public mix, compiled from everybody's
+## 1. A public mix, compiled from everybody's — SPECIFIED
 
-Wanted: **one playlist compiled from every account's home mix, where a video
-several mixes agree on ranks higher.**
+Decided 2026-08-31 (Andre): **the public feed is every account's home mix,
+resampled at random every hour, with a video ranked up the more mixes hold it.**
+
+That settles the three things the sketch below left open — the source set, the
+cadence, and what agreement buys a video.
+
+### Source: `home-mix`, not every lane
+
+One lane per account, the `home-mix` lane, expanded through the existing
+`{users: all, lane: home-mix}` form that `household` already uses. So the
+compiled feed inherits enrolment for free: an account added next month appears
+in it without the config being touched, and an account whose `home-mix` is empty
+contributes nothing rather than breaking the merge.
+
+Reading `home-mix` rather than the raw lanes also means the per-account taste
+filtering has already happened once. The compiled feed is a merge of opinions,
+not a merge of catalogues.
+
+### Cadence: hourly, and random within the hour
+
+The membership question and the ordering question separate the same way they
+already do for a normal lane: the nightly run decides what is eligible, the
+hourly reorder decides what sits at the top. Here both are cheap, because a
+`home-mix` is already in the database — so the whole rebuild rides the existing
+`iv-suggest-shuffle.timer` and costs **zero fetches**, exactly as `mix` does.
+
+Random every hour, not deterministic-best every hour: a strict score ordering
+would pin the same dozen videos to the top of a public playlist for as long as
+those mixes hold them. The random draw is what makes the feed feel alive to a
+visitor who opens it twice in a day. So the score sets each video's *weight in a
+weighted sample*, not its rank.
+
+### What duplication buys
+
+Agreement raises a video's weight; it does not gate its inclusion. Sketch to
+argue with:
+
+- Base weight per holding mix, `1 / (rank + k)`, so depth in one mix counts for
+  something and a video near the top of a mix counts for more.
+- Sum across the mixes holding it, then apply an agreement multiplier so two
+  mixes agreeing beats the same total accumulated from one deep placement.
+- Draw the playlist as a weighted sample without replacement, so a
+  low-agreement video is unlikely rather than excluded.
+
+With one account enrolled and any history, every weight collapses to the single
+mix's `1 / (rank + k)` and the feed degrades to "that account's home mix,
+shuffled hourly" — which is what the instance shows today, so the first version
+cannot regress the status quo.
+
+### The rest, unchanged from the sketch
 
 - **Not `policy: mix`.** `weighted_mix` divides slots by share — each source
   gets its cut, and a video in two sources is placed once, at its first claim.
-  Ranking agreement higher is a scoring merge: score a video by how many mixes
-  hold it and how high, then sort. Same inputs, different question. It wants its
-  own policy (`consensus`?), not another flag on `mix`.
-- **Scoring sketch, to argue with rather than implement as written:** sum
-  `1 / (rank + k)` across the mixes holding it, so a video near the top of two
-  mixes beats one at the top of a single mix, and a video everybody has near the
-  bottom does not win on count alone. `k` decides how much depth matters.
+  Ranking agreement higher is a scoring merge, a different question of the same
+  inputs. It wants its own policy, `consensus`.
 - **Filtering has no viewer.** Every other lane filters against somebody's watch
-  history and blocklist; this one has neither. Probably the union of the
-  household's blocklists — a channel any member blocked is a bad thing to greet
-  a stranger with.
-- **It lives on the bot's own account**, because nobody in particular owns it.
+  history and blocklist; this one has neither. Use the union of the household's
+  blocklists — a channel any member blocked is a bad thing to greet a stranger
+  with. Do *not* filter on watch history: there is no viewer whose history it
+  could be.
+- **It lives on the bot's own account**, because nobody in particular owns it,
+  with `privacy: public`, and `popular_playlists` points at it.
+
+### Open before building
+
+- `k`, the agreement multiplier's shape, and the sample size — all three are
+  taste, and all three are cheap to change once the lane exists.
+- Whether the hourly redraw should keep a video that is currently on screen
+  (the `fatigue` machinery in `shuffle` exists for exactly this) or draw fully
+  fresh each hour. Fully fresh is simpler and this playlist has no single viewer
+  to disorient.
 
 ## 2. Auto-enrol every account, and carry the ones with no history — BUILT
 
