@@ -1710,6 +1710,14 @@ def expand_source(src):
              "optional": True} for email in household]
 
 
+def share_key(src):
+    """The key weighted_mix counts shares by. It carries the account, not just the lane.
+
+    Two people's "suggested" are two different sources.
+    """
+    return "%s/%s" % (src["user"], src["lane"]) if src["user"] else src["lane"]
+
+
 def mix_sources(mix):
     """The source list of a mix lane, as [{user, lane, share, key}, ...]."""
     if mix.get("sources"):
@@ -1722,10 +1730,8 @@ def mix_sources(mix):
         ratio = max(1, int(mix.get("ratio", 2)))
         out = [{"user": "", "lane": base, "share": float(ratio), "optional": False},
                {"user": "", "lane": blend, "share": 1.0, "optional": False}]
-    # Two people's "suggested" are two sources, so the key that weighted_mix
-    # counts shares by has to carry the account, not just the lane id.
     for s in out:
-        s["key"] = "%s/%s" % (s["user"], s["lane"]) if s["user"] else s["lane"]
+        s["key"] = share_key(s)
     return out
 
 
@@ -1748,6 +1754,16 @@ def playlist_videos(plid):
         "CROSS JOIN LATERAL unnest(p.\"index\") WITH ORDINALITY AS u(idx, ord) "
         "JOIN playlist_videos pv ON pv.plid = p.id AND pv.\"index\" = u.idx "
         "WHERE p.id = %s ORDER BY u.ord;" % lit(plid))]
+
+
+def furthest_behind_its_share(ready, share, taken, placed):
+    """The source owing the most output, counting the pure head against its share.
+
+    Exempting the head was measured and is worse: the first source overdraws,
+    runs dry near the end and hands the tail to whatever is left. Keep `pure`
+    small instead.
+    """
+    return max(ready, key=lambda s: share[s["key"]] * (placed + 1) - taken[s["key"]])
 
 
 def weighted_mix(sources, size, pure=0):
@@ -1791,18 +1807,11 @@ def weighted_mix(sources, size, pure=0):
     while sources and len(out) < min(pure, size) and peek(sources[0]) is not None:
         take(sources[0])
 
-    # The head DOES count toward the shares. Exempting it was tried and is worse:
-    # it smooths positions 11-19 but then overdraws the first source, which runs
-    # dry near the end and hands the tail to whatever is left — music went from
-    # 9% to 13% and the last nine slots clumped. Counting the head keeps the
-    # totals honest; keep `pure` small instead, since a large head is what makes
-    # the other sources catch up in a block.
     while len(out) < size:
         ready = [s for s in sources if peek(s) is not None]
         if not ready:
             break
-        take(max(ready, key=lambda s: share[s["key"]] * (len(out) + 1)
-                 - taken[s["key"]]))
+        take(furthest_behind_its_share(ready, share, taken, len(out)))
     return out
 
 
