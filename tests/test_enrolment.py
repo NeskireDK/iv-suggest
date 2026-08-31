@@ -181,3 +181,69 @@ class HouseholdSource(ConfigCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InertKeys(ConfigCase):
+
+    def test_a_key_the_policy_never_reads_is_named(self):
+        mod = self.loaded("""
+lanes:
+  - id: played
+    title: Played
+    policy: last_played
+    ttl_days: 0
+    min_seconds: 0
+""")
+        self.assertEqual(["min_seconds", "ttl_days"],
+                         mod.load_config()[0]["ignored"])
+
+    def test_a_key_the_policy_does_read_is_not_named(self):
+        mod = self.loaded("""
+lanes:
+  - id: played
+    title: Played
+    policy: last_played
+    size: 100
+    played_decay: 0.9
+    seed: {genre: Music}
+""")
+        self.assertEqual([], mod.load_config()[0]["ignored"])
+
+    def test_refill_reads_everything_so_nothing_is_inert(self):
+        mod = self.loaded("""
+lanes:
+  - id: a
+    title: A
+    ttl_days: 3
+    min_seconds: 0
+    max_per_channel: 4
+""")
+        self.assertEqual([], mod.load_config()[0]["ignored"])
+
+    def test_a_default_is_not_reported_only_what_the_lane_sets(self):
+        """Otherwise every last_played lane would warn about the defaults block."""
+        mod = self.loaded("""
+defaults:
+  ttl_days: 14
+  min_seconds: 120
+lanes:
+  - id: played
+    title: Played
+    policy: last_played
+""")
+        self.assertEqual([], mod.load_config()[0]["ignored"])
+
+    def test_the_warning_says_the_lane_and_the_policy(self):
+        mod = self.loaded("""
+lanes:
+  - id: played
+    title: Played
+    policy: last_played
+    ttl_days: 0
+""")
+        said = []
+        mod.log = said.append
+        mod.warn_ignored_keys(mod.load_config())
+        self.assertIn("played", said[0])
+        self.assertIn("last_played", said[0])
+        self.assertIn("ttl_days", said[0])

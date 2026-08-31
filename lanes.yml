@@ -55,22 +55,20 @@ defaults:
 lanes:
   - id: suggested
     title: "Suggested"
-    seed: {from: watched, limit: 30, recent: 10, shuffle_window: 300}
+    seed: {limit: 30, recent: 10, shuffle_window: 300}
     expand: recommended
     refresh_per_day: 5          # ~6 day rotation of the whole 30
     sample_pool: 40
     keep_min: 20                # never rotate below this, even on a thin night
 
+  # last_played holds the N most recently PLAYED, so it reads none of the
+  # candidate rules: no ttl, no exclude_watched, no per-channel cap. Setting
+  # them here did nothing and the run now says so.
   - id: music-watched
     title: "Music: watched"
-    policy: last_played         # hold the N most recently PLAYED music videos
-    seed: {from: watched, scan: 700, genre: Music}
-    expand: none
+    policy: last_played
+    seed: {scan: 700, genre: Music}
     size: 100
-    ttl_days: 0                 # age never removes anything here
-    exclude_watched: false      # a repeat is the point of this lane
-    min_seconds: 0
-    max_per_channel: 0
     fetch_cap: 150              # fills over about 3 nights, then costs nothing
     # 100 videos competing for 10 visible slots churn the top far harder than a
     # 30 lane; a proportionally wider window brings it back to ~3.7/hour.
@@ -80,7 +78,7 @@ lanes:
     title: "Music: discover"
     # shuffle_window 700 matches what music-watched already caches, so a
     # shuffled seed almost never costs an extra genre fetch.
-    seed: {from: watched, limit: 15, scan: 300, genre: Music, shuffle_window: 700}
+    seed: {limit: 15, scan: 300, genre: Music, shuffle_window: 700}
     expand: recommended
     filter: {genre: Music}
     exclude_watched: false      # re-hearing a good song is fine
@@ -97,7 +95,7 @@ lanes:
   # published since yesterday. ~60 uploads per fetch, ~a dozen fetches a refill.
   - id: fresh-uploads
     title: "Fresh uploads"
-    seed: {from: watched, limit: 400}
+    seed: {limit: 400}
     expand: channel_latest
     size: 25
     ttl_days: 10
@@ -128,7 +126,7 @@ lanes:
   # the whole graph and mostly returns older videos. NOT a home-mix source.
   - id: new-for-you
     title: "New for you"
-    seed: {from: watched, limit: 30, recent: 10, shuffle_window: 300}
+    seed: {limit: 30, recent: 10, shuffle_window: 300}
     expand: recommended
     recommend_max_age_days: 14
     size: 30
@@ -180,7 +178,7 @@ lanes:
 
   - id: gaming
     title: "Gaming"
-    seed: {from: watched, limit: 15, scan: 300, genre: "Gaming", shuffle_window: 700}
+    seed: {limit: 15, scan: 300, genre: "Gaming", shuffle_window: 700}
     expand: recommended
     filter: {genre: "Gaming"}
     size: 20
@@ -191,7 +189,7 @@ lanes:
 
   - id: autos
     title: "Cars"
-    seed: {from: watched, limit: 15, scan: 300, genre: "Autos & Vehicles", shuffle_window: 700}
+    seed: {limit: 15, scan: 300, genre: "Autos & Vehicles", shuffle_window: 700}
     expand: recommended
     filter: {genre: "Autos & Vehicles"}
     size: 20
@@ -202,7 +200,7 @@ lanes:
 
   - id: sci-tech
     title: "Science & tech"
-    seed: {from: watched, limit: 15, scan: 300, genre: "Science & Technology", shuffle_window: 700}
+    seed: {limit: 15, scan: 300, genre: "Science & Technology", shuffle_window: 700}
     expand: recommended
     filter: {genre: "Science & Technology"}
     size: 20

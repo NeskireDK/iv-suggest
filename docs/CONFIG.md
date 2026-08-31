@@ -78,13 +78,13 @@ Any lane key, applied to every lane. A lane overrides any of them.
 A list. Every lane needs `id` and `title`; everything else falls back to
 `defaults`, then to the built-in below.
 
-⚠️ **A lane's `policy` decides which keys are read at all, and an ignored key is
-accepted in silence.** `last_played` reads only `id`, `title`, `size`,
-`fetch_cap`, `privacy`, `seed.genre`, `seed.scan`, `dedupe_songs` and
-`played_decay`. `mix` reads only `id`, `title`, `size`, `privacy`,
+⚠️ **A lane's `policy` decides which keys are read at all.** `last_played` reads
+only `id`, `title`, `size`, `fetch_cap`, `privacy`, `min_watched`, `shuffle`,
+`seed`, `dedupe_songs` and `played_decay`. `mix` reads those universals plus
 `exclude_watched` and `mix`. Everything under Turnover and Candidate rules
 below, plus `expand`, `filter` and the `expand`-specific keys, is **`refill`
-only**.
+only**. `init` and `run` name any inert key a lane sets:
+`lane music-watched: policy last_played never reads ttl_days`.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -128,11 +128,10 @@ Per-`expand` keys, ignored by the other modes:
 
 #### `seed`
 
-Which watch-history entries the expansion starts from.
+Which watch-history entries the expansion starts from — the only source there is.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `from` | `watched` | **read by nothing.** Present in the defaults, never consulted |
 | `limit` | `30` | how many seeds to use. The lane's `size` is the fallback only when the lane supplies a `seed:` block that omits `limit` |
 | `scan` | `limit × 20` with a genre, else `limit` | how deep to walk the history looking for them. Policy `last_played` reads this key separately and defaults it to `size × 6` |
 | `genre` | — | only seed from watched videos of this genre |

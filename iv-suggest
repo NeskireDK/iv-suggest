@@ -112,7 +112,7 @@ DEFAULTS = {
     "dedupe_songs": True,     # one upload per song, across every lane
     "min_seconds": 120,
     "max_seconds": 0,         # 0 = no upper bound; use it to drop compilations
-    "seed": {"from": "watched", "limit": 30},
+    "seed": {"limit": 30},
     "expand": "recommended",  # recommended | none | channel_latest | subscription_feed
     "filter": {},
     "policy": "refill",       # refill | last_played | mix
@@ -238,6 +238,16 @@ END $$;
 # what sits at the top, and it never touches YouTube.
 # channel_videos.kind, written by the fork's ClassifyChannelVideosJob.
 SUB_KINDS = ("video", "short", "live")
+
+# Every policy reads these; the rest of DEFAULTS is refill's alone. A lane that
+# sets a key its policy ignores is a copy-paste that looks like it works.
+UNIVERSAL_LANE_KEYS = frozenset(
+    ["id", "title", "policy", "size", "fetch_cap", "privacy", "min_watched",
+     "shuffle"])
+POLICY_LANE_KEYS = {
+    "last_played": frozenset(["seed", "dedupe_songs", "played_decay"]),
+    "mix": frozenset(["exclude_watched", "mix"]),
+}
 
 SHUFFLE_DEFAULTS = {
     "enabled": True,
@@ -755,12 +765,33 @@ def merge_lane(base, patch):
     return merged
 
 
+def ignored_keys(policy, keys):
+    """The keys a lane sets that its policy will never read."""
+    readable = POLICY_LANE_KEYS.get(policy)
+    if readable is None:
+        return []
+    return sorted(set(keys) - UNIVERSAL_LANE_KEYS - readable)
+
+
 def load_config():
     cfg = read_config()
     file_defaults = cfg.get("defaults") or {}
     defaults = merge_lane(
         dict(DEFAULTS, shuffle=dict(SHUFFLE_DEFAULTS)), file_defaults)
-    return [merge_lane(defaults, raw) for raw in cfg.get("lanes") or []]
+    lanes = []
+    for raw in cfg.get("lanes") or []:
+        lane = merge_lane(defaults, raw)
+        lane["ignored"] = ignored_keys(lane["policy"], raw)
+        lanes.append(lane)
+    return lanes
+
+
+def warn_ignored_keys(lanes):
+    """Say which lane settings are inert, since nothing else would."""
+    for lane in lanes:
+        if lane.get("ignored"):
+            log("lane %s: policy %s never reads %s"
+                % (lane["id"], lane["policy"], ", ".join(lane["ignored"])))
 
 
 def instance_accounts():
@@ -971,18 +1002,6 @@ def seed_order(watched, seed_cfg):
     pool = hist[recent:window]
     random.shuffle(pool)
     return hist[:recent] + pool + hist[window:]
-
-
-def matches(meta, lane):
-    """Does a video satisfy the lane filter?"""
-    want = lane.get("filter") or {}
-    if not meta:
-        return False
-    if want.get("genre") and (meta.get("genre") or "") != want["genre"]:
-        return False
-    if lane["min_seconds"] and (meta.get("seconds") or 0) < lane["min_seconds"]:
-        return False
-    return True
 
 
 # --------------------------------------------------------------------------
@@ -1727,6 +1746,7 @@ def cmd_run(args):
     the account.
     """
     all_lanes = load_config()
+    warn_ignored_keys(all_lanes)
     users = accounts_wanted(args)
     fetcher = Fetcher(rate_per_min=args.rate, budget=args.budget, persist=True)
     seed_override = args.seeds if args.seeds else (DRY_SEEDS if args.dry_run else None)
@@ -2175,7 +2195,8 @@ def cmd_init(args):
     log("schema suggest is ready (rows without an account belong to %s)" % PRIMARY)
     users = load_users() if args.all_users else [
         u for u in load_users() if u["email"] == PRIMARY]
-    all_lanes = load_config() if args.all_users else []
+    all_lanes = load_config()
+    warn_ignored_keys(all_lanes)
     for user in users:
         log("account %s" % user["email"])
         open_session(user["email"])
@@ -2374,10 +2395,10 @@ def main():
     global TOKEN, SESSION
     p = argparse.ArgumentParser(description="lane based suggestion playlists")
     sub = p.add_subparsers(dest="cmd", required=True)
-    i = sub.add_parser("init")
+    i = sub.add_parser("init", help="schema, sessions and any missing playlists")
     i.add_argument("--all-users", action="store_true",
-                   help="prepare every account in the users: block, creating "
-                        "the playlists it is missing")
+                   help="prepare every managed account, not just "
+                        "IV_SUGGEST_ACCOUNT")
     r = sub.add_parser("run")
     r.add_argument("--dry-run", action="store_true",
                    help="write no playlist and no state; the metadata cache is still filled")
