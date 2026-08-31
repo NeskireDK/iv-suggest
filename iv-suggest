@@ -1396,17 +1396,51 @@ def expand_candidates(lane, seeds, room, run):
     return expand(lane, seeds, room, run)
 
 
+def videos_on_cooldown(lane_id, drop):
+    """Ids the lane may not offer again yet, including the ones it dropped this run.
+
+    A real run has already written cooldown rows for its own drops; a dry run
+    has not, and would otherwise show a video rotating out and coming straight
+    back in.
+    """
+    held = {r[0] for r in query(
+        "SELECT vid FROM suggest.cooldown "
+        "WHERE account=%s AND lane=%s AND until > now();" % (acct(), lit(lane_id)))}
+    return held | {v["videoId"] for v, _ in drop}
+
+
+def sample_pool_of(lane):
+    """How many top candidates to sample over. None for a lane whose score is watch order."""
+    return lane["sample_pool"] if lane["expand"] != "none" else 0
+
+
+def weighted_sample(ranked, pool):
+    """The top `pool` candidates reordered by Efraimidis-Spirakis, and how many moved.
+
+    A strict top N hands back the same videos night after night, because the
+    score order barely moves between runs even when hundreds of candidates
+    scored nearly as well.
+    """
+    if pool <= 1 or len(ranked) <= 1:
+        return ranked, 0
+    head, tail = ranked[:pool], ranked[pool:]
+    head.sort(key=lambda kv: -(random.random() ** (1.0 / max(kv[1], 1e-6))))
+    return head + tail, len(head)
+
+
+def genre_check_cap(room):
+    """How many candidates a genre lane may look up before it gives up for this run.
+
+    Generous, because the rejection rate is high; the real cost guard is the
+    lane's fetch_cap.
+    """
+    return max(20, room * 3)
+
+
 def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
     """The candidates that pass every filter, as [(vid, score, meta, song), ...]."""
     lane_id = lane["id"]
-    cool = {r[0] for r in query(
-        "SELECT vid FROM suggest.cooldown "
-        "WHERE account=%s AND lane=%s AND until > now();" % (acct(), lit(lane_id)))}
-    # A real run has already written the cooldown rows for this run's drops, but
-    # a dry run has not: without this the sweep would rotate a video out and the
-    # refill would put it straight back, which is not what the dry run is there
-    # to show.
-    cool |= {v["videoId"] for v, _ in drop}
+    cool = videos_on_cooldown(lane_id, drop)
     elsewhere = set()
     if lane["dedupe_across_lanes"]:
         elsewhere = {r[0] for r in query(
@@ -1429,21 +1463,10 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
         per_channel[v.get("authorId")] = per_channel.get(v.get("authorId"), 0) + 1
 
     ranked = sorted(scores.items(), key=lambda kv: -kv[1])
-
-    # Take a weighted sample of the good candidates rather than the strict top
-    # of the list. The score order hardly moves between runs, so a strict top N
-    # hands back the same videos night after night even when hundreds of other
-    # candidates scored nearly as well. Efraimidis-Spirakis: order by
-    # u**(1/weight) descending and a high score is still likely to win, just no
-    # longer certain to. Only for `recommended`; `none` uses the score to carry
-    # the watch order and must not be shuffled.
-    pool = lane["sample_pool"] if lane["expand"] != "none" else 0
-    if pool > 1 and len(ranked) > 1:
-        head, tail = ranked[:pool], ranked[pool:]
-        head.sort(key=lambda kv: -(random.random() ** (1.0 / max(kv[1], 1e-6))))
-        ranked = head + tail
+    ranked, sampled = weighted_sample(ranked, sample_pool_of(lane))
+    if sampled:
         log("  weighted sample over the top %d of %d candidates"
-            % (len(head), len(ranked)))
+            % (sampled, len(ranked)))
 
     rejected = {"watched": 0, "subscribed": 0, "cooldown": 0, "in_lane": 0,
                 "other_lane": 0, "short": 0, "long": 0, "genre": 0,
@@ -1457,7 +1480,7 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
         if vid in in_lane:
             rejected["in_lane"] += 1
             continue
-        if vid in run.fetcher.dead:          # known unfetchable, do not offer it again
+        if vid in run.fetcher.dead:
             rejected["dead"] += 1
             continue
         if lane["exclude_watched"] and vid in run.watched_set:
@@ -1484,9 +1507,7 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
             rejected["long"] += 1
             continue
         if genre_wanted:
-            # Lazy: check in ranked order only. The cap must allow for a high
-            # rejection rate; the real cost guard is the lane fetch_cap.
-            if checked >= max(20, room * 3):
+            if checked >= genre_check_cap(room):
                 log("  genre check cap reached after %d candidates" % checked)
                 break
             try:
