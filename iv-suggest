@@ -852,6 +852,17 @@ def load_users():
     return users
 
 
+def enrolled_lanes(user, all_lanes):
+    """The lanes this account qualifies for right now, history gate applied.
+
+    Every reader of a lane list has to ask the same question the filler asks.
+    Asking it without the gate reports lanes the filler will skip, which is how
+    an auto-enrolled account with no history raised twelve "lane has not run"
+    alerts on the night it was added.
+    """
+    return lanes_for(user, all_lanes, watch_count(user["email"]))
+
+
 def lanes_for(user, lanes, watched=None):
     """The lanes one account gets, in lanes.yml order, with its overrides applied.
 
@@ -2152,7 +2163,7 @@ def cmd_shuffle(args):
 
 def shuffle_account(user, all_lanes, args):
     use_account(user["email"])
-    lanes = lanes_for(user, all_lanes)
+    lanes = enrolled_lanes(user, all_lanes)
     if args.lane:
         lanes = [l for l in lanes if l["id"] == args.lane]
         if not lanes:
@@ -2201,7 +2212,7 @@ def cmd_init(args):
         log("account %s" % user["email"])
         open_session(user["email"])
         use_account(user["email"])
-        for lane in lanes_for(user, all_lanes, watch_count(user["email"])):
+        for lane in enrolled_lanes(user, all_lanes):
             plid, _ = playlist_of(lane, dry=False)
             log("  lane %-16s %s" % (lane["id"], plid))
     log("done: %d accounts ready" % len(users))
@@ -2268,7 +2279,8 @@ def cmd_metrics(args):
 
     for user in users:
         use_account(user["email"])
-        lanes = lanes_for(user, all_lanes)
+        lanes = enrolled_lanes(user, all_lanes)
+        held_back = len(lanes_for(user, all_lanes)) - len(lanes)
 
         # One query per table per account keeps this cheap enough to run every
         # 15 minutes.
@@ -2301,6 +2313,9 @@ def cmd_metrics(args):
 
         metric("lanes_configured", "Lanes this account is given.", "gauge",
                [('{account="%s"}' % ACCOUNT, len(lanes))])
+        metric("lanes_held_back",
+               "Lanes withheld from this account until it has more history.",
+               "gauge", [('{account="%s"}' % ACCOUNT, held_back)])
         metric("blocked_channels",
                "Channels the blocklist keeps out of every lane of this account.",
                "gauge", [('{account="%s"}' % ACCOUNT, len(read_blocked()))])
