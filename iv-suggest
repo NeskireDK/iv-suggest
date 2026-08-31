@@ -21,12 +21,14 @@ calls, and stops at a hard budget per run.
 """
 
 import argparse
+import base64
 import csv
 import io
 import json
 import os
 import random
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -92,8 +94,9 @@ ACCOUNT = PRIMARY
 
 def use_account(email):
     """Point every account-scoped query and API call at this account."""
-    global ACCOUNT
+    global ACCOUNT, SESSION
     ACCOUNT = email
+    SESSION = session_of(email)
 
 
 def acct():
@@ -188,6 +191,12 @@ ALTER TABLE suggest.video_meta ADD COLUMN IF NOT EXISTS genre_known boolean DEFA
 CREATE TABLE IF NOT EXISTS suggest.shuffles (
   ran timestamptz DEFAULT now(), account text, lane text, videos int, moved int,
   error text);
+-- Which Invidious session the bot uses for each account. session_ids has no
+-- column to label a session with, so ownership is recorded here instead; that
+-- is also what keeps it to one login per account rather than one per run.
+CREATE TABLE IF NOT EXISTS suggest.accounts (
+  account text PRIMARY KEY, sid text NOT NULL,
+  created timestamptz DEFAULT now());
 """
 
 # Bring a single-account database up to the shape above. Everything that exists
@@ -413,19 +422,67 @@ def parse_views(rec):
 # invidious API
 
 
-def load_token():
-    token = setting("IV_SUGGEST_TOKEN")
-    if not token:
-        sys.exit("no IV_SUGGEST_TOKEN in %s or the environment" % ENVFILE)
-    return token
-
-
+# The signed token from the environment, if the install still has one, and the
+# session the bot holds for the account currently being filled. The session
+# wins: it exists for every account, whereas the token only ever covered one.
 TOKEN = None
+SESSION = None
+
+
+def load_token():
+    """The pre-multi-user API token. Optional now that sessions replaced it."""
+    return setting("IV_SUGGEST_TOKEN")
+
+
+def session_of(email):
+    """The bot's session for an account, or "" when it has none yet.
+
+    Checked against session_ids on the way out, so a session the account has
+    since signed out of reads as absent and is issued again, instead of being
+    used to make every call fail.
+    """
+    if not email:
+        return ""
+    return one("SELECT a.sid FROM suggest.accounts a "
+               "JOIN session_ids s ON s.id = a.sid AND s.email = a.account "
+               "WHERE a.account=%s;" % lit(email))
+
+
+def open_session(email):
+    """Give the bot a login for an account, once. Returns the session id.
+
+    Invidious accepts a bare SID cookie on /api/v1/auth/* and grants it the
+    full scope of whoever owns it, with no HMAC and no password, because the
+    SID *is* the credential. It is 32 random bytes, so a row in session_ids is
+    all the bot needs to act as an account: no new secret to store, no password
+    prompt, and no second copy of the signed token scheme to maintain.
+
+    These are real logins, so there is exactly one per account and it is
+    reused. Issuing one per run would leave a login in the account's session
+    list every night.
+    """
+    sid = session_of(email)
+    if sid:
+        return sid
+    if not one("SELECT 1 FROM users WHERE email=%s;" % lit(email)):
+        sys.exit("no Invidious account %s (the value in users.email)" % email)
+    sid = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode()
+    execute("INSERT INTO session_ids(id,email,issued) VALUES (%s,%s,now()); "
+            "INSERT INTO suggest.accounts(account,sid) VALUES (%s,%s) "
+            "ON CONFLICT (account) DO UPDATE SET sid=EXCLUDED.sid, created=now();"
+            % (lit(sid), lit(email), lit(email), lit(sid)))
+    log("  opened a session for %s" % email)
+    return sid
 
 
 def api(method, path, body=None):
     req = urllib.request.Request(API + path, method=method)
-    req.add_header("Authorization", "Bearer " + TOKEN)
+    if SESSION:
+        req.add_header("Cookie", "SID=" + SESSION)
+    elif TOKEN:
+        req.add_header("Authorization", "Bearer " + TOKEN)
+    else:
+        raise Aborted("no credential for %s: run `iv-suggest init`" % ACCOUNT)
     data = None
     if body is not None:
         data = json.dumps(body).encode()
@@ -1829,6 +1886,8 @@ def cmd_init(args):
                  "account the rows written before multi-user belong to")
     execute(MIGRATE_SQL.replace("__ACCOUNT__", lit(PRIMARY)))
     log("schema suggest is ready (rows without an account belong to %s)" % PRIMARY)
+    open_session(PRIMARY)
+    log("account %s is ready" % PRIMARY)
     return 0
 
 
@@ -1976,7 +2035,7 @@ def cmd_metrics(args):
 
 
 def main():
-    global TOKEN
+    global TOKEN, SESSION
     p = argparse.ArgumentParser(description="lane based suggestion playlists")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init")
@@ -2002,8 +2061,12 @@ def main():
     # "metrics" reads only the database, so it must work without the token.
     # The stats timer runs it every 15 minutes as a plain reader. "shuffle" is
     # the same: it permutes playlists.index in SQL and calls no API at all.
-    if args.cmd not in ("metrics", "shuffle"):
+    if args.cmd not in ("metrics", "shuffle", "init"):
         TOKEN = load_token()
+        use_account(PRIMARY)
+        if not SESSION and not TOKEN:
+            sys.exit("no credential for %s: run `iv-suggest init` to open one"
+                     % PRIMARY)
     return {"init": cmd_init, "run": cmd_run, "status": cmd_status,
             "metrics": cmd_metrics, "dedupe": cmd_dedupe,
             "views": cmd_views, "shuffle": cmd_shuffle}[args.cmd](args)
