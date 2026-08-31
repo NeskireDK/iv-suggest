@@ -193,6 +193,11 @@ class LaneCase(unittest.TestCase):
         return self.mod.merge_lane(
             base, dict({"id": "lane1", "title": "Lane One"}, **patch))
 
+    def context(self, watched=(), subs=(), blocked=None, dry=False,
+                seed_override=None):
+        return self.mod.LaneRun(list(watched), set(watched), set(subs),
+                                blocked or {}, self.fetch, dry, seed_override)
+
     def fill(self, lane, watched=(), subs=(), blocked=None, dry=False,
              seed_override=None, db=None, api=None, fetch=None):
         self.db = db or Db()
@@ -200,8 +205,8 @@ class LaneCase(unittest.TestCase):
         self.fetch = fetch or Fetch()
         self.db.install(self.mod)
         self.api.install(self.mod)
-        return self.mod.run_lane(lane, list(watched), set(watched), set(subs),
-                                 blocked or {}, self.fetch, dry, seed_override)
+        return self.mod.run_lane(
+            lane, self.context(watched, subs, blocked, dry, seed_override))
 
     def logged(self, fragment):
         return [line for line in self.said if fragment in line]
@@ -635,8 +640,8 @@ class LastPlayed(LaneCase):
         self.fetch = fetch or Fetch()
         self.db.install(self.mod)
         self.api.install(self.mod)
-        return self.mod.run_lane_last_played(lane, list(watched), blocked or {},
-                                             self.fetch, dry)
+        return self.mod.run_lane_last_played(
+            lane, self.context(watched, blocked=blocked, dry=dry))
 
     def test_the_most_recently_played_become_the_lane_newest_first(self):
         self.play(self.lane(policy="last_played", size=2),
