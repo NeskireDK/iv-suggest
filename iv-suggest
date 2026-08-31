@@ -83,7 +83,23 @@ DB_USER = setting("IV_SUGGEST_DB_USER", "kemal")
 DB_NAME = setting("IV_SUGGEST_DB_NAME", "invidious")
 API = setting("IV_SUGGEST_API", "http://localhost:3000")
 CONFIG = setting("IV_SUGGEST_CONFIG", "/etc/iv-suggest/lanes.yml")
-ACCOUNT = setting("IV_SUGGEST_ACCOUNT")
+# The account whose lanes are being filled right now. `use_account()` moves it;
+# PRIMARY is the one from the environment, which is also what the schema
+# migration backfills every pre-multi-user row to.
+PRIMARY = setting("IV_SUGGEST_ACCOUNT")
+ACCOUNT = PRIMARY
+
+
+def use_account(email):
+    """Point every account-scoped query and API call at this account."""
+    global ACCOUNT
+    ACCOUNT = email
+
+
+def acct():
+    """The current account as a SQL literal. Every suggest.* query needs it."""
+    return lit(ACCOUNT)
+
 
 VID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -139,17 +155,21 @@ DRY_SEEDS = 10          # a dry run uses few seeds; the nightly run uses the con
 SCHEMA_SQL = """
 CREATE SCHEMA IF NOT EXISTS suggest;
 CREATE TABLE IF NOT EXISTS suggest.lanes (
-  lane text PRIMARY KEY, plid text NOT NULL, title text,
-  created timestamptz DEFAULT now());
+  account text NOT NULL, lane text, plid text NOT NULL, title text,
+  created timestamptz DEFAULT now(), PRIMARY KEY (account, lane));
 CREATE TABLE IF NOT EXISTS suggest.items (
-  lane text, vid text, added timestamptz DEFAULT now(), score real,
-  PRIMARY KEY (lane, vid));
+  account text NOT NULL, lane text, vid text, added timestamptz DEFAULT now(),
+  score real, PRIMARY KEY (account, lane, vid));
 CREATE TABLE IF NOT EXISTS suggest.cooldown (
-  lane text, vid text, until timestamptz, reason text,
-  PRIMARY KEY (lane, vid));
+  account text NOT NULL, lane text, vid text, until timestamptz, reason text,
+  PRIMARY KEY (account, lane, vid));
 CREATE TABLE IF NOT EXISTS suggest.runs (
-  started timestamptz DEFAULT now(), lane text, added int, removed int,
-  kept int, fetches int, error text);
+  started timestamptz DEFAULT now(), account text, lane text, added int,
+  removed int, kept int, fetches int, error text);
+-- The metadata cache is deliberately GLOBAL. Every miss is a YouTube fetch, and
+-- two people who watch the same thing should pay for it once: scoping this per
+-- account would multiply the fetch bill by the size of the household for no
+-- gain. Nothing in it is personal -- it is title, genre, length and view count.
 CREATE TABLE IF NOT EXISTS suggest.video_meta (
   vid text PRIMARY KEY, genre text, seconds int, author_id text, title text,
   fetched timestamptz DEFAULT now());
@@ -166,7 +186,52 @@ ALTER TABLE suggest.items ADD COLUMN IF NOT EXISTS last_top timestamptz;
 -- must treat such a row as a cache miss, everything else may use it.
 ALTER TABLE suggest.video_meta ADD COLUMN IF NOT EXISTS genre_known boolean DEFAULT true;
 CREATE TABLE IF NOT EXISTS suggest.shuffles (
-  ran timestamptz DEFAULT now(), lane text, videos int, moved int, error text);
+  ran timestamptz DEFAULT now(), account text, lane text, videos int, moved int,
+  error text);
+"""
+
+# Bring a single-account database up to the shape above. Everything that exists
+# is backfilled to the account in IV_SUGGEST_ACCOUNT, so the rows and the
+# playlists that were already there survive untouched -- no lane is recreated.
+# Split from SCHEMA_SQL because it needs that account name interpolated, which
+# is a plain substitution rather than a %s: the DO block below passes %I and %s
+# of its own to PostgreSQL's format().
+MIGRATE_SQL = """
+ALTER TABLE suggest.lanes    ADD COLUMN IF NOT EXISTS account text;
+ALTER TABLE suggest.items    ADD COLUMN IF NOT EXISTS account text;
+ALTER TABLE suggest.cooldown ADD COLUMN IF NOT EXISTS account text;
+ALTER TABLE suggest.runs     ADD COLUMN IF NOT EXISTS account text;
+ALTER TABLE suggest.shuffles ADD COLUMN IF NOT EXISTS account text;
+UPDATE suggest.lanes    SET account = __ACCOUNT__ WHERE account IS NULL;
+UPDATE suggest.items    SET account = __ACCOUNT__ WHERE account IS NULL;
+UPDATE suggest.cooldown SET account = __ACCOUNT__ WHERE account IS NULL;
+UPDATE suggest.runs     SET account = __ACCOUNT__ WHERE account IS NULL;
+UPDATE suggest.shuffles SET account = __ACCOUNT__ WHERE account IS NULL;
+ALTER TABLE suggest.lanes    ALTER COLUMN account SET NOT NULL;
+ALTER TABLE suggest.items    ALTER COLUMN account SET NOT NULL;
+ALTER TABLE suggest.cooldown ALTER COLUMN account SET NOT NULL;
+DO $$
+DECLARE
+  t text;
+  keys text;
+BEGIN
+  FOR t, keys IN VALUES ('lanes', 'account, lane'),
+                        ('items', 'account, lane, vid'),
+                        ('cooldown', 'account, lane, vid')
+  LOOP
+    -- Only rebuild a primary key that does not already carry `account`, so a
+    -- second `init` is free instead of another index rebuild.
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_index i
+      JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
+      WHERE i.indrelid = ('suggest.' || t)::regclass AND i.indisprimary
+        AND a.attname = 'account')
+    THEN
+      EXECUTE format('ALTER TABLE suggest.%I DROP CONSTRAINT IF EXISTS %I', t, t || '_pkey');
+      EXECUTE format('ALTER TABLE suggest.%I ADD PRIMARY KEY (%s)', t, keys);
+    END IF;
+  END LOOP;
+END $$;
 """
 
 # The hourly reorder. Membership is the nightly run's job; this only decides
@@ -678,6 +743,9 @@ def read_blocked():
                 "SELECT DISTINCT coalesce(pv.ucid,''), coalesce(pv.author,'') "
                 "FROM playlists p JOIN playlist_videos pv ON pv.plid = p.id "
                 "WHERE p.author=%s AND lower(p.title)=lower(%s) "
+                # Every account's lanes, deliberately: a playlist id is unique
+                # instance wide, so scoping this would let one account's
+                # "Blocked" playlist swallow another account's lane.
                 "AND p.id NOT IN (SELECT plid FROM suggest.lanes);"
                 % (lit(ACCOUNT), lit(title))):
             if ucid:
@@ -690,7 +758,8 @@ def read_blocked():
 def playlist_of(lane, dry):
     """The stable playlist for a lane. Create it once, never recreate it."""
     lane_id, title = lane["id"], lane["title"]
-    plid = one("SELECT plid FROM suggest.lanes WHERE lane=%s;" % lit(lane_id))
+    plid = one("SELECT plid FROM suggest.lanes WHERE account=%s AND lane=%s;"
+               % (acct(), lit(lane_id)))
     if plid:
         try:
             return plid, api("GET", "/api/v1/auth/playlists/" + plid)
@@ -699,7 +768,8 @@ def playlist_of(lane, dry):
                 raise
             log("  playlist %s is gone from Invidious, forgetting it" % plid)
             if not dry:
-                execute("DELETE FROM suggest.lanes WHERE lane=%s;" % lit(lane_id))
+                execute("DELETE FROM suggest.lanes WHERE account=%s AND lane=%s;"
+                        % (acct(), lit(lane_id)))
     if dry:
         log("  would create the playlist %r" % title)
         return None, {"videos": []}
@@ -711,8 +781,8 @@ def playlist_of(lane, dry):
     # force the value with the update endpoint.
     api("PATCH", "/api/v1/auth/playlists/" + plid,
         {"title": title, "privacy": lane["privacy"]})
-    execute("INSERT INTO suggest.lanes(lane,plid,title) VALUES (%s,%s,%s);"
-            % (lit(lane_id), lit(plid), lit(title)))
+    execute("INSERT INTO suggest.lanes(account,lane,plid,title) VALUES (%s,%s,%s,%s);"
+            % (acct(), lit(lane_id), lit(plid), lit(title)))
     log("  created the playlist %r (%s)" % (title, plid))
     return plid, api("GET", "/api/v1/auth/playlists/" + plid)
 
@@ -763,7 +833,8 @@ def run_lane(lane, watched, watched_set, subs, blocked, fetcher, dry,
     current = playlist.get("videos") or []
 
     rows = query("SELECT vid, to_char(added,'YYYY-MM-DD'), extract(epoch FROM added), "
-                 "coalesce(score,0) FROM suggest.items WHERE lane=%s;" % lit(lane_id))
+                 "coalesce(score,0) FROM suggest.items "
+                 "WHERE account=%s AND lane=%s;" % (acct(), lit(lane_id)))
     added_at = {r[0]: r[1] for r in rows}
     added_ts = {r[0]: float(r[2] or 0) for r in rows}
     item_score = {r[0]: float(r[3] or 0) for r in rows}
@@ -779,9 +850,9 @@ def run_lane(lane, watched, watched_set, subs, blocked, fetcher, dry,
             item_score[v["videoId"]] = 0.0
             log("  adopted an untracked entry: %s" % v["title"][:56])
             if not dry:
-                execute("INSERT INTO suggest.items(lane,vid,score) VALUES "
-                        "(%s,%s,0) ON CONFLICT (lane,vid) DO NOTHING;"
-                        % (lit(lane_id), lit(v["videoId"])))
+                execute("INSERT INTO suggest.items(account,lane,vid,score) VALUES "
+                        "(%s,%s,%s,0) ON CONFLICT (account,lane,vid) DO NOTHING;"
+                        % (acct(), lit(lane_id), lit(v["videoId"])))
 
     # 1. sweep -------------------------------------------------------------
     ttl = lane["ttl_days"]
@@ -821,18 +892,21 @@ def run_lane(lane, watched, watched_set, subs, blocked, fetcher, dry,
             if why == "blocked":
                 # No cooldown on purpose: the blocklist is what keeps it out, so
                 # unblocking the channel must let its videos back the same night.
-                execute("DELETE FROM suggest.items WHERE lane=%s AND vid=%s;"
-                        % (lit(lane_id), lit(v["videoId"])))
+                execute("DELETE FROM suggest.items "
+                        "WHERE account=%s AND lane=%s AND vid=%s;"
+                        % (acct(), lit(lane_id), lit(v["videoId"])))
                 continue
             days = {"watched": lane["watched_cooldown_days"],
                     "rotated": lane["rotate_cooldown_days"]}.get(
                         why, lane["cooldown_days"])
-            execute("DELETE FROM suggest.items WHERE lane=%s AND vid=%s; "
-                    "INSERT INTO suggest.cooldown(lane,vid,until,reason) VALUES "
-                    "(%s,%s,now() + interval '%d days',%s) ON CONFLICT (lane,vid) "
+            execute("DELETE FROM suggest.items "
+                    "WHERE account=%s AND lane=%s AND vid=%s; "
+                    "INSERT INTO suggest.cooldown(account,lane,vid,until,reason) VALUES "
+                    "(%s,%s,%s,now() + interval '%d days',%s) "
+                    "ON CONFLICT (account,lane,vid) "
                     "DO UPDATE SET until=EXCLUDED.until, reason=EXCLUDED.reason;"
-                    % (lit(lane_id), lit(v["videoId"]), lit(lane_id),
-                       lit(v["videoId"]), days, lit(why)))
+                    % (acct(), lit(lane_id), lit(v["videoId"]), acct(),
+                       lit(lane_id), lit(v["videoId"]), days, lit(why)))
     room = lane["size"] - len(keep)
     log("  swept %d, kept %d, room for %d" % (len(drop), len(keep), room))
     if room <= 0:
@@ -999,7 +1073,8 @@ def run_lane(lane, watched, watched_set, subs, blocked, fetcher, dry,
 
     # 4. filter ------------------------------------------------------------
     cool = {r[0] for r in query(
-        "SELECT vid FROM suggest.cooldown WHERE lane=%s AND until > now();" % lit(lane_id))}
+        "SELECT vid FROM suggest.cooldown "
+        "WHERE account=%s AND lane=%s AND until > now();" % (acct(), lit(lane_id)))}
     # A real run has already written the cooldown rows for this run's drops, but
     # a dry run has not: without this the sweep would rotate a video out and the
     # refill would put it straight back, which is not what the dry run is there
@@ -1008,7 +1083,8 @@ def run_lane(lane, watched, watched_set, subs, blocked, fetcher, dry,
     elsewhere = set()
     if lane["dedupe_across_lanes"]:
         elsewhere = {r[0] for r in query(
-            "SELECT vid FROM suggest.items WHERE lane <> %s;" % lit(lane_id))}
+            "SELECT vid FROM suggest.items "
+            "WHERE account=%s AND lane <> %s;" % (acct(), lit(lane_id)))}
     in_lane = {v["videoId"] for v, _ in keep}
     songs = set()
     if lane["dedupe_songs"]:
@@ -1018,8 +1094,9 @@ def run_lane(lane, watched, watched_set, subs, blocked, fetcher, dry,
                 songs.add(k)
         if lane["dedupe_across_lanes"]:
             songs |= {r[0] for r in query(
-                "SELECT song_key FROM suggest.items WHERE lane <> %s "
-                "AND coalesce(song_key,'') <> '';" % lit(lane_id))}
+                "SELECT song_key FROM suggest.items "
+                "WHERE account=%s AND lane <> %s "
+                "AND coalesce(song_key,'') <> '';" % (acct(), lit(lane_id)))}
     per_channel = {}
     for v, _ in keep:
         per_channel[v.get("authorId")] = per_channel.get(v.get("authorId"), 0) + 1
@@ -1130,10 +1207,10 @@ def run_lane(lane, watched, watched_set, subs, blocked, fetcher, dry,
             fetcher.bury(vid, 30, "playlist add %s" % e.code)
             refused += 1
             continue
-        execute("INSERT INTO suggest.items(lane,vid,score,song_key) VALUES "
-                "(%s,%s,%s,%s) ON CONFLICT (lane,vid) DO UPDATE SET "
+        execute("INSERT INTO suggest.items(account,lane,vid,score,song_key) VALUES "
+                "(%s,%s,%s,%s,%s) ON CONFLICT (account,lane,vid) DO UPDATE SET "
                 "added=now(), score=EXCLUDED.score, song_key=EXCLUDED.song_key;"
-                % (lit(lane_id), lit(vid), round(score, 4), lit(skey)))
+                % (acct(), lit(lane_id), lit(vid), round(score, 4), lit(skey)))
         added.append((vid, meta))
     if refused:
         log("  %d of %d adds refused by Invidious" % (refused, len(chosen)))
@@ -1226,11 +1303,13 @@ def run_lane_last_played(lane, watched, blocked, fetcher, dry):
     decay = lane["played_decay"]
     if not dry and desired:
         values = ",".join(
-            "(%s,%s,%s)" % (lit(lane_id), lit(vid), round(10.0 * (decay ** rank), 4))
+            "(%s,%s,%s,%s)" % (acct(), lit(lane_id), lit(vid),
+                               round(10.0 * (decay ** rank), 4))
             for rank, vid in enumerate(desired))
         execute("UPDATE suggest.items i SET score = x.score::real "
-                "FROM (VALUES %s) AS x(lane,vid,score) "
-                "WHERE i.lane = x.lane AND i.vid = x.vid;" % values)
+                "FROM (VALUES %s) AS x(account,lane,vid,score) "
+                "WHERE i.account = x.account AND i.lane = x.lane "
+                "AND i.vid = x.vid;" % values)
 
     for v in to_drop:
         log("  - %s: %s"
@@ -1238,8 +1317,9 @@ def run_lane_last_played(lane, watched, blocked, fetcher, dry):
                (v["title"] or "")[:60]))
         if not dry:
             api("DELETE", "/api/v1/auth/playlists/%s/videos/%s" % (plid, v["indexId"]))
-            execute("DELETE FROM suggest.items WHERE lane=%s AND vid=%s;"
-                    % (lit(lane_id), lit(v["videoId"])))
+            execute("DELETE FROM suggest.items "
+                    "WHERE account=%s AND lane=%s AND vid=%s;"
+                    % (acct(), lit(lane_id), lit(v["videoId"])))
             # No cooldown row on purpose: one replay must bring it straight back.
     refused = 0
     for vid in to_add:
@@ -1254,10 +1334,10 @@ def run_lane_last_played(lane, watched, blocked, fetcher, dry):
             fetcher.bury(vid, 30, "playlist add %s" % e.code)
             refused += 1
             continue
-        execute("INSERT INTO suggest.items(lane,vid,score,song_key) VALUES "
-                "(%s,%s,%s,%s) ON CONFLICT (lane,vid) DO UPDATE SET "
+        execute("INSERT INTO suggest.items(account,lane,vid,score,song_key) VALUES "
+                "(%s,%s,%s,%s,%s) ON CONFLICT (account,lane,vid) DO UPDATE SET "
                 "added=now(), score=EXCLUDED.score, song_key=EXCLUDED.song_key;"
-                % (lit(lane_id), lit(vid),
+                % (acct(), lit(lane_id), lit(vid),
                    round(10.0 * (decay ** desired.index(vid)), 4),
                    lit(song_key(meta.get("title"), meta.get("author")))))
     kept = len(current) - len(to_drop)
@@ -1365,7 +1445,8 @@ def run_lane_mix(lane, dry):
     log("\nlane %s  (%s)  policy mix" % (lane_id, lane["title"]))
 
     def source(src_id):
-        src_plid = one("SELECT plid FROM suggest.lanes WHERE lane=%s;" % lit(src_id))
+        src_plid = one("SELECT plid FROM suggest.lanes WHERE account=%s AND lane=%s;"
+                       % (acct(), lit(src_id)))
         if not src_plid:
             raise Aborted("source lane %r has no playlist yet" % src_id)
         pl = api("GET", "/api/v1/auth/playlists/" + src_plid)
@@ -1439,9 +1520,11 @@ def cmd_run(args):
             failed += 1
             log("  ERROR: %r" % e)
         if not args.dry_run:
-            execute("INSERT INTO suggest.runs(lane,added,removed,kept,fetches,error) "
-                    "VALUES (%s,%s,%s,%s,%s,%s);"
-                    % (lit(lane["id"]), added, removed, kept, used, lit(error)))
+            execute("INSERT INTO suggest.runs"
+                    "(account,lane,added,removed,kept,fetches,error) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s);"
+                    % (acct(), lit(lane["id"]), added, removed, kept, used,
+                       lit(error)))
         if isinstance(error, str) and error and "budget" in error:
             log("fetch budget spent, stopping before the other lanes")
             break
@@ -1462,7 +1545,8 @@ def cmd_dedupe(args):
     except Exception:
         pass
     entries = []
-    for lane_id, plid in query("SELECT lane, plid FROM suggest.lanes;"):
+    for lane_id, plid in query("SELECT lane, plid FROM suggest.lanes "
+                               "WHERE account=%s;" % acct()):
         playlist = api("GET", "/api/v1/auth/playlists/" + plid)
         videos = playlist.get("videos") or []
         log("lane %-16s %d videos" % (lane_id, len(videos)))
@@ -1482,8 +1566,10 @@ def cmd_dedupe(args):
         members.sort(key=lambda e: (e[1], e[2], e[3]))
         keeper = members[0]
         if not args.dry_run:
-            execute("UPDATE suggest.items SET song_key=%s WHERE lane=%s AND vid=%s;"
-                    % (lit(key), lit(keeper[4]), lit(keeper[6]["videoId"])))
+            execute("UPDATE suggest.items SET song_key=%s "
+                    "WHERE account=%s AND lane=%s AND vid=%s;"
+                    % (lit(key), acct(), lit(keeper[4]),
+                       lit(keeper[6]["videoId"])))
         if len(members) == 1:
             continue
         log("\nsong %r" % key)
@@ -1494,11 +1580,14 @@ def cmd_dedupe(args):
             removed += 1
             if not args.dry_run:
                 api("DELETE", "/api/v1/auth/playlists/%s/videos/%s" % (plid, v["indexId"]))
-                execute("DELETE FROM suggest.items WHERE lane=%s AND vid=%s; "
-                        "INSERT INTO suggest.cooldown(lane,vid,until,reason) VALUES "
-                        "(%s,%s,now() + interval '365 days','same song') "
-                        "ON CONFLICT (lane,vid) DO UPDATE SET until=EXCLUDED.until;"
-                        % (lit(lane_id), lit(v["videoId"]), lit(lane_id), lit(v["videoId"])))
+                execute("DELETE FROM suggest.items "
+                        "WHERE account=%s AND lane=%s AND vid=%s; "
+                        "INSERT INTO suggest.cooldown(account,lane,vid,until,reason) "
+                        "VALUES (%s,%s,%s,now() + interval '365 days','same song') "
+                        "ON CONFLICT (account,lane,vid) "
+                        "DO UPDATE SET until=EXCLUDED.until;"
+                        % (acct(), lit(lane_id), lit(v["videoId"]), acct(),
+                           lit(lane_id), lit(v["videoId"])))
     log("\n%d duplicate uploads%s" % (removed, "" if args.dry_run else " removed"))
     return 0
 
@@ -1514,7 +1603,8 @@ def cmd_views(args):
     one video, and keeps going; only 5 consecutive failures of any kind abort.
     """
     vids = set()
-    for lane_id, plid in query("SELECT lane, plid FROM suggest.lanes;"):
+    for lane_id, plid in query("SELECT lane, plid FROM suggest.lanes "
+                               "WHERE account=%s;" % acct()):
         playlist = api("GET", "/api/v1/auth/playlists/" + plid)
         videos = playlist.get("videos") or []
         log("lane %-16s %d videos" % (lane_id, len(videos)))
@@ -1575,8 +1665,9 @@ def read_order(plid, lane_id):
         "FROM playlists p "
         "CROSS JOIN LATERAL unnest(p.\"index\") WITH ORDINALITY AS u(idx, ord) "
         "JOIN playlist_videos pv ON pv.plid = p.id AND pv.\"index\" = u.idx "
-        "LEFT JOIN suggest.items i ON i.lane = %s AND i.vid = pv.id "
-        "WHERE p.id = %s ORDER BY u.ord;" % (lit(lane_id), lit(plid)))
+        "LEFT JOIN suggest.items i ON i.account = %s AND i.lane = %s "
+        "AND i.vid = pv.id "
+        "WHERE p.id = %s ORDER BY u.ord;" % (acct(), lit(lane_id), lit(plid)))
 
 
 def rank_items(items, cfg):
@@ -1624,7 +1715,8 @@ def shuffle_lane(lane, orders, dry):
     """Reorder one lane. Returns its new video order, or None if it was skipped."""
     lane_id = lane["id"]
     cfg = lane["shuffle"]
-    plid = one("SELECT plid FROM suggest.lanes WHERE lane=%s;" % lit(lane_id))
+    plid = one("SELECT plid FROM suggest.lanes WHERE account=%s AND lane=%s;"
+               % (acct(), lit(lane_id)))
     if not plid:
         log("lane %-16s no playlist yet, skipped" % lane_id)
         return None
@@ -1687,14 +1779,17 @@ def shuffle_lane(lane, orders, dry):
         # Fatigue rises while a video is on screen and falls once it is not, so
         # a buried video recovers instead of being held down for ever.
         execute("UPDATE suggest.items SET top_hours = "
-                "least(coalesce(top_hours,0)+1, %d) WHERE lane=%s AND vid = ANY(%s); "
+                "least(coalesce(top_hours,0)+1, %d) "
+                "WHERE account=%s AND lane=%s AND vid = ANY(%s); "
                 "UPDATE suggest.items SET top_hours = greatest(coalesce(top_hours,0)-1, 0) "
-                "WHERE lane=%s AND NOT (vid = ANY(%s)); "
-                "UPDATE suggest.items SET last_top = now() WHERE lane=%s AND vid=%s;"
-                % (cfg["fatigue_cap"], lit(lane_id), visible,
-                   lit(lane_id), visible, lit(lane_id), lit(after[0])))
-    execute("INSERT INTO suggest.shuffles(lane,videos,moved) VALUES (%s,%s,%s);"
-            % (lit(lane_id), len(after), moved))
+                "WHERE account=%s AND lane=%s AND NOT (vid = ANY(%s)); "
+                "UPDATE suggest.items SET last_top = now() "
+                "WHERE account=%s AND lane=%s AND vid=%s;"
+                % (cfg["fatigue_cap"], acct(), lit(lane_id), visible,
+                   acct(), lit(lane_id), visible,
+                   acct(), lit(lane_id), lit(after[0])))
+    execute("INSERT INTO suggest.shuffles(account,lane,videos,moved) "
+            "VALUES (%s,%s,%s,%s);" % (acct(), lit(lane_id), len(after), moved))
     return after
 
 
@@ -1720,21 +1815,27 @@ def cmd_shuffle(args):
             failed += 1
             log("lane %-16s ERROR: %r" % (lane["id"], e))
             if not args.dry_run:
-                execute("INSERT INTO suggest.shuffles(lane,videos,moved,error) "
-                        "VALUES (%s,0,0,%s);" % (lit(lane["id"]), lit(repr(e))))
+                execute("INSERT INTO suggest.shuffles(account,lane,videos,moved,error) "
+                        "VALUES (%s,%s,0,0,%s);"
+                        % (acct(), lit(lane["id"]), lit(repr(e))))
     log("done: %d lanes reordered, %d failures" % (len(orders), failed))
     return 1 if failed else 0
 
 
 def cmd_init(args):
     execute(SCHEMA_SQL)
-    log("schema suggest is ready")
+    if not PRIMARY:
+        sys.exit("set IV_SUGGEST_ACCOUNT: the migration needs to know which "
+                 "account the rows written before multi-user belong to")
+    execute(MIGRATE_SQL.replace("__ACCOUNT__", lit(PRIMARY)))
+    log("schema suggest is ready (rows without an account belong to %s)" % PRIMARY)
     return 0
 
 
 def cmd_status(args):
     rows = query("SELECT l.lane, l.plid, count(i.vid) FROM suggest.lanes l "
-                 "LEFT JOIN suggest.items i ON i.lane=l.lane GROUP BY 1,2 ORDER BY 1;")
+                 "LEFT JOIN suggest.items i ON i.account=l.account AND i.lane=l.lane "
+                 "WHERE l.account=%s GROUP BY 1,2 ORDER BY 1;" % acct())
     log("%-16s %-38s %s" % ("lane", "playlist", "videos"))
     for lane, plid, n in rows:
         log("%-16s %-38s %s" % (lane, plid, n))
@@ -1747,7 +1848,7 @@ def cmd_status(args):
     log("%-20s %-16s %s" % ("last run", "lane", "added/removed/kept/fetches error"))
     for r in query("SELECT to_char(started,'YYYY-MM-DD HH24:MI'), lane, added, removed, "
                    "kept, fetches, coalesce(error,'') FROM suggest.runs "
-                   "ORDER BY started DESC LIMIT 12;"):
+                   "WHERE account=%s ORDER BY started DESC LIMIT 12;" % acct()):
         log("%-20s %-16s %s/%s/%s/%s %s" % (r[0], r[1], r[2], r[3], r[4], r[5], r[6]))
     return 0
 
@@ -1758,17 +1859,18 @@ def cmd_metrics(args):
 
     # One query per table keeps this cheap enough to run every 15 minutes.
     tracked = dict((r[0], int(r[1])) for r in query(
-        "SELECT lane, count(*) FROM suggest.items GROUP BY 1;"))
+        "SELECT lane, count(*) FROM suggest.items WHERE account=%s GROUP BY 1;" % acct()))
     changed = dict((r[0], float(r[1])) for r in query(
-        "SELECT lane, extract(epoch FROM max(added)) FROM suggest.items GROUP BY 1;"))
+        "SELECT lane, extract(epoch FROM max(added)) FROM suggest.items "
+        "WHERE account=%s GROUP BY 1;" % acct()))
     last = {}
     for r in query(
             "SELECT DISTINCT ON (lane) lane, extract(epoch FROM started), added, "
             "removed, kept, fetches, coalesce(error,'') FROM suggest.runs "
-            "ORDER BY lane, started DESC;"):
+            "WHERE account=%s ORDER BY lane, started DESC;" % acct()):
         last[r[0]] = r
     plids = dict((r[0], r[1]) for r in query(
-        "SELECT lane, plid FROM suggest.lanes;"))
+        "SELECT lane, plid FROM suggest.lanes WHERE account=%s;" % acct()))
 
     out = []
 
@@ -1838,12 +1940,13 @@ def cmd_metrics(args):
 
     metric("fetches_24h", "YouTube fetches in the last day, all lanes.", "gauge",
            [("", one("SELECT coalesce(sum(fetches),0) FROM suggest.runs "
-                     "WHERE started > now() - interval '1 day';") or 0)])
+                     "WHERE account=%s AND started > now() - interval '1 day';"
+                     % acct()) or 0)])
     metric("meta_rows", "Rows in the permanent metadata cache.", "gauge",
            [("", one("SELECT count(*) FROM suggest.video_meta;") or 0)])
     metric("cooldown_rows", "Videos held back by a cooldown.", "gauge",
            [("", one("SELECT count(*) FROM suggest.cooldown "
-                     "WHERE until > now();") or 0)])
+                     "WHERE account=%s AND until > now();" % acct()) or 0)])
     metric("dead_rows", "Videos known to be unfetchable, so never retried.",
            "gauge",
            [("", one("SELECT count(*) FROM suggest.video_dead "
@@ -1853,10 +1956,10 @@ def cmd_metrics(args):
     metric("last_shuffle_timestamp_seconds",
            "Newest reorder of any lane.", "gauge",
            [("", one("SELECT coalesce(extract(epoch FROM max(ran))::bigint,0) "
-                     "FROM suggest.shuffles;") or 0)])
+                     "FROM suggest.shuffles WHERE account=%s;" % acct()) or 0)])
     shuffled = dict((r[0], r[1]) for r in query(
         "SELECT DISTINCT ON (lane) lane, moved FROM suggest.shuffles "
-        "ORDER BY lane, ran DESC;"))
+        "WHERE account=%s ORDER BY lane, ran DESC;" % acct()))
     metric("lane_last_moved",
            "Positions changed by the last reorder of this lane.", "gauge",
            [(tag(lane), shuffled.get(lane["id"], 0)) for lane in lanes])
