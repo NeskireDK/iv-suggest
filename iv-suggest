@@ -1541,7 +1541,7 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
 def reconcile_playlist(lane, chosen, plid, run):
     """Add the chosen videos to the lane's playlist. Returns how many were refused."""
     lane_id = lane["id"]
-    refused, added = 0, []
+    refused, landed = 0, []
     for vid, score, meta, skey in chosen:
         log("  + %5.2f  %-52s %s" % (score, (meta.get("title") or vid)[:52],
                                      (meta.get("author") or meta.get("authorId") or "")[:24]))
@@ -1550,43 +1550,45 @@ def reconcile_playlist(lane, chosen, plid, run):
         if not add_to_lane(lane_id, plid, vid, score, skey, run.fetcher):
             refused += 1
             continue
-        added.append((vid, meta))
+        landed.append((vid, meta))
     if refused:
         log("  %d of %d adds refused by Invidious" % (refused, len(chosen)))
-    # Persist what the listings already told us about the videos that actually
-    # landed, so the Trending/Popular feed can show their view counts. Only the
-    # ones that landed, and in one statement: a run sees 300+ candidates, and a
-    # row per candidate would cost hundreds of psql round trips for nothing.
-    if not run.dry and added:
-        run.fetcher.remember_partial(added)
+    if not run.dry and landed:
+        run.fetcher.remember_partial(landed)
     return refused
 
 
-def run_lane_last_played(lane, run):
-    """Hold the N most recently PLAYED videos that match the lane.
+def plays_newest_first(watched):
+    """The watch history in last-played order, most recent first."""
+    return reversed(watched)
 
-    Invidious does `array_append(array_remove(watched, id), id)` on every play, so
-    the position in `users.watched` is a real last-played order. The lane is
-    reconciled to the top N of that order: a replay lifts a video back to the
-    top, and a video nobody plays sinks past N and leaves. First in, last
-    played out.
 
-    Safety rule: if the scan could not reach N candidates (budget or scan depth),
-    NOTHING is evicted this run. The lane only grows. Otherwise a short scan
-    would delete videos it simply had not looked at yet.
+def played_score(decay, rank):
+    """A last-played rank as a score with a gradient wide enough to survive the shuffle.
+
+    Scores that are all equal make the hourly reorder pure noise instead of a
+    rotation; the exponential keeps what was played most recently leading.
     """
-    lane_id = lane["id"]
-    log("\nlane %s  (%s)  policy last_played" % (lane_id, lane["title"]))
-    started = run.fetcher.fetches
-    run.fetcher.begin_lane(lane["fetch_cap"])
-    plid, playlist = playlist_of(lane, run.dry)
-    current = {v["videoId"]: v for v in (playlist.get("videos") or [])}
+    return 10.0 * (decay ** rank)
 
+
+def eviction_is_safe(stopped):
+    """Whether this run may evict, given how the scan ended.
+
+    A scan cut short by the fetch budget left entries unexamined rather than
+    unmatched, and one could be a recent play; a scan that merely found fewer
+    than `size` matches looked at everything and may still evict.
+    """
+    return not stopped
+
+
+def scan_recent_plays(lane, run):
+    """The videos this lane wants, newest play first, and how far the scan got."""
     size = lane["size"]
     want_genre = (lane["seed"] or {}).get("genre")
     scan_limit = (lane["seed"] or {}).get("scan", size * 6)
     desired, keys, scanned, stopped = [], set(), 0, ""
-    for vid in reversed(run.watched):                  # newest play first
+    for vid in plays_newest_first(run.watched):
         if len(desired) >= size or scanned >= scan_limit:
             break
         scanned += 1
@@ -1609,46 +1611,67 @@ def run_lane_last_played(lane, run):
             if key:
                 keys.add(key)
         desired.append(vid)
+    return desired, scanned, stopped
 
-    # The scan walks newest-play-first, so a video in the playlist that the scan
-    # never met is provably older than everything it did meet: evicting it is
-    # correct even when fewer than `size` were found. Only a scan cut short by
-    # the FETCH BUDGET is unsafe — there entries went unexamined rather than
-    # unmatched, and one of them could be a recent play. (The earlier rule keyed
-    # on `len(desired) >= size`, which meant a lane whose window simply holds
-    # fewer than `size` matches could never evict anything at all.)
-    complete = not stopped
+
+def entries_to_evict(current, desired, run, may_evict):
+    """Entries that leave: those below the play window, plus any blocked channel.
+
+    A blocked channel leaves whether or not the scan finished. The grow-only
+    rule protects entries the scan never reached, and a blocked one is not that.
+    """
+    wanted = set(desired)
+    leaving = [v for vid, v in current.items() if vid not in wanted] if may_evict else []
+    already = {v["videoId"] for v in leaving}
+    return leaving + [v for vid, v in current.items()
+                      if vid not in already and v.get("authorId") in run.blocked]
+
+
+def rescore_by_play_order(lane_id, desired, decay):
+    """Write each entry's score from its position in the play order."""
+    values = ",".join(
+        "(%s,%s,%s,%s)" % (acct(), lit(lane_id), lit(vid),
+                           round(played_score(decay, rank), 4))
+        for rank, vid in enumerate(desired))
+    execute("UPDATE suggest.items i SET score = x.score::real "
+            "FROM (VALUES %s) AS x(account,lane,vid,score) "
+            "WHERE i.account = x.account AND i.lane = x.lane "
+            "AND i.vid = x.vid;" % values)
+
+
+def run_lane_last_played(lane, run):
+    """Hold the N most recently PLAYED videos that match the lane.
+
+    Invidious does `array_append(array_remove(watched, id), id)` on every play, so
+    the position in `users.watched` is a real last-played order. The lane is
+    reconciled to the top N of that order: a replay lifts a video back to the
+    top, and a video nobody plays sinks past N and leaves. First in, last
+    played out.
+
+    Safety rule: if the scan could not reach N candidates (budget or scan depth),
+    NOTHING is evicted this run. The lane only grows. Otherwise a short scan
+    would delete videos it simply had not looked at yet.
+    """
+    lane_id = lane["id"]
+    log("\nlane %s  (%s)  policy last_played" % (lane_id, lane["title"]))
+    started = run.fetcher.fetches
+    run.fetcher.begin_lane(lane["fetch_cap"])
+    plid, playlist = playlist_of(lane, run.dry)
+    current = {v["videoId"]: v for v in (playlist.get("videos") or [])}
+
+    desired, scanned, stopped = scan_recent_plays(lane, run)
+    may_evict = eviction_is_safe(stopped)
     log("  scanned %d history entries, found %d of %d wanted%s"
-        % (scanned, len(desired), size, "; " + stopped if stopped else ""))
-    if not complete:
+        % (scanned, len(desired), lane["size"], "; " + stopped if stopped else ""))
+    if not may_evict:
         log("  the fetch budget cut the scan short, so nothing is evicted (grow only)")
 
-    keep_set = set(desired)
-    to_drop = [v for vid, v in current.items() if vid not in keep_set] if complete else []
-    # The grow-only rule above protects entries the scan never reached. A blocked
-    # channel is not one of those: its videos leave whether the scan finished or
-    # not, so they are collected separately and merged.
-    dropped = {v["videoId"] for v in to_drop}
-    to_drop += [v for vid, v in current.items()
-                if vid not in dropped and v.get("authorId") in run.blocked]
+    to_drop = entries_to_evict(current, desired, run, may_evict)
     to_add = [v for v in desired if v not in current]
 
-    # Give every entry a score from its last-played rank. This lane used to
-    # store 0 for all of them, which was harmless while the order was fixed —
-    # but the hourly shuffle ranks on score, and 96 identical scores make it
-    # pure noise instead of a rotation. An exponential keeps the gradient wide
-    # enough to survive the shuffle's jitter, so what was played most recently
-    # still leads and the reorder moves videos around inside that.
     decay = lane["played_decay"]
     if not run.dry and desired:
-        values = ",".join(
-            "(%s,%s,%s,%s)" % (acct(), lit(lane_id), lit(vid),
-                               round(10.0 * (decay ** rank), 4))
-            for rank, vid in enumerate(desired))
-        execute("UPDATE suggest.items i SET score = x.score::real "
-                "FROM (VALUES %s) AS x(account,lane,vid,score) "
-                "WHERE i.account = x.account AND i.lane = x.lane "
-                "AND i.vid = x.vid;" % values)
+        rescore_by_play_order(lane_id, desired, decay)
 
     for v in to_drop:
         log("  - %s: %s"
@@ -1663,7 +1686,7 @@ def run_lane_last_played(lane, run):
         if run.dry:
             continue
         if not add_to_lane(lane_id, plid, vid,
-                           10.0 * (decay ** desired.index(vid)),
+                           played_score(decay, desired.index(vid)),
                            song_key(meta.get("title"), meta.get("author")),
                            run.fetcher):
             refused += 1
