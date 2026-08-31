@@ -150,10 +150,56 @@ class PerViewer(unittest.TestCase):
             self.mixed()
         self.assertIn("suggested", str(caught.exception))
 
-    def test_a_mix_writes_no_state_and_costs_no_fetches(self):
-        self.mod.execute = lambda sql: self.fail("a mix wrote state")
-        removed, added, kept, used = self.mixed()
+    def test_a_real_rebuild_writes_no_state_and_costs_no_fetches(self):
+        """The dry path returns before every write, so this has to run for real."""
+        calls = []
+        self.mod.execute = lambda sql: self.fail("a mix wrote state: %s" % sql)
+        self.mod.api = lambda method, path, body=None: calls.append(method)
+        removed, added, kept, used = self.mod.run_lane_mix(
+            self.lane(), set(), set(), dry=False)
         self.assertEqual(0, used)
+        self.assertTrue(added)
+        self.assertEqual({"POST"}, set(calls))
+
+    def test_a_rebuild_clears_the_playlist_before_refilling_it(self):
+        calls = []
+        self.mod.execute = lambda sql: None
+        self.mod.api = lambda method, path, body=None: calls.append((method, path))
+        self.mod.playlist_of = lambda lane, dry: (
+            "PL_home", {"videos": [{"videoId": "old1", "indexId": "ix1"}]})
+        self.mod.run_lane_mix(self.lane(), set(), set(), dry=False)
+        self.assertEqual(("DELETE", "/api/v1/auth/playlists/PL_home/videos/ix1"),
+                         calls[0])
+        self.assertEqual({"POST"}, {m for m, _ in calls[1:]})
+
+
+class VideoCount(unittest.TestCase):
+    """`status` printed 0 for a full mix playlist; `metrics` never did."""
+
+    def setUp(self):
+        self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+
+    def run_row(self, added, kept):
+        return ["home", "1700000000", str(added), "0", str(kept), "0", ""]
+
+    def test_a_mix_lane_is_counted_from_its_last_run(self):
+        self.assertEqual(40, self.mod.lane_video_count(
+            "mix", 0, self.run_row(added=40, kept=0)))
+
+    def test_a_rebuilt_mix_lane_counts_what_it_kept_too(self):
+        self.assertEqual(54, self.mod.lane_video_count(
+            "mix", 0, self.run_row(added=14, kept=40)))
+
+    def test_a_mix_lane_that_never_ran_is_zero_not_an_error(self):
+        self.assertEqual(0, self.mod.lane_video_count("mix", 0, None))
+
+    def test_any_other_policy_counts_its_tracked_rows(self):
+        self.assertEqual(25, self.mod.lane_video_count(
+            "refill", 25, self.run_row(added=3, kept=22)))
+
+    def test_a_lane_missing_from_the_config_counts_its_rows(self):
+        """`status` lists what suggest.lanes holds, which may outlive lanes.yml."""
+        self.assertEqual(7, self.mod.lane_video_count(None, 7, None))
 
 
 if __name__ == "__main__":

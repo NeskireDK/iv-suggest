@@ -28,7 +28,7 @@ only in your shell is missing from the nightly run — test with `env -i`.
 
 ## `lanes.yml`
 
-Five top-level keys: `blocklist`, `auto_enrol`, `users`, `defaults`, `lanes`.
+Top-level keys: `blocklist`, `auto_enrol`, `users`, `defaults`, `lanes`.
 
 ### `blocklist`
 
@@ -68,6 +68,10 @@ which is what it did before multi-user.
 | `email` | — | **Required.** the `users.email` value |
 | `lanes` | `all` | `all`, or a list of lane ids. Order is always the file's, so mix lanes still run last |
 | `overrides` | `{}` | `{lane-id: {key: value}}` — lane keys changed for this account only |
+
+An override patch merges into `shuffle`, `subscription` and `mix` key by key, so
+setting one of their keys keeps the rest. Every other block, `seed` included, is
+replaced whole.
 
 ### `defaults`
 
@@ -119,7 +123,7 @@ Per-`expand` keys, ignored by the other modes:
 
 | Key | Default | Applies to | Meaning |
 |---|---|---|---|
-| `seed` | `{from: watched, limit: 30}` | `recommended`, `channel_latest`, `none` | see below |
+| `seed` | `{limit: 30}` | `recommended`, `channel_latest`, `none` | see below |
 | `recommend_max_age_days` | `0` | `recommended` | drop a recommendation older than this. `0` = off. Free — `recommendedVideos` carries `published` |
 | `max_channels` | `12` | `channel_latest` | channels to poll per run |
 | `max_age_days` | `21` | `channel_latest` | how new an upload must be |
@@ -149,7 +153,7 @@ filter on.
 |---|---|---|
 | `kinds` | `[video]` | any of `video`, `short`, `live` |
 | `max_age_hours` | `0` | only entries this new. `0` = no bound |
-| `rank` | `views` | `views` \| `published` |
+| `rank` | `views` | `views`, or `published` for anything else — an unknown value is not rejected |
 
 #### `mix`
 

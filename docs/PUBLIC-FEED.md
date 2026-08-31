@@ -1,30 +1,27 @@
 # TODO: the public feed, and what a brand new account sees
 
-Status: **not started.** Written 2026-08-31.
+Status: **section 2 built and live; section 1 not started.** Written
+2026-08-31.
 
 Two gaps, one moment: somebody opens the instance and the engine has nothing
 personal to offer them. A logged-out visitor has no account at all; a new account
 has one but no history yet. Today both land on whatever `popular_playlists`
 points at, which is one specific person's Home mix.
 
-## Decide first: how public is public?
+## Decided: how public is public?
 
-`iv.ariksen.dk` has no Authelia. A playlist feeding Popular is readable by
-anybody who can reach the host, so a compiled feed publishes an aggregate of the
-household's viewing to the open internet — past "the household sees each other's
-taste", which is what [MULTI-USER.md](MULTI-USER.md) accepted.
+**Public to everyone, no limitations** (Andre, 2026-08-31). No Invidious account
+is needed to see the compiled feed; reaching the instance is enough. Cloudflare
+is the only thing in front of it, and a visitor who is a Cloudflare user but not
+an Invidious user is explicitly in scope.
 
-Aggregation is not anonymisation: a two-person household with one obvious
-enthusiasm is not hard to read. Options, cheapest first:
+So option 3 of the three that were on the table: accept the aggregate as
+public, because it is a family instance. The privacy filter idea (only include
+a video *n* accounts agree on) stays on the table as a **ranking** device, which
+is what the scoring below already wants — not as an access control.
 
-1. leave the public feed a fixed hand-curated playlist, keep the compiled one
-   behind login;
-2. only include a video *n* accounts share — agreement as the privacy filter,
-   which the ranking below already computes;
-3. accept it as-is, because it is a family instance.
-
-This decides where the playlist lives and possibly what goes in it, so it comes
-before either piece of work below.
+This unblocks section 1: the compiled playlist can be `privacy: public` and can
+be what `popular_playlists` points at.
 
 ## 1. A public mix, compiled from everybody's
 
@@ -126,16 +123,11 @@ decides *which accounts*.
 
 Removed from `DEFAULTS`, from `lanes.yml` and from the reference.
 
-### code — `iv-suggest status` reports 0 videos for a mix lane
+### ~~code — `iv-suggest status` reports 0 videos for a mix lane~~ FIXED
 
-The `videos` column counts `suggest.items`, which a mix lane never writes: it
-rebuilds from its sources every run and stores no membership of its own. So
-`home-mix` and `household` read as empty in `status` while the playlists hold
-54 and 40. `cmd_metrics` already special-cases the same thing
-(`0 if lane["policy"] == "mix"`), so the shape of the fix is known — count
-`array_length(playlists."index", 1)` for a mix lane. Cosmetic, but it reads as
-a broken lane at exactly the moment somebody is checking whether a deploy
-worked.
+Display only — the lane filled correctly the whole time. `status` counted
+`suggest.items`, which a mix lane never writes. `cmd_metrics` already knew
+better, so the two now share `lane_video_count()` and cannot drift again.
 
 ### docs — corrected in CONFIG.md
 
