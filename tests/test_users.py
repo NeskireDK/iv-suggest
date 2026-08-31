@@ -6,6 +6,7 @@ dozen playlists the bot made in your account is a bad first impression.
 """
 
 import os
+import re
 import tempfile
 import unittest
 
@@ -129,30 +130,53 @@ users:
             "an override must not leak into the shared lane definition")
 
 
+class Runs:
+    """A suggest.runs table that answers account_order the way Postgres would."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def query(self, sql):
+        rows = self.rows
+        if "coalesce(error,'')=''" in re.sub(r"\s+", "", sql):
+            rows = [r for r in rows if not r[2]]
+        newest = {}
+        for account, started, _ in rows:
+            newest[account] = max(newest.get(account, 0.0), started)
+        return [[account, str(started)] for account, started in newest.items()]
+
+
+class EmptyLaneList(ConfigCase):
+
+    def test_an_empty_lane_list_means_no_lanes_not_every_lane(self):
+        """`lanes: []` is how somebody is managed but given nothing yet."""
+        mod = self.loaded(LANES + ("users:\n  - email: %s\n    lanes: []\n" % ME))
+        user = mod.load_users()[0]
+        self.assertEqual([], mod.lanes_for(user, mod.load_config()))
+        self.assertEqual([], mod.lanes_for(user, mod.load_config(), 900))
+
+
 class Order(unittest.TestCase):
     """Least-recently-succeeded first, so the same person is not always last."""
 
     def setUp(self):
         self.mod = load(IV_SUGGEST_ACCOUNT=ME)
 
-    def order(self, rows, users):
-        self.mod.query = lambda sql: rows
+    def order(self, runs, users):
+        self.mod.query = Runs(runs).query
         return [u["email"] for u in
                 self.mod.account_order([{"email": e} for e in users])]
 
     def test_the_stalest_account_is_served_first(self):
-        rows = [[ME, "200"], [OTHER, "100"]]
-        self.assertEqual([OTHER, ME], self.order(rows, [ME, OTHER]))
+        runs = [(ME, 200.0, ""), (OTHER, 100.0, "")]
+        self.assertEqual([OTHER, ME], self.order(runs, [ME, OTHER]))
 
     def test_an_account_that_never_ran_leads(self):
-        rows = [[ME, "200"]]
-        self.assertEqual([OTHER, ME], self.order(rows, [ME, OTHER]))
+        self.assertEqual([OTHER, ME], self.order([(ME, 200.0, "")], [ME, OTHER]))
 
     def test_a_failed_run_does_not_count_as_a_turn(self):
-        captured = []
-        self.mod.query = lambda sql: captured.append(sql) or []
-        self.mod.account_order([{"email": ME}])
-        self.assertIn("coalesce(error,'') = ''", captured[0])
+        runs = [(ME, 100.0, ""), (OTHER, 900.0, "budget spent")]
+        self.assertEqual([OTHER, ME], self.order(runs, [ME, OTHER]))
 
 
 class Budget(unittest.TestCase):
