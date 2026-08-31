@@ -96,7 +96,7 @@ class Migration(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        subprocess.run(["docker", "rm", "-f", cls.name], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", "-v", cls.name], capture_output=True)
 
     def psql(self, sql, tuples_only=True):
         flags = ["-At"] if tuples_only else []
