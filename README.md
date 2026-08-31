@@ -92,9 +92,10 @@ iv-suggest run [--dry-run] [--lane ID]            fill the lanes
            [--seeds N] [--rate N] [--budget N]
 iv-suggest shuffle [--dry-run] [--lane ID]        reorder only, no fetches
            [--account EMAIL]
-iv-suggest status                                 lane sizes and recent runs
-iv-suggest dedupe [--dry-run]                     one upload per song
+iv-suggest status [--account EMAIL]               lane sizes and recent runs
+iv-suggest dedupe [--dry-run] [--account EMAIL]   one upload per song
 iv-suggest views [--rate N] [--budget N]          backfill missing view counts
+           [--account EMAIL]
 iv-suggest metrics                                Prometheus text, database only
 ```
 

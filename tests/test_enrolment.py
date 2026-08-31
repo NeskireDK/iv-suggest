@@ -91,6 +91,52 @@ users:
         self.assertEqual(0.08, theirs["shuffle"]["jitter"])
 
 
+class MergedBlocks(ConfigCase):
+    """Which nested blocks a patch merges into, and which it replaces."""
+
+    def patched(self, block, patch):
+        mod = self.loaded(LANES, instance=(ME,))
+        base = dict(mod.load_config()[0])
+        base[block] = {"a": 1, "b": 2}
+        return mod.merge_lane(base, {block: patch})[block]
+
+    def test_a_partial_shuffle_block_keeps_the_other_keys(self):
+        self.assertEqual({"a": 1, "b": 9}, self.patched("shuffle", {"b": 9}))
+
+    def test_a_partial_subscription_block_keeps_the_other_keys(self):
+        self.assertEqual({"a": 1, "b": 9}, self.patched("subscription", {"b": 9}))
+
+    def test_a_partial_mix_block_keeps_the_sources(self):
+        """`overrides: {home: {mix: {pure: 5}}}` used to drop mix.sources."""
+        mod = self.loaded(LANES, instance=(ME,))
+        household = [l for l in mod.load_config() if l["id"] == "household"][0]
+        merged = mod.merge_lane(household, {"mix": {"pure": 5}})
+        self.assertEqual(5, merged["mix"]["pure"])
+        self.assertTrue(merged["mix"]["sources"])
+
+    def test_a_seed_block_replaces_rather_than_merges(self):
+        """CONFIG.md commits to this, so it is a claim and not an accident."""
+        self.assertEqual({"b": 9}, self.patched("seed", {"b": 9}))
+
+
+class OverrideInertKeys(ConfigCase):
+
+    def overridden(self, policy, patch):
+        text = ("lanes:\n  - id: played\n    title: Played\n    policy: %s\n"
+                "users:\n  - email: %s\n    overrides:\n      played: %s\n"
+                % (policy, ME, patch))
+        mod = self.loaded(text, instance=(ME,))
+        user = mod.load_users()[0]
+        return mod.lanes_for(user, mod.load_config())[0]["ignored"]
+
+    def test_an_override_setting_a_key_the_policy_never_reads_is_named(self):
+        self.assertEqual(["ttl_days"],
+                         self.overridden("last_played", "{ttl_days: 3}"))
+
+    def test_an_override_setting_a_key_the_policy_reads_is_not_named(self):
+        self.assertEqual([], self.overridden("last_played", "{played_decay: 0.5}"))
+
+
 class AutoEnrol(ConfigCase):
 
     def test_no_block_still_means_only_the_listed_account(self):
@@ -128,6 +174,17 @@ users:
   - email: %s
 """ % ME, instance=(ME, OTHER))
         self.assertEqual(sorted([ME, OTHER]), sorted(u["email"] for u in mod.load_users()))
+
+    def test_a_bare_auto_enrol_key_still_enrols(self):
+        """Writing the key at all is the opt-in; `auto_enrol:` parses as None."""
+        mod = self.loaded(LANES + "auto_enrol:\n", instance=(ME, OTHER))
+        self.assertEqual(sorted([ME, OTHER]),
+                         sorted(u["email"] for u in mod.load_users()))
+
+    def test_auto_enrol_true_enrols(self):
+        mod = self.loaded(LANES + "auto_enrol: true\n", instance=(ME, OTHER))
+        self.assertEqual(sorted([ME, OTHER]),
+                         sorted(u["email"] for u in mod.load_users()))
 
     def test_exclude_keeps_an_account_out(self):
         mod = self.loaded(LANES + "auto_enrol: {exclude: [%s]}\n" % OTHER,
@@ -203,9 +260,6 @@ class HouseholdSource(ConfigCase):
         self.assertFalse(named[0]["optional"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class InertKeys(ConfigCase):
 
@@ -271,3 +325,5 @@ lanes:
         self.assertIn("played", said[0])
         self.assertIn("last_played", said[0])
         self.assertIn("ttl_days", said[0])
+if __name__ == "__main__":
+    unittest.main()
