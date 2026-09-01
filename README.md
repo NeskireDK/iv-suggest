@@ -181,10 +181,9 @@ on every request — so reordering a lane is one SQL `UPDATE` on a `bigint[]`: n
 delete, no re-add, no API call, and the client-visible `indexId` in
 `playlist_videos.index` never moves. It is race-safe against the nightly run
 because it permutes whatever the array holds at write time, so a video added
-between the read and the write sorts last and survives. The
-ranking discounts what has already been on screen and treats slot 1 as a rota
-rather than a ranking, so at least half the lane leads before any video returns
-to the top.
+between the read and the write sorts last and survives. The ranking discounts
+what has already been on screen and treats slot 1 as a rota rather than a
+ranking, so at least half the lane leads before any video returns to the top.
 
 **Rate limiting toward YouTube is the main constraint.** Invidious's `videos`
 cache is unlogged and short-lived, so assume every `/api/v1/videos/<id>` reaches

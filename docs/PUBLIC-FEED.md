@@ -129,11 +129,14 @@ mix from part 1 as its home feed.**
 - **Enrolment is idempotent.** It is recomputed every run; `playlist_of()`
   creates only what is missing, and `min_watched` is a filter rather than stored
   state, so nothing has to be migrated when an account warms up.
-- **Every reader of a lane list applies the gate, not just the filler.** That is
-  what `enrolled_lanes()` is for, and why `status` and `metrics` go through it.
-  Reporting the ungated list names lanes the run will skip: on the night the
-  second account was auto-enrolled it raised twelve "lane has not run" alerts
-  for lanes that were never going to run.
+- **Every reader of a lane list applies the gate, not just the filler.**
+  Reporting the ungated list names lanes the run will skip — on the night the
+  second account was auto-enrolled that raised twelve "lane has not run" alerts
+  for lanes that were never going to run. `run` applies it inline through
+  `lanes_for()`, since it already has the watch history in hand; `shuffle`,
+  `init` and `metrics` call `enrolled_lanes()`, which looks the count up for
+  them. `status` needs no gate at all: it reads `suggest.lanes`, and a held-back
+  lane has no row there to report.
 - **A Takeout import remains the real fix** and lands the whole history at once.
   The fallback covers the days before somebody gets round to it.
 
