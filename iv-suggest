@@ -911,10 +911,10 @@ def playlist_of(lane, dry):
 def seed_order(watched, seed_cfg):
     """History ids in the order the seed picker walks them, newest first."""
     hist = list(reversed(watched))
-    window = int((seed_cfg or {}).get("shuffle_window") or 0)
+    window = int(seed_cfg.get("shuffle_window") or 0)
     if window < 2:
         return hist
-    recent = int((seed_cfg or {}).get("recent") or 0)
+    recent = int(seed_cfg.get("recent") or 0)
     pool = hist[recent:window]
     random.shuffle(pool)
     return hist[:recent] + pool + hist[window:]
@@ -1068,8 +1068,8 @@ def pick_seeds(lane, run):
     seeds = []
     if seed_free:
         log("  no seeds needed (%s)" % lane["expand"])
-    seed_cfg = lane["seed"]
-    want_genre = (seed_cfg or {}).get("genre")
+    seed_cfg = lane["seed"] or {}
+    want_genre = seed_cfg.get("genre")
     limit = seed_cfg.get("limit", lane["size"])
     if run.seed_override:
         limit = min(limit, run.seed_override)

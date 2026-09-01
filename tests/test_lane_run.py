@@ -313,6 +313,17 @@ class Seeds(LaneCase):
                   db=Db(), api=Api(), fetch=fetch)
         self.assertEqual(2, len(self.db_added_vids()))
 
+    def test_a_valueless_seed_key_still_fills_the_lane(self):
+        history = ["h%010d" % i for i in range(2)]
+        self.fill(self.lane(expand="none", exclude_watched=False, seed=None),
+                  watched=history, db=Db(), api=Api())
+        self.assertEqual(["h0000000001", "h0000000000"], self.db_added_vids())
+
+    def test_a_valueless_seed_key_survives_the_lane_merge_as_none(self):
+        self.assertIsNone(self.lane(seed=None)["seed"],
+                          "the seed block is replaced wholesale, so pick_seeds "
+                          "is what has to cope with a key written bare")
+
     def test_an_account_with_no_history_makes_no_api_call_at_all(self):
         removed, added, kept, used = self.fill(self.lane(), db=Db(), api=Api())
         self.assertEqual((0, 0, 0), (removed, added, kept))
