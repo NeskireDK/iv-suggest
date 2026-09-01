@@ -11,8 +11,7 @@ session per account rather than holding a token for each. An account not named
 in that block is never touched.
 
   config : /etc/iv-suggest/lanes.yml and /etc/iv-suggest/env (docs/CONFIG.md)
-  auth   : one session per account, in suggest.accounts. IV_SUGGEST_TOKEN is
-           the fallback for an install predating that.
+  auth   : one session per account, in suggest.accounts, minted on demand
   state  : PostgreSQL schema "suggest" in the Invidious database
   usage  : iv-suggest --help
 
@@ -76,7 +75,9 @@ DB_USER = setting("IV_SUGGEST_DB_USER", "kemal")
 DB_NAME = setting("IV_SUGGEST_DB_NAME", "invidious")
 API = setting("IV_SUGGEST_API", "http://localhost:3000")
 CONFIG = setting("IV_SUGGEST_CONFIG", "/etc/iv-suggest/lanes.yml")
-# The account whose lanes are being filled right now. `use_account()` moves it;
+# The account whose lanes are being filled right now. A reader moves it with
+# `use_account()`, anything that calls the API with `serve_account()` -- the
+# difference is which one guarantees a session, and a reader must not mint one.
 # PRIMARY is the one from the environment, which is also what the schema
 # migration backfills every pre-multi-user row to.
 PRIMARY = setting("IV_SUGGEST_ACCOUNT")
@@ -84,10 +85,17 @@ ACCOUNT = PRIMARY
 
 
 def use_account(email):
-    """Point every account-scoped query and API call at this account."""
+    """Point every account-scoped query at this account. Reads only: mints nothing."""
     global ACCOUNT, SESSION
     ACCOUNT = email
     SESSION = session_of(email)
+
+
+def serve_account(email):
+    """Point at this account and guarantee the session its API calls need."""
+    global ACCOUNT, SESSION
+    ACCOUNT = email
+    SESSION = open_session(email)
 
 
 def acct():
@@ -411,16 +419,7 @@ def parse_views(rec):
         return None
 
 
-# The signed token from the environment, if the install still has one, and the
-# session the bot holds for the account currently being filled. The session
-# wins: it exists for every account, whereas the token only ever covered one.
-TOKEN = None
 SESSION = None
-
-
-def load_token():
-    """The pre-multi-user API token. Optional now that sessions replaced it."""
-    return setting("IV_SUGGEST_TOKEN")
 
 
 def session_of(email):
@@ -449,13 +448,10 @@ def open_session(email):
 
 
 def api(method, path, body=None):
-    req = urllib.request.Request(API + path, method=method)
-    if SESSION:
-        req.add_header("Cookie", "SID=" + SESSION)
-    elif TOKEN:
-        req.add_header("Authorization", "Bearer " + TOKEN)
-    else:
+    if not SESSION:
         raise Aborted("no credential for %s: run `iv-suggest init`" % ACCOUNT)
+    req = urllib.request.Request(API + path, method=method)
+    req.add_header("Cookie", "SID=" + SESSION)
     data = None
     if body is not None:
         data = json.dumps(body).encode()
@@ -1713,7 +1709,7 @@ def run_one_lane(lane, run):
 
 def run_account(user, all_lanes, fetcher, seed_override, args):
     """One account's lanes. Returns how many of them failed."""
-    use_account(user["email"])
+    serve_account(user["email"])
     watched, subs = read_user()
     lanes = lanes_for(user, all_lanes, len(watched))
     held_back = [l["id"] for l in lanes_for(user, all_lanes)
@@ -1751,7 +1747,7 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
 def cmd_dedupe(args):
     """Keep one upload per song per account and remove the rest. The next run refills."""
     for user in accounts_wanted(args):
-        use_account(user["email"])
+        serve_account(user["email"])
         log("account %s" % user["email"])
         dedupe_account(args)
     return 0
@@ -1817,7 +1813,7 @@ def videos_across_every_lane(args):
     """The distinct video ids held by every lane of every wanted account."""
     vids = set()
     for user in accounts_wanted(args):
-        use_account(user["email"])
+        serve_account(user["email"])
         for lane_id, plid in query("SELECT lane, plid FROM suggest.lanes "
                                    "WHERE account=%s;" % acct()):
             playlist = api("GET", "/api/v1/auth/playlists/" + plid)
@@ -2075,8 +2071,7 @@ def cmd_init(args):
     warn_ignored_keys(all_lanes)
     for user in users:
         log("account %s" % user["email"])
-        open_session(user["email"])
-        use_account(user["email"])
+        serve_account(user["email"])
         for lane in enrolled_lanes(user, all_lanes):
             plid, _ = playlist_of(lane, dry=False)
             log("  lane %-16s %s" % (lane["id"], plid))
@@ -2301,13 +2296,7 @@ def _instance_wide_metrics(metric, users):
            [("", 1)])
 
 
-def needs_credential(cmd):
-    """False for the two commands that only read the database and call no API."""
-    return cmd not in ("metrics", "shuffle")
-
-
 def main():
-    global TOKEN
     p = argparse.ArgumentParser(description="lane based suggestion playlists")
     sub = p.add_subparsers(dest="cmd", required=True)
     i = sub.add_parser("init", help="schema, sessions and any missing playlists")
@@ -2338,8 +2327,6 @@ def main():
     s.add_argument("--lane")
     s.add_argument("--account", help="reorder only this account")
     args = p.parse_args()
-    if needs_credential(args.cmd):
-        TOKEN = load_token()
     return {"init": cmd_init, "run": cmd_run, "status": cmd_status,
             "metrics": cmd_metrics, "dedupe": cmd_dedupe,
             "views": cmd_views, "shuffle": cmd_shuffle}[args.cmd](args)

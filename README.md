@@ -99,7 +99,7 @@ iv-suggest views [--rate N] [--budget N]          backfill missing view counts
 iv-suggest metrics                                Prometheus text, database only
 ```
 
-`metrics` takes no token and makes no fetch, so it is safe to scrape often.
+`metrics` needs no session and makes no fetch, so it is safe to scrape often.
 
 `views` exists because the feed reads its numbers out of `suggest.video_meta`.
 A candidate that only ever arrived through `recommendedVideos` or

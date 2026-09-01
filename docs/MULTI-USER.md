@@ -96,25 +96,26 @@ One timer, one hourly shuffle, both looping internally. No per-account units.
 - **The first timer-driven full `run` has not happened on this code.** The
   2026-08-31 fill was a manual foreground run straight after the deploy; only the
   hourly shuffle has run from a timer since.
-- **`IV_SUGGEST_TOKEN` is a reachable fallback that can write to the wrong
-  account.** Not dead code, which is what an earlier note here claimed. `api()`
-  is `if SESSION: ... elif TOKEN: ...`, and `SESSION` can legitimately be empty:
-  `use_account()` sets it from `session_of()`, which returns `""` when the
-  account's sid no longer joins `session_ids`. Only `cmd_init` calls
-  `open_session()`. `run`, `views`, `dedupe`, `status` and `shuffle` all call
-  `use_account()` alone. So a lost session does not stop a fill — it falls
-  through to a single account-agnostic bearer token while the loop is positioned
-  on some *other* account, and the writes land wherever that token's account is.
-  Single-account, that was a harmless safety net; multi-user, it is a
-  cross-account write.
+- **A session is minted per account by whoever calls the API.** There are two
+  entry points and the difference is the whole safety property:
 
-  The fix is not just deleting the token. `run`, `views` and `dedupe` should
-  mint through `open_session()` like `init` does, so a lost session self-heals
-  for the *correct* account; the token fallback then becomes genuinely
-  unreachable and can go with it, leaving `Aborted("no credential ... run
-  iv-suggest init")` as the loud failure. Until then the token stays, because
-  removing it alone converts a silent misfire into an abort without giving the
-  fill any way to recover.
+  | | sets `ACCOUNT` | session |
+  |---|---|---|
+  | `serve_account()` | yes | `open_session()` — reuses the row or mints one |
+  | `use_account()` | yes | `session_of()` — `""` when the sid no longer joins `session_ids` |
+
+  `init`, `run`, `views` and `dedupe` call the API, so they serve. `status`,
+  `metrics` and `shuffle` read the database and call no API, so they only point,
+  and reporting never writes a session row as a side effect. `api()` has no
+  fallback: no session is `Aborted("no credential ... run iv-suggest init")`.
+
+  This replaced `IV_SUGGEST_TOKEN`, one account-agnostic bearer token that
+  `api()` fell back to when `SESSION` was empty. Because only `cmd_init` minted,
+  a lost session did not stop a fill — it authenticated as the token's owner
+  while the loop sat on a *different* account, and the playlist writes landed in
+  the wrong account. Removing the token alone would only have converted that
+  into an abort, which is why the minting came first. `tests/test_sessions.py`
+  holds the invariant statically, so a new command cannot reintroduce it.
 
 - **Does an issued SID survive the nightly 05:00 job?** The question was
   written assuming that job restores the database. It does not: `iv-nightly.sh`
