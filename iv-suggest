@@ -844,7 +844,7 @@ def read_user():
 
 
 def read_blocked():
-    """Channel ids no lane may offer, as {ucid: channel name}, from the playlist and the config."""
+    """Channel ids no lane may offer, as {ucid: channel name}: the playlist plus the config."""
     cfg = dict(BLOCKLIST_DEFAULTS)
     cfg.update(read_config().get("blocklist") or {})
     blocked = {}
