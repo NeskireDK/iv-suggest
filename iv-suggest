@@ -567,11 +567,7 @@ class Fetcher:
                 % (lit(vid), days, lit(reason)))
 
     def channel_latest(self, ucid):
-        """Recent uploads of one channel: one fetch for about 60 videos.
-
-        Far cheaper per candidate than /api/v1/videos, and unlike the
-        recommendation graph it returns content that did not exist yesterday.
-        """
+        """Recent uploads of one channel: one fetch for about 60 videos."""
         if self.fetches >= self.budget:
             raise BudgetSpent("run budget %d spent" % self.budget)
         if self.lane_cap and self.lane_used >= self.lane_cap:
@@ -633,19 +629,8 @@ class Fetcher:
                views_lit))
 
     def remember_partial(self, entries):
-        """Persist metadata that came free with a listing, for many videos at once.
-
-        A recommendation or channel listing carries the view count, title, author
-        and length — everything the Trending/Popular feed reads (it looks view
-        counts up in `suggest.video_meta`). Dropping them was why videos added
-        from those two sources showed no view count on the feed page while the
-        watch page, which asks upstream live, showed the real number.
-
-        `genre` is the one field a listing does NOT carry, so a new row is marked
-        `genre_known = false` and a genre lane still verifies it upstream. An
-        existing complete row keeps its genre and its flag: only the cheap fields
-        are refreshed.
-        """
+        """Persist the metadata a listing carries free, for many videos at once.
+        No genre: a new row is marked `genre_known = false`, an existing one keeps its own."""
         rows = []
         for vid, m in entries:
             if not m:
@@ -680,11 +665,7 @@ class Fetcher:
 
     def meta_of(self, vid):
         """Metadata including a real genre, from the cache or from one paced fetch.
-
-        A `genre_known = false` row counts as a MISS here: it was filled in from a
-        listing that carries no genre, and returning it would make every genre
-        lane reject the video for ever without once asking upstream.
-        """
+        A `genre_known = false` row is a MISS, or a genre lane would never ask upstream."""
         m = self.meta.get(vid)
         if m and m.get("genre_known", True):
             self.cache_hits += 1
