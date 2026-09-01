@@ -511,7 +511,7 @@ class Fetcher:
         self.lane_cap, self.lane_used = cap, 0
 
     def video(self, vid):
-        """Full API answer. Costs one YouTube fetch. None if the video is gone."""
+        """Full API answer, or None when the video is gone or upstream cannot parse it."""
         if vid in self.dead:
             self.dead_hits += 1
             return None
@@ -1641,13 +1641,7 @@ def run_lane_mix(lane, run):
 
 
 def cmd_run(args):
-    """Fill every managed account's lanes, in one paced run.
-
-    One timer, one budget, one metadata cache. The accounts are a loop inside
-    this process rather than a unit each, because the thing that has to stay
-    scarce -- calls that reach YouTube -- is a property of the instance, not of
-    the account.
-    """
+    """Fill every managed account's lanes in one paced run: one timer, one budget."""
     all_lanes = load_config()
     warn_ignored_keys(all_lanes)
     users = accounts_wanted(args)
@@ -1672,15 +1666,7 @@ def cmd_run(args):
 
 
 def budget_slice(total, spent, accounts_left):
-    """One account's share of the run's fetch budget.
-
-    Divide, do not multiply. The pacing is there to keep YouTube calm, which is
-    a property of the instance and not of the account, so a second person does
-    not double the calls -- they halve each share.
-
-    Recomputed from what is left each time, so a light account's unspent slice
-    rolls forward to whoever comes next instead of being lost.
-    """
+    """One account's share of what is LEFT of the run's fetch budget."""
     return max(0, total - spent) // max(1, accounts_left)
 
 
@@ -1696,11 +1682,7 @@ def accounts_wanted(args):
 
 
 def log_account_header(lanes, run):
-    """Announce the account's totals, watch count included.
-
-    The watch count is there because it is why a new account's lanes come out
-    thin, and nothing else makes that visible.
-    """
+    """Announce the account's totals, watch count included."""
     log("\naccount %s: %d watched, %d subscriptions, %d blocked, %d lanes, "
         "%d fetches of budget"
         % (ACCOUNT, len(run.watched), len(run.subs), len(run.blocked), len(lanes),
@@ -1709,9 +1691,7 @@ def log_account_header(lanes, run):
 
 def run_one_lane(lane, run):
     """One lane's (removed, added, kept, fetches), and its error if it had one.
-
-    A lane that raises is recorded and never stops the account's other lanes.
-    """
+    A lane that raises is recorded and never stops the account's other lanes."""
     try:
         if lane["policy"] == "last_played":
             return run_lane_last_played(lane, run), None
@@ -1764,12 +1744,7 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
 
 
 def cmd_dedupe(args):
-    """Keep one upload per song and remove the rest. The next run refills.
-
-    Per account: two people are each allowed their own copy of a song, and
-    dropping one because the other already has it is exactly the bleed the
-    account column exists to stop.
-    """
+    """Keep one upload per song per account and remove the rest. The next run refills."""
     for user in accounts_wanted(args):
         use_account(user["email"])
         log("account %s" % user["email"])
@@ -1781,11 +1756,7 @@ Upload = namedtuple("Upload", "song quality lane_rank title_len lane plid video"
 
 
 def dedupe_account(args):
-    """One account's duplicates.
-
-    The keeper is chosen on quality, not on lane order: the artist's own upload
-    beats a re-upload, and a lane earlier in lanes.yml beats a later one.
-    """
+    """One account's duplicates. The keeper wins on upload_quality first, lane order second."""
     order = {lane["id"]: i for i, lane in enumerate(load_config())}
     entries = []
     for lane_id, plid in query("SELECT lane, plid FROM suggest.lanes "
@@ -1838,11 +1809,7 @@ def dedupe_account(args):
 
 
 def videos_across_every_lane(args):
-    """The distinct video ids held by every lane of every wanted account.
-
-    Distinct because a view count is a property of the video: two accounts
-    holding the same one pay for a single refresh.
-    """
+    """The distinct video ids held by every lane of every wanted account."""
     vids = set()
     for user in accounts_wanted(args):
         use_account(user["email"])
@@ -1858,14 +1825,7 @@ def videos_across_every_lane(args):
 
 def cmd_views(args):
     """Refresh the recorded view counts of every video the bot's playlists hold.
-
-    Every /api/v1/videos/<id> call reaches YouTube, so this reuses the Fetcher's
-    pacing/budget/backoff exactly like a run -- but it must see the CURRENT
-    count, not whatever the metadata cache already has, so it calls video()
-    for every video regardless of what the cache says. video() itself already
-    treats a lone HTTP 500 as a known upstream parser bug: it logs, skips the
-    one video, and keeps going; only 5 consecutive failures of any kind abort.
-    """
+    Ignores the metadata cache on purpose: the whole point is the CURRENT count."""
     vids = videos_across_every_lane(args)
     log("%d unique videos across every lane of every account" % len(vids))
 
@@ -2143,12 +2103,7 @@ def shuffle_account(user, all_lanes, args):
 
 
 def cmd_init(args):
-    """Prepare the schema, then every managed account. Safe to re-run.
-
-    Idempotent throughout: the migration only touches what it has not touched
-    before, a session is opened once and reused, and a playlist is created only
-    when the account has none for that lane. Nothing here recreates anything.
-    """
+    """Prepare the schema, then every managed account. Idempotent, so safe to re-run."""
     if not PRIMARY:
         sys.exit("set IV_SUGGEST_ACCOUNT: the migration needs to know which "
                  "account the rows written before multi-user belong to")
