@@ -392,7 +392,17 @@ class Expand(LaneCase):
                   watched=["h0000000000", "h0000000001"], db=Db(), api=Api())
         rows = self.db.item_rows()
         self.assertEqual(["h0000000001", "h0000000000"], [r[0] for r in rows])
-        self.assertGreaterEqual(rows[0][1], rows[1][1])
+        self.assertGreater(rows[0][1], rows[1][1])
+
+    def test_expand_none_keeps_consecutive_ranks_apart_once_stored(self):
+        history = ["h%010d" % i for i in range(6)]
+        self.fill(self.lane(expand="none", exclude_watched=False, size=6),
+                  watched=history, db=Db(), api=Api())
+        stored = [score for _, score, _ in self.db.item_rows()]
+        self.assertEqual(len(history), len(stored))
+        self.assertEqual(sorted(set(stored), reverse=True), stored,
+                         "a rank the stored rounding flattens leaves the hourly "
+                         "shuffle ranking on noise instead of the watch order")
 
 
 class Filter(LaneCase):

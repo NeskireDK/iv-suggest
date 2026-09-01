@@ -142,6 +142,7 @@ RATE_PER_MIN = 20
 MAX_FETCHES = 320
 DAYS_BEFORE_RETRYING_A_BROKEN_VIDEO = 30
 MAX_CONSECUTIVE_FAILS = 5
+STORED_SCORE_DECIMALS = 4   # suggest.items.score is rounded to this before it is written
 DRY_SEEDS = 10          # a dry run uses few seeds; the nightly run uses the config
 
 SCHEMA_SQL = """
@@ -957,7 +958,8 @@ def add_to_lane(lane_id, plid, vid, score, song, fetcher):
     execute("INSERT INTO suggest.items(account,lane,vid,score,song_key) VALUES "
             "(%s,%s,%s,%s,%s) ON CONFLICT (account,lane,vid) DO UPDATE SET "
             "added=now(), score=EXCLUDED.score, song_key=EXCLUDED.song_key;"
-            % (acct(), lit(lane_id), lit(vid), round(score, 4), lit(song)))
+            % (acct(), lit(lane_id), lit(vid),
+               round(score, STORED_SCORE_DECIMALS), lit(song)))
     return True
 
 
@@ -1111,7 +1113,7 @@ def channels_to_read(watch_counts, most):
 
 
 def rank_derived_score(rank):
-    """A score from feed position rather than from raw views.
+    """A score from list position, spread so consecutive ranks differ once stored.
     Raw views would swamp the hourly shuffle's fatigue and jitter multipliers."""
     return 10.0 * (0.99 ** rank)
 
@@ -1216,7 +1218,7 @@ def expand_by_watch_order(lane, seeds, room, run):
     """The seeds themselves, scored so the lane keeps the order they were watched in."""
     scores, meta_seen = {}, {}
     for rank, vid in enumerate(seeds):
-        scores[vid] = 1.0 - rank / 100000.0
+        scores[vid] = rank_derived_score(rank)
         meta_seen[vid] = run.fetcher.meta.get(vid, {})
     return scores, meta_seen
 
@@ -1444,7 +1446,7 @@ def rescore_by_play_order(lane_id, desired, decay):
     """Write each entry's score from its position in the play order."""
     values = ",".join(
         "(%s,%s,%s,%s)" % (acct(), lit(lane_id), lit(vid),
-                           round(played_score(decay, rank), 4))
+                           round(played_score(decay, rank), STORED_SCORE_DECIMALS))
         for rank, vid in enumerate(desired))
     execute("UPDATE suggest.items i SET score = x.score::real "
             "FROM (VALUES %s) AS x(account,lane,vid,score) "
