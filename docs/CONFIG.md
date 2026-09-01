@@ -68,9 +68,9 @@ which is what it did before multi-user.
 | `lanes` | `all` | `all`, or a list of lane ids. Order is always the file's, so mix lanes still run last |
 | `overrides` | `{}` | `{lane-id: {key: value}}` — lane keys changed for this account only |
 
-An override patch merges into `shuffle`, `subscription` and `mix` key by key, so
-setting one of their keys keeps the rest. Every other block, `seed` included, is
-replaced whole.
+An override patch merges into `shuffle`, `subscription`, `mix` and `consensus`
+key by key, so setting one of their keys keeps the rest. Every other block,
+`seed` included, is replaced whole.
 
 ### `defaults`
 
@@ -81,10 +81,11 @@ Any lane key, applied to every lane. A lane overrides any of them.
 A list. Every lane needs `id` and `title`; everything else falls back to
 `defaults`, then to the built-in below.
 
-⚠️ **A lane's `policy` decides which keys are read at all.** `last_played` reads
-only `id`, `title`, `size`, `fetch_cap`, `privacy`, `min_watched`, `shuffle`,
-`seed`, `dedupe_songs` and `played_decay`. `mix` reads those universals plus
-`exclude_watched` and `mix`. Everything under Turnover and Candidate rules
+⚠️ **A lane's `policy` decides which keys are read at all.** The universals are
+`id`, `title`, `size`, `fetch_cap`, `privacy`, `min_watched` and `shuffle`.
+`last_played` reads those plus `seed`, `dedupe_songs` and `played_decay`; `mix`
+reads them plus `exclude_watched` and `mix`; `consensus` reads them plus
+`consensus` and nothing else. Everything under Turnover and Candidate rules
 below, plus `expand`, `filter` and the `expand`-specific keys, is **`refill`
 only**. `init` and `run` name any inert key a lane sets:
 `lane music-watched: policy last_played never reads ttl_days`.
@@ -93,7 +94,7 @@ only**. `init` and `run` name any inert key a lane sets:
 |---|---|---|
 | `id` | — | **Required.** stable key for state, overrides and `--lane` |
 | `title` | — | **Required.** the playlist title Invidious shows |
-| `policy` | `refill` | `refill` \| `last_played` \| `mix` — see [README](../README.md#what-a-lane-is) |
+| `policy` | `refill` | `refill` \| `last_played` \| `mix` \| `consensus` — see [README](../README.md#what-a-lane-is) |
 | `expand` | `recommended` | where candidates come from: `recommended` \| `channel_latest` \| `subscription_feed` \| `none` |
 | `size` | `30` | videos the lane holds |
 | `min_watched` | `0` | skip this lane for an account with fewer watched videos than this. The gate for auto-enrolment — no state to flip, the lane appears once the history exists |
@@ -181,6 +182,45 @@ a spent source simply stops being eligible and the others take its share.
 
 Filtering is per **viewer**, not per source: whatever anyone contributed is
 dropped if this viewer already watched it or blocked its channel.
+
+#### `consensus`
+
+`policy: consensus` compiles **one** playlist out of every account's mix and
+weights a video by how many of those mixes hold it, under the lane's
+`consensus:` key. Like `mix` it rebuilds from its sources every run, reads them
+over SQL, spends **nothing from the fetch budget** and never needs another
+account's session; and like `mix` it is one DELETE and one POST per video
+upstream.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `sources` | `[{users: all, lane: home-mix}]` | list of `{lane}`, `{user, lane}` or `{users: all, lane}`, read exactly as `mix.sources` is. `share` is not read: this policy scores, it does not divide slots |
+| `rank_offset` | `4.0` | the *k* in `1 / (rank + k)`, one video's weight from one mix. Must be above zero. Lower pins the head of each mix in place; higher flattens the mix's own order until only agreement counts |
+| `agreement_power` | `1.0` | exponent on the number of mixes holding a video. `1.0` doubles what two accounts agree on, `0.0` turns agreement off and leaves the depth sum |
+
+The weight of a video is `1 / (rank + k)` summed over every mix holding it,
+times `holders ** agreement_power`; the playlist is then a weighted sample
+without replacement of `size` videos. So agreement **raises** a video's weight
+rather than gating its inclusion — with the defaults, a video two mixes hold at
+rank 4 outweighs another account's top pick, and a video only one account holds
+is unlikely rather than excluded.
+
+Three things follow from the feed having no viewer:
+
+- **No watch-history filter.** There is no viewer whose history it could be, so
+  `exclude_watched` is not read.
+- **The blocklist is the union of every managed account's.** A channel anyone
+  blocked is a bad thing to greet a stranger with.
+- **The draw is fresh every hour.** The reorder redraws the whole order from the
+  same weights and ages no fatigue counter — nothing is pinned in place, because
+  a public playlist has no one viewer to disorient. Membership stays the nightly
+  run's call, exactly as for `mix`.
+
+Give the lane `privacy: public` if visitors are to see it. Scope it to **one
+account**: with `auto_enrol` every account is given every lane, so name the
+owner in `users:` and leave the consensus lane out of `auto_enrol.lanes`, or the
+instance grows one copy of the feed per account. Pointing `popular_playlists` at
+its plid is a compose change, not a setting here.
 
 #### `shuffle`
 

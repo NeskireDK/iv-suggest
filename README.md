@@ -30,13 +30,14 @@ One playlist plus the rules that fill it. A new genre is a new block in
     sample_pool: 30
 ```
 
-Three policies, plus an hourly reorder that costs no fetches:
+Four policies, plus an hourly reorder that costs no fetches:
 
 | `policy` | Behaviour |
 |---|---|
 | `refill` | score candidates, top the lane up to `size`, retire the stale |
 | `last_played` | hold the N most recently *played* videos of a genre |
 | `mix` | interleave other lanes — or other accounts' lanes — by share of output |
+| `consensus` | one feed compiled from every account's mix, weighted by how many of them hold a video and redrawn every hour |
 
 Four ways to find candidates:
 

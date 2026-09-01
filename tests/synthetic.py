@@ -152,8 +152,13 @@ NEWCOMER = Account("synth-newcomer", range(170, 186), 600, subscriptions=8)
 
 HOUSEHOLD = (ALICE, BOB, COLD, THIN, JUST_OVER, TWIN, LONER)
 
+BOT = Account("synth-bot", (), 0)
+CONTRIBUTORS = (ALICE, TWIN, BOB, LONER)
+
 LANES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "synthetic_lanes.yml")
+CONSENSUS_LANES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "synthetic_consensus_lanes.yml")
 
 # Column order and types as `\d` reports them on a live instance. Hand written
 # rather than dumped, so it can hold no real row. suggest.* is absent on purpose:
@@ -587,6 +592,11 @@ class Instance:
         """One nightly run, as the timer would fire it."""
         self.log.append("=== iv-suggest run %s ===" % sorted(over.items()))
         return self.engine.cmd_run(Args(**over))
+
+    def hour(self, **over):
+        """One hourly reorder, as the shuffle timer would fire it."""
+        self.log.append("=== iv-suggest shuffle %s ===" % sorted(over.items()))
+        return self.engine.cmd_shuffle(Args(**over))
 
     def metrics(self):
         """`iv-suggest metrics` output as a list of sample lines."""

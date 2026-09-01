@@ -1,0 +1,49 @@
+# Lanes for the consensus feed harness (tests/test_synthetic_consensus.py).
+#
+# A second file rather than a lane added to synthetic_lanes.yml: the public feed
+# lives on one account while every other account contributes a home-mix, which
+# is a different enrolment shape from the household file's, and mixing the two
+# would make either file's assertions depend on the other's accounts.
+
+blocklist:
+  playlist: Blocked
+  channels: []
+
+# The contributors are auto-enrolled and get no consensus lane: one copy of the
+# public feed, on the account below, is the whole point.
+auto_enrol:
+  lanes: [suggested, home-mix]
+  exclude: []
+
+users:
+  - email: synth-bot@synthetic.invalid
+    lanes: [public]
+
+defaults:
+  size: 8
+  seed: {limit: 4}
+  fetch_cap: 10
+  sample_pool: 0
+  refresh_per_day: 0
+  min_watched: 0
+
+lanes:
+  - id: suggested
+    title: "Suggested"
+    expand: recommended
+
+  - id: home-mix
+    title: "Home mix"
+    policy: mix
+    size: 8
+    mix:
+      sources:
+        - {lane: suggested, share: 1.0}
+
+  # Names no account and no source: the default source is every account's
+  # home-mix, so a member registered later joins the feed on its own.
+  - id: public
+    title: "Public"
+    policy: consensus
+    size: 6
+    privacy: public
