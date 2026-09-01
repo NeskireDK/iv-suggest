@@ -947,10 +947,7 @@ def retire_item(lane_id, plid, video, cooldown_days=0, reason=""):
 
 def add_to_lane(lane_id, plid, vid, score, song, fetcher):
     """Add one video to a lane and track it. False when Invidious refused the add.
-
-    Invidious resolves the video as it writes the playlist row, so a candidate
-    upstream cannot parse fails HERE and nowhere earlier.
-    """
+    Invidious resolves the video as it writes the row, so a bad candidate fails only here."""
     try:
         api("POST", "/api/v1/auth/playlists/%s/videos" % plid, {"videoId": vid})
     except urllib.error.HTTPError as e:
@@ -989,10 +986,7 @@ def run_lane(lane, run):
 
 def adopted_item_state(lane_id, current, dry):
     """Age and score per playlist entry, adopting any the state has no row for.
-
-    A crash landing between the add call and the state write leaves an entry
-    with no age, which the TTL sweep could then never reach.
-    """
+    Adopted because a crash between the add and the state write leaves an ageless entry."""
     rows = query("SELECT vid, to_char(added,'YYYY-MM-DD'), extract(epoch FROM added), "
                  "coalesce(score,0) FROM suggest.items "
                  "WHERE account=%s AND lane=%s;" % (acct(), lit(lane_id)))
@@ -1015,10 +1009,7 @@ def adopted_item_state(lane_id, current, dry):
 
 def why_it_leaves(v, lane, run, added_at, ttl_cutoff):
     """Why this entry leaves the lane tonight, or None to keep it.
-
-    Blocked is tested first: a channel blocked today has to go tonight rather
-    than in `ttl_days` time.
-    """
+    Blocked is tested first: it is the one reason that carries no cooldown."""
     if v.get("authorId") in run.blocked:
         return "blocked"
     if lane["exclude_watched"] and v["videoId"] in run.watched_set:
@@ -1029,12 +1020,7 @@ def why_it_leaves(v, lane, run, added_at, ttl_cutoff):
 
 
 def oldest_survivors(keep, lane, added_ts, item_score):
-    """The ids a forced daily turnover retires, oldest and lowest scoring first.
-
-    Without a quota a slot frees up only on a watch or on the TTL, and the TTL
-    fires for the whole lane at once because the lane was filled at once; the
-    daily drip is what spreads the ages back out.
-    """
+    """The ids a forced daily turnover retires, oldest and lowest scoring first."""
     rotate = min(lane["refresh_per_day"], max(0, len(keep) - lane["keep_min"]))
     if rotate <= 0:
         return set()
@@ -1070,11 +1056,7 @@ def sweep_lane(lane, current, plid, run):
 
 
 def blocked_without_a_fetch(vid, run):
-    """Whether the cache alone already says this video's channel is blocked.
-
-    Cache only, deliberately: an unknown seed is still worth expanding, and the
-    candidate filter catches its recommendations later.
-    """
+    """Whether the cache alone already says this video's channel is blocked."""
     return (run.fetcher.meta.get(vid) or {}).get("authorId") in run.blocked
 
 
@@ -1113,11 +1095,7 @@ def pick_seeds(lane, run):
 
 
 def is_too_old(rec, cutoff):
-    """Whether a listing entry predates the cutoff.
-
-    Free to ask: a listing carries `published`, so an age filter costs no extra
-    fetch.
-    """
+    """Whether a listing entry predates the cutoff. Free: a listing carries `published`."""
     if not cutoff:
         return False
     published = parse_published(rec)
@@ -1126,10 +1104,7 @@ def is_too_old(rec, cutoff):
 
 def channels_to_read(watch_counts, most):
     """A weighted draw over the watched channels, capped at `most`.
-
-    Weighted rather than the plain top N, so a channel watched twice still gets
-    a turn now and then instead of never.
-    """
+    Weighted, not the plain top N, so a channel watched twice still gets a turn."""
     drawn = sorted(watch_counts.items(),
                    key=lambda kv: -(random.random() ** (1.0 / max(kv[1], 1))))
     return drawn[:most]
@@ -1137,10 +1112,7 @@ def channels_to_read(watch_counts, most):
 
 def rank_derived_score(rank):
     """A score from feed position rather than from raw views.
-
-    The hourly shuffle multiplies score by fatigue and jitter, and a
-    seven-figure view count would swamp both.
-    """
+    Raw views would swamp the hourly shuffle's fatigue and jitter multipliers."""
     return 10.0 * (0.99 ** rank)
 
 
@@ -1171,10 +1143,7 @@ def expand_by_recommendation(lane, seeds, room, run):
 
 def expand_by_channel_uploads(lane, seeds, room, run):
     """New uploads from channels in the history the account never subscribed to.
-
-    The recommendation graph only recycles videos that already existed, so this
-    is the one source that can offer something published since the last run.
-    """
+    The only source of a video published since the last run: the graph recycles."""
     scores, meta_seen = {}, {}
     watch_counts = {}
     for vid in seeds:
@@ -1207,11 +1176,7 @@ def expand_by_channel_uploads(lane, seeds, room, run):
 
 
 def expand_by_subscription_feed(lane, seeds, room, run):
-    """The subscription feed table, straight over SQL and costing no YouTube fetch.
-
-    Its `kind` column is what makes a Shorts-only or live-only lane possible,
-    and `views` comes free from the channel RSS.
-    """
+    """The subscription feed table, straight over SQL and costing no YouTube fetch."""
     scores, meta_seen = {}, {}
     sub_cfg = lane["subscription"]
     kinds = [k for k in (sub_cfg.get("kinds") or ["video"]) if k in SUB_KINDS]
@@ -1268,12 +1233,7 @@ def expand_candidates(lane, seeds, room, run):
 
 
 def videos_on_cooldown(lane_id, drop):
-    """Ids the lane may not offer again yet, including the ones it dropped this run.
-
-    A real run has already written cooldown rows for its own drops; a dry run
-    has not, and would otherwise show a video rotating out and coming straight
-    back in.
-    """
+    """Ids the lane may not offer again yet, including the ones it dropped this run."""
     held = {r[0] for r in query(
         "SELECT vid FROM suggest.cooldown "
         "WHERE account=%s AND lane=%s AND until > now();" % (acct(), lit(lane_id)))}
@@ -1286,12 +1246,7 @@ def sample_pool_of(lane):
 
 
 def weighted_sample(ranked, pool):
-    """The top `pool` candidates reordered by Efraimidis-Spirakis, and how many moved.
-
-    A strict top N hands back the same videos night after night, because the
-    score order barely moves between runs even when hundreds of candidates
-    scored nearly as well.
-    """
+    """The top `pool` candidates reordered by Efraimidis-Spirakis, and how many moved."""
     if pool <= 1 or len(ranked) <= 1:
         return ranked, 0
     head, tail = ranked[:pool], ranked[pool:]
@@ -1300,11 +1255,7 @@ def weighted_sample(ranked, pool):
 
 
 def genre_check_cap(room):
-    """How many candidates a genre lane may look up before it gives up for this run.
-
-    Generous, because the rejection rate is high; the real cost guard is the
-    lane's fetch_cap.
-    """
+    """How many candidates a genre lane may look up before it gives up for this run."""
     return max(20, room * 3)
 
 
