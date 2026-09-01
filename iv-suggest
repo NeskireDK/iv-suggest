@@ -66,12 +66,7 @@ _ENV = _envfile()
 
 
 def setting(name, default=""):
-    """A setting from the real environment, else ENVFILE, else the default.
-
-    The file is read as well as the environment because the systemd units call
-    this script directly, with no EnvironmentFile — so a value set only in the
-    environment would be present interactively and absent from the nightly run.
-    """
+    """A setting from the real environment, else ENVFILE, else the default."""
     return os.environ.get(name) or _ENV.get(name) or default
 
 
@@ -145,6 +140,7 @@ BLOCKLIST_DEFAULTS = {
 # Rate limit, global for the whole run. 20 per minute = one call every 3 s.
 RATE_PER_MIN = 20
 MAX_FETCHES = 320
+DAYS_BEFORE_RETRYING_A_BROKEN_VIDEO = 30
 MAX_CONSECUTIVE_FAILS = 5
 DRY_SEEDS = 10          # a dry run uses few seeds; the nightly run uses the config
 
@@ -293,11 +289,7 @@ def _flatten(text):
 
 
 def parse_song(title, author=""):
-    """Return (artist, song_key) for "Artist - Title (qualifiers)". Artist may be empty.
-
-    The key is the flattened TITLE alone, because a re-upload channel often
-    replaces the artist ("American Pie Song" by "Hit Usa songs").
-    """
+    """Return (artist, song_key) for "Artist - Title (qualifiers)". Artist may be empty."""
     raw = _BRACKETS_RE.sub(" ", title or "").split("|")[0].lstrip("@# ")
     parts = _SPLIT_RE.split(raw)
     if len(parts) >= 2 and len(_flatten(parts[0])) >= 2:
@@ -319,8 +311,10 @@ def upload_quality(title, author):
     """Lower is better. Picks the artist's own upload over a re-upload."""
     artist, _ = parse_song(title, author)
     chan = _flatten(re.sub(r"(?i)vevo|official|topic", " ", author or "")).replace(" ", "")
-    if artist and chan and (artist == chan or artist in chan or chan in artist):
-        return 0                                   # the artist's own channel
+    is_the_artists_own_channel = bool(
+        artist and chan and (artist == chan or artist in chan or chan in artist))
+    if is_the_artists_own_channel:
+        return 0
     if re.search(r"(?i)\bofficial\b", title or ""):
         return 1
     return 2
@@ -363,14 +357,17 @@ def lit(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _typed_views_literal(views):
+    """A views value for a VALUES row, cast so an all-NULL batch still reads as bigint.
+    Postgres types such a column from its literals, not from the insert target."""
+    if isinstance(views, (int, float)):
+        return str(int(views))
+    return "NULL::bigint"
+
+
 def parse_published(rec):
     """Unix seconds from a listing's `published`, or 0 when it carries none.
-
-    The two listings disagree on the type: `channels/latest` gives unix
-    seconds, `recommendedVideos` gives an RFC3339 string derived from the
-    relative "21 hours ago" text (so it is approximate, which is fine for a
-    day-scale cutoff). Comparing the string against a float raises.
-    """
+    `channels/latest` sends unix seconds, `recommendedVideos` an RFC3339 string."""
     pub = rec.get("published")
     if isinstance(pub, (int, float)):
         return float(pub)
@@ -394,15 +391,8 @@ def listing_meta(rec):
 
 
 def parse_views(rec):
-    """A numeric view count from a listing that may only carry the text form.
-
-    /api/v1/videos carries a numeric ``viewCount``; the ``recommendedVideos``
-    and ``channels/latest`` listings carry only ``viewCountText`` ("154K",
-    "8.9K", "2,471,179 views"). The Trending/Popular feed reads the number from
-    suggest.video_meta.views, so a candidate that only ever came through those
-    two listings would show 0 for ever. Parse the text as a free fallback (no
-    extra fetch); return None when neither field is usable.
-    """
+    """A view count from a listing that may carry only the text form ("154K"), else None.
+    Free: `recommendedVideos` and `channels/latest` omit the numeric `viewCount`."""
     v = rec.get("viewCount")
     if isinstance(v, (int, float)):
         return int(v)
@@ -433,12 +423,7 @@ def load_token():
 
 
 def session_of(email):
-    """The bot's session for an account, or "" when it has none yet.
-
-    Checked against session_ids on the way out, so a session the account has
-    since signed out of reads as absent and is issued again, instead of being
-    used to make every call fail.
-    """
+    """The bot's session for an account, or "" when its sid no longer joins session_ids."""
     if not email:
         return ""
     return one("SELECT a.sid FROM suggest.accounts a "
@@ -479,6 +464,26 @@ def api(method, path, body=None):
     return json.loads(raw) if raw else None
 
 
+def unfetchable_videos():
+    """Ids no run should try again, so none re-pays the timeouts they already cost."""
+    return {r[0] for r in query(
+        "SELECT vid FROM suggest.video_dead WHERE until > now();")}
+
+
+def cached_video_meta():
+    """The permanent metadata cache, keyed by video id."""
+    return {vid: {"genre": genre or None,
+                  "seconds": int(seconds) if seconds else 0,
+                  "authorId": author_id or None, "author": author,
+                  "title": title or "",
+                  "views": int(views) if views else None,
+                  "genre_known": genre_known == "t"}
+            for vid, genre, seconds, author_id, title, author, views, genre_known
+            in query("SELECT vid, genre, seconds, author_id, title, "
+                     "coalesce(author,''), views, coalesce(genre_known,true) "
+                     "FROM suggest.video_meta;")}
+
+
 class Fetcher:
     """Paces and caches every call that can reach YouTube."""
 
@@ -493,20 +498,8 @@ class Fetcher:
         self.dead_hits = 0
         self.lane_cap = None
         self.lane_used = 0
-        # Videos that could not be fetched. Without this every run pays the same
-        # three seconds again for the same handful of broken ids, for ever.
-        self.dead = {r[0] for r in query(
-            "SELECT vid FROM suggest.video_dead WHERE until > now();")}
-        self.meta = {}
-        for vid, genre, seconds, author_id, title, author, views, gk in query(
-                "SELECT vid, genre, seconds, author_id, title, coalesce(author,''), views, "
-                "coalesce(genre_known,true) FROM suggest.video_meta;"):
-            self.meta[vid] = {"genre": genre or None,
-                              "seconds": int(seconds) if seconds else 0,
-                              "authorId": author_id or None, "author": author,
-                              "title": title or "",
-                              "views": int(views) if views else None,
-                              "genre_known": gk == "t"}
+        self.dead = unfetchable_videos()
+        self.meta = cached_video_meta()
 
     def _pace(self):
         wait = self.interval - (time.monotonic() - self.last)
@@ -518,10 +511,10 @@ class Fetcher:
         self.lane_cap, self.lane_used = cap, 0
 
     def video(self, vid):
-        """Full API answer. Costs one YouTube fetch. None if the video is gone."""
+        """Full API answer, or None when the video is gone or upstream cannot parse it."""
         if vid in self.dead:
             self.dead_hits += 1
-            return None                          # known bad, costs nothing
+            return None
         if self.fetches >= self.budget:
             raise BudgetSpent("run budget %d spent" % self.budget)
         if self.lane_cap and self.lane_used >= self.lane_cap:
@@ -537,30 +530,32 @@ class Fetcher:
                 if data and not data.get("error"):
                     self._remember(vid, data)
                     return data
-                self.bury(vid, 30, "no such video")
-                return None                      # upstream says: no such video
+                self.bury(vid, DAYS_BEFORE_RETRYING_A_BROKEN_VIDEO, "no such video")
+                return None
             except urllib.error.HTTPError as e:
                 self.fetches += 1
                 if e.code in (404, 410):
                     self.fails = 0
                     self.bury(vid, 365, "http %d" % e.code)
                     return None
-                # A 500 on one video is an upstream parser bug, not an outage.
-                # Ask the health endpoint which of the two this is. Bury it for a
-                # month only: a Watchtower update may well fix the parser.
-                if e.code >= 500 and self._alive():
+                if self._is_a_parser_bug_not_an_outage(e):
                     self.fails = 0
                     self.skipped_500 += 1
-                    self.bury(vid, 30, "upstream 500")
+                    self.bury(vid, DAYS_BEFORE_RETRYING_A_BROKEN_VIDEO,
+                              "upstream 500")
                     log("  skipping %s (upstream 500, Invidious is healthy)" % vid)
                     return None
                 self._trouble(e, delay)
                 delay *= 2
-            except Exception as e:               # timeout, connection reset
+            except Exception as e:
                 self.fetches += 1
                 self._trouble(e, delay)
                 delay *= 2
         return None
+
+    def _is_a_parser_bug_not_an_outage(self, error):
+        """True when Invidious is healthy but fails on this one video."""
+        return error.code >= 500 and self._alive()
 
     def bury(self, vid, days, reason):
         """Remember a video that cannot be fetched, so no later run retries it."""
@@ -572,11 +567,7 @@ class Fetcher:
                 % (lit(vid), days, lit(reason)))
 
     def channel_latest(self, ucid):
-        """Recent uploads of one channel: one fetch for about 60 videos.
-
-        Far cheaper per candidate than /api/v1/videos, and unlike the
-        recommendation graph it returns content that did not exist yesterday.
-        """
+        """Recent uploads of one channel: one fetch for about 60 videos."""
         if self.fetches >= self.budget:
             raise BudgetSpent("run budget %d spent" % self.budget)
         if self.lane_cap and self.lane_used >= self.lane_cap:
@@ -638,36 +629,16 @@ class Fetcher:
                views_lit))
 
     def remember_partial(self, entries):
-        """Persist metadata that came free with a listing, for many videos at once.
-
-        A recommendation or channel listing carries the view count, title, author
-        and length — everything the Trending/Popular feed reads (it looks view
-        counts up in `suggest.video_meta`). Dropping them was why videos added
-        from those two sources showed no view count on the feed page while the
-        watch page, which asks upstream live, showed the real number.
-
-        `genre` is the one field a listing does NOT carry, so a new row is marked
-        `genre_known = false` and a genre lane still verifies it upstream. An
-        existing complete row keeps its genre and its flag: only the cheap fields
-        are refreshed.
-        """
+        """Persist the metadata a listing carries free, for many videos at once.
+        No genre: a new row is marked `genre_known = false`, an existing one keeps its own."""
         rows = []
         for vid, m in entries:
             if not m:
                 continue
-            views = m.get("views")
-            # `views` must be cast, not left as a bare NULL. This is an
-            # INSERT ... SELECT over a VALUES-derived table, so Postgres infers
-            # each column's type from the literals rather than from the target
-            # column. A batch where *every* listing lacked a viewCount gives an
-            # all-NULL column, which resolves to text, and the insert dies with
-            # `column "views" is of type bigint but expression is of type text`.
-            # One row carrying a real number hid the bug the rest of the time.
             rows.append("(%s,%s,%s,%s,%s,%s)" % (
                 lit(vid), int(m.get("seconds") or 0), lit(m.get("authorId")),
                 lit((m.get("title") or "")[:300]), lit((m.get("author") or "")[:120]),
-                str(int(views)) if isinstance(views, (int, float))
-                else "NULL::bigint"))
+                _typed_views_literal(m.get("views"))))
             cached = self.meta.setdefault(vid, dict(m))
             cached.setdefault("genre", None)
             cached.setdefault("genre_known", False)
@@ -694,11 +665,7 @@ class Fetcher:
 
     def meta_of(self, vid):
         """Metadata including a real genre, from the cache or from one paced fetch.
-
-        A `genre_known = false` row counts as a MISS here: it was filled in from a
-        listing that carries no genre, and returning it would make every genre
-        lane reject the video for ever without once asking upstream.
-        """
+        A `genre_known = false` row is a MISS, or a genre lane would never ask upstream."""
         m = self.meta.get(vid)
         if m and m.get("genre_known", True):
             self.cache_hits += 1
@@ -708,9 +675,10 @@ class Fetcher:
 
 
 def log(msg):
+    """Print one line. A closed pipe (`iv-suggest status | head`) ends the run quietly."""
     try:
         print(msg, flush=True)
-    except BrokenPipeError:        # `iv-suggest status | head` is normal use
+    except BrokenPipeError:
         os._exit(0)
 
 
@@ -728,14 +696,7 @@ def read_config():
 
 
 def merge_lane(base, patch):
-    """Lane settings with `patch` applied, merging the nested blocks key by key.
-
-    A patch that sets `shuffle: {jitter: 0}` must keep the other shuffle keys:
-    replacing the block wholesale leaves rank_items() without `fatigue`, which
-    raises inside the per-lane try/except and silently stops that lane
-    reordering for good. `seed` is deliberately absent from the merged blocks
-    and CONFIG.md commits to that: a seed patch replaces the block.
-    """
+    """Lane settings with `patch` applied, merging MERGED_LANE_BLOCKS key by key."""
     merged = dict(base)
     merged.update(patch)
     for block in MERGED_LANE_BLOCKS:
@@ -803,19 +764,7 @@ def named_users(cfg):
 
 
 def load_users():
-    """The accounts to manage, as [{email, lanes, overrides}, ...].
-
-    With no `auto_enrol:` block only the accounts written out in `users:` are
-    touched, and no block at all means the single IV_SUGGEST_ACCOUNT with every
-    lane -- exactly what a config written before multi-user did.
-
-    Writing `auto_enrol:` reverses that and takes in every account on the
-    instance,
-    including ones registered later. A `users:` entry still wins, so listing
-    somebody is how you give them different lanes rather than how you opt them
-    in. Lanes they cannot fill yet are held back by `min_watched`, so enrolment
-    does not hand a new account a dozen empty playlists.
-    """
+    """The accounts to manage, as [{email, lanes, overrides}, ...]."""
     if "users" in _CONFIG_CACHE:
         return _CONFIG_CACHE["users"]
     cfg = read_config()
@@ -838,32 +787,14 @@ def load_users():
 
 
 def enrolled_lanes(user, all_lanes):
-    """The lanes this account qualifies for right now, history gate applied.
-
-    Every reader of a lane list has to ask the same question the filler asks.
-    Asking it without the gate reports lanes the filler will skip, which is how
-    an auto-enrolled account with no history raised twelve "lane has not run"
-    alerts on the night it was added.
-    """
+    """The lanes this account qualifies for now, with the min_watched gate applied.
+    Every reader of a lane list needs the gate, or it names lanes the filler will skip."""
     return lanes_for(user, all_lanes, watch_count(user["email"]))
 
 
 def lanes_for(user, lanes, watched=None):
     """The lanes one account gets, in lanes.yml order, with its overrides applied.
-
-    `lanes: all` is for the account that wants the whole library; everyone else
-    names the few they want, because a three-lane household member does not
-    need Shorts, Live streams and two mixes.
-
-    The order is lanes.yml's, never the user's list: mix lanes have to run after
-    the lanes they read, and that ordering is a property of the config, not of
-    who is being filled.
-
-    Pass `watched` to drop the lanes this account has too little history to
-    fill. That is what keeps auto-enrolment from handing a new account a dozen
-    playlists that come back empty; the lanes appear on their own once the
-    history is there.
-    """
+    Pass `watched` to also drop the lanes it has too little history to fill."""
     want = user.get("lanes", "all")
     if want != "all":
         want = set(want or [])
@@ -882,11 +813,7 @@ def lanes_for(user, lanes, watched=None):
 
 def overridden_lane(lane, patch):
     """One lane with a per-user patch applied, its inert-key list recomputed.
-
-    Without the recompute an override that sets a key the policy never reads is
-    the one place `ignored` cannot warn about, which is the case most likely to
-    be written by hand and never noticed.
-    """
+    Recomputed because an override is the one place `ignored` would not warn."""
     merged = merge_lane(lane, patch)
     merged["ignored"] = sorted(
         set(lane.get("ignored") or []) | set(ignored_keys(merged["policy"], patch)))
@@ -894,12 +821,7 @@ def overridden_lane(lane, patch):
 
 
 def account_order(users):
-    """Accounts least-recently-succeeded first.
-
-    The fetch budget is global and divided, so whoever is served last is the one
-    an exhausted budget starves. Rotating on the last successful run means that
-    is a different account each night instead of the same one for ever.
-    """
+    """Accounts least-recently-succeeded first, so a spent budget starves a different one."""
     seen = dict((r[0], float(r[1] or 0)) for r in query(
         "SELECT account, extract(epoch FROM max(started)) FROM suggest.runs "
         "WHERE coalesce(error,'') = '' GROUP BY 1;"))
@@ -907,14 +829,14 @@ def account_order(users):
 
 
 def read_user():
+    """This account's watch history, newest last, and its subscription ucids.
+    A missing account raises rather than exits, so one bad `users:` entry costs only itself."""
     if not ACCOUNT:
         sys.exit("set IV_SUGGEST_ACCOUNT to the Invidious account to fill "
                  "(the value in users.email)")
     row = query("SELECT array_to_string(watched,' '), array_to_string(subscriptions,' ') "
                 "FROM users WHERE email=%s;" % lit(ACCOUNT))
     if not row:
-        # Aborted, not exit: a typo in one users: entry must not cost the
-        # accounts that are spelled correctly their nightly run.
         raise Aborted("no Invidious account %s" % ACCOUNT)
     watched = row[0][0].split() if row[0][0] else []
     subs = set(row[0][1].split()) if len(row[0]) > 1 and row[0][1] else set()
@@ -922,33 +844,13 @@ def read_user():
 
 
 def read_blocked():
-    """Channel ids no lane may offer, as {ucid: channel name}.
-
-    Two sources, unioned. The first is a plain Invidious playlist on the bot's
-    own account: every client can already add a video to a playlist, and the
-    playlist is server side, so the list needs no new endpoint, no fork change
-    and no per-device sync. A video is only a handle on its channel here — one
-    entry blocks everything that channel publishes, and the entry can stay in
-    the playlist as the record of why. The second is `blocklist.channels` in
-    the config, for a channel with no video convenient to tap.
-
-    A lane playlist is excluded by id: naming a lane "Blocked" would otherwise
-    feed the lane's own contents back as a blocklist and empty it.
-    """
+    """Channel ids no lane may offer, as {ucid: channel name}: the playlist plus the config."""
     cfg = dict(BLOCKLIST_DEFAULTS)
     cfg.update(read_config().get("blocklist") or {})
     blocked = {}
     title = (cfg.get("playlist") or "").strip()
     if title and ACCOUNT:
-        for ucid, author in query(
-                "SELECT DISTINCT coalesce(pv.ucid,''), coalesce(pv.author,'') "
-                "FROM playlists p JOIN playlist_videos pv ON pv.plid = p.id "
-                "WHERE p.author=%s AND lower(p.title)=lower(%s) "
-                # Every account's lanes, deliberately: a playlist id is unique
-                # instance wide, so scoping this would let one account's
-                # "Blocked" playlist swallow another account's lane.
-                "AND p.id NOT IN (SELECT plid FROM suggest.lanes);"
-                % (lit(ACCOUNT), lit(title))):
+        for ucid, author in channels_tapped_by_playlist(title):
             if ucid:
                 blocked[ucid] = author or ucid
     for ucid in cfg.get("channels") or []:
@@ -956,10 +858,26 @@ def read_blocked():
     return blocked
 
 
+def channels_tapped_by_playlist(title):
+    """(ucid, author) of every video in this account's playlist of that title.
+    Lanes are excluded across every account: a plid is unique instance wide."""
+    return query("SELECT DISTINCT coalesce(pv.ucid,''), coalesce(pv.author,'') "
+                 "FROM playlists p JOIN playlist_videos pv ON pv.plid = p.id "
+                 "WHERE p.author=%s AND lower(p.title)=lower(%s) "
+                 "AND p.id NOT IN (SELECT plid FROM suggest.lanes);"
+                 % (lit(ACCOUNT), lit(title)))
+
+
 def lane_plid(account, lane_id):
     """The playlist id of one account's lane, or "" when it has none yet."""
     return one("SELECT plid FROM suggest.lanes WHERE account=%s AND lane=%s;"
                % (lit(account), lit(lane_id)))
+
+
+def force_privacy(plid, title, privacy):
+    """Re-apply privacy after a create, which Invidious ignores and stores Public."""
+    api("PATCH", "/api/v1/auth/playlists/" + plid,
+        {"title": title, "privacy": privacy})
 
 
 def playlist_of(lane, dry):
@@ -982,11 +900,7 @@ def playlist_of(lane, dry):
     made = api("POST", "/api/v1/auth/playlists",
                {"title": title, "privacy": lane["privacy"]})
     plid = made["playlistId"]
-    # Invidious IGNORES privacy on create and stores Public. A public playlist is
-    # readable by anyone who knows the plid, and /api/ carries no Authelia, so
-    # force the value with the update endpoint.
-    api("PATCH", "/api/v1/auth/playlists/" + plid,
-        {"title": title, "privacy": lane["privacy"]})
+    force_privacy(plid, title, lane["privacy"])
     execute("INSERT INTO suggest.lanes(account,lane,plid,title) VALUES (%s,%s,%s,%s);"
             % (acct(), lit(lane_id), lit(plid), lit(title)))
     log("  created the playlist %r (%s)" % (title, plid))
@@ -994,15 +908,7 @@ def playlist_of(lane, dry):
 
 
 def seed_order(watched, seed_cfg):
-    """History ids in the order the seed picker walks them, newest first.
-
-    The default order is the plain history, so the same run picks the same
-    seeds, expands the same recommendations and lands on the same candidates.
-    `shuffle_window: N` draws the N most recent entries in random order instead,
-    which makes the candidate set different every night even if nothing new was
-    watched. `recent: M` pins the M newest in front of the shuffle, so what was
-    just played still leads.
-    """
+    """History ids in the order the seed picker walks them, newest first."""
     hist = list(reversed(watched))
     window = int((seed_cfg or {}).get("shuffle_window") or 0)
     if window < 2:
@@ -1014,11 +920,7 @@ def seed_order(watched, seed_cfg):
 
 
 def cooldown_days_for(lane, why):
-    """Days a swept video is held out; a blocked channel gets none.
-
-    Unblocking a channel has to let its videos back the same night, so the
-    blocklist stays the only thing keeping them out.
-    """
+    """Days a swept video is held out; a blocked channel gets none, so unblocking is instant."""
     if why == "blocked":
         return 0
     return {"watched": lane["watched_cooldown_days"],
@@ -1045,10 +947,7 @@ def retire_item(lane_id, plid, video, cooldown_days=0, reason=""):
 
 def add_to_lane(lane_id, plid, vid, score, song, fetcher):
     """Add one video to a lane and track it. False when Invidious refused the add.
-
-    Invidious resolves the video as it writes the playlist row, so a candidate
-    upstream cannot parse fails HERE and nowhere earlier.
-    """
+    Invidious resolves the video as it writes the row, so a bad candidate fails only here."""
     try:
         api("POST", "/api/v1/auth/playlists/%s/videos" % plid, {"videoId": vid})
     except urllib.error.HTTPError as e:
@@ -1087,10 +986,7 @@ def run_lane(lane, run):
 
 def adopted_item_state(lane_id, current, dry):
     """Age and score per playlist entry, adopting any the state has no row for.
-
-    A crash landing between the add call and the state write leaves an entry
-    with no age, which the TTL sweep could then never reach.
-    """
+    Adopted because a crash between the add and the state write leaves an ageless entry."""
     rows = query("SELECT vid, to_char(added,'YYYY-MM-DD'), extract(epoch FROM added), "
                  "coalesce(score,0) FROM suggest.items "
                  "WHERE account=%s AND lane=%s;" % (acct(), lit(lane_id)))
@@ -1111,37 +1007,42 @@ def adopted_item_state(lane_id, current, dry):
     return added_at, added_ts, item_score
 
 
+def why_it_leaves(v, lane, run, added_at, ttl_cutoff):
+    """Why this entry leaves the lane tonight, or None to keep it.
+    Blocked is tested first: it is the one reason that carries no cooldown."""
+    if v.get("authorId") in run.blocked:
+        return "blocked"
+    if lane["exclude_watched"] and v["videoId"] in run.watched_set:
+        return "watched"
+    if ttl_cutoff and added_at.get(v["videoId"], "9999") < ttl_cutoff:
+        return "expired"
+    return None
+
+
+def oldest_survivors(keep, lane, added_ts, item_score):
+    """The ids a forced daily turnover retires, oldest and lowest scoring first."""
+    rotate = min(lane["refresh_per_day"], max(0, len(keep) - lane["keep_min"]))
+    if rotate <= 0:
+        return set()
+    stale = sorted(keep, key=lambda vw: (added_ts.get(vw[0]["videoId"], 0.0),
+                                         item_score.get(vw[0]["videoId"], 0.0)))
+    return {vw[0]["videoId"] for vw in stale[:rotate]}
+
+
 def sweep_lane(lane, current, plid, run):
     """What leaves the lane tonight, what stays, and the room that opens up."""
     lane_id = lane["id"]
     added_at, added_ts, item_score = adopted_item_state(lane_id, current, run.dry)
     ttl = lane["ttl_days"]
     old = one("SELECT to_char(now() - interval '%d days','YYYY-MM-DD');" % ttl) if ttl else ""
+
     drop, keep = [], []
     for v in current:
-        vid = v["videoId"]
-        why = None
-        # Blocked first: a channel blocked today must leave the lanes tonight,
-        # not in `ttl_days` time.
-        if v.get("authorId") in run.blocked:
-            why = "blocked"
-        elif lane["exclude_watched"] and vid in run.watched_set:
-            why = "watched"
-        elif ttl and added_at.get(vid, "9999") < old:
-            why = "expired"
+        why = why_it_leaves(v, lane, run, added_at, old)
         (drop if why else keep).append((v, why))
 
-    # Forced turnover. Without it a slot frees up only when a video is watched
-    # (which needs a client that reports playback) or when the TTL fires, and
-    # the TTL fires for the whole lane on the same night because the whole lane
-    # was filled on the same night. Retiring the oldest survivors on a fixed
-    # quota gives the lane a steady daily drip and spreads the ages out, which
-    # is what stops the all-at-once expiry in the first place.
-    rotate = min(lane["refresh_per_day"], max(0, len(keep) - lane["keep_min"]))
-    if rotate > 0:
-        stale = sorted(keep, key=lambda vw: (added_ts.get(vw[0]["videoId"], 0.0),
-                                             item_score.get(vw[0]["videoId"], 0.0)))
-        retire = {vw[0]["videoId"] for vw in stale[:rotate]}
+    retire = oldest_survivors(keep, lane, added_ts, item_score)
+    if retire:
         drop.extend((v, "rotated") for v, _ in keep if v["videoId"] in retire)
         keep = [vw for vw in keep if vw[0]["videoId"] not in retire]
 
@@ -1152,6 +1053,11 @@ def sweep_lane(lane, current, plid, run):
     room = lane["size"] - len(keep)
     log("  swept %d, kept %d, room for %d" % (len(drop), len(keep), room))
     return drop, keep, room
+
+
+def blocked_without_a_fetch(vid, run):
+    """Whether the cache alone already says this video's channel is blocked."""
+    return (run.fetcher.meta.get(vid) or {}).get("authorId") in run.blocked
 
 
 def pick_seeds(lane, run):
@@ -1171,9 +1077,7 @@ def pick_seeds(lane, run):
         if len(seeds) >= limit or scan <= 0:
             break
         scan -= 1
-        # Cache only, never a fetch: an unknown seed is worth expanding, and the
-        # candidate check catches its recommendations anyway.
-        if (run.fetcher.meta.get(vid) or {}).get("authorId") in run.blocked:
+        if blocked_without_a_fetch(vid, run):
             continue
         if want_genre:
             try:
@@ -1190,126 +1094,175 @@ def pick_seeds(lane, run):
     return seeds, seed_free
 
 
-def expand_candidates(lane, seeds, room, run):
-    """Candidate ids scored by the lane's expand source, with their listing meta."""
+def is_too_old(rec, cutoff):
+    """Whether a listing entry predates the cutoff. Free: a listing carries `published`."""
+    if not cutoff:
+        return False
+    published = parse_published(rec)
+    return not published or published < cutoff
+
+
+def channels_to_read(watch_counts, most):
+    """A weighted draw over the watched channels, capped at `most`.
+    Weighted, not the plain top N, so a channel watched twice still gets a turn."""
+    drawn = sorted(watch_counts.items(),
+                   key=lambda kv: -(random.random() ** (1.0 / max(kv[1], 1))))
+    return drawn[:most]
+
+
+def rank_derived_score(rank):
+    """A score from feed position rather than from raw views.
+    Raw views would swamp the hourly shuffle's fatigue and jitter multipliers."""
+    return 10.0 * (0.99 ** rank)
+
+
+def expand_by_recommendation(lane, seeds, room, run):
+    """What the recommendation graph offers around each seed, weighted by seed rank."""
     scores, meta_seen = {}, {}
     rec_age = lane["recommend_max_age_days"]
     rec_cutoff = time.time() - rec_age * 86400.0 if rec_age else 0.0
-    if lane["expand"] == "recommended":
-        for rank, vid in enumerate(seeds):
-            try:
-                data = run.fetcher.video(vid)
-            except BudgetSpent as e:
-                log("  %s, expanding only the first %d seeds" % (e, rank))
-                break
-            if not data:
+    for rank, vid in enumerate(seeds):
+        try:
+            data = run.fetcher.video(vid)
+        except BudgetSpent as e:
+            log("  %s, expanding only the first %d seeds" % (e, rank))
+            break
+        if not data:
+            continue
+        weight = 0.97 ** rank
+        for rec in data.get("recommendedVideos") or []:
+            rid = rec.get("videoId")
+            if not rid or not VID_RE.match(rid):
                 continue
-            weight = 0.97 ** rank
-            for rec in data.get("recommendedVideos") or []:
-                rid = rec.get("videoId")
-                if not rid or not VID_RE.match(rid):
-                    continue
-                # `recommendedVideos` carries `published`, so a lane can ask the
-                # graph for recent uploads only and it costs no extra fetch.
-                if rec_cutoff:
-                    pub = parse_published(rec)
-                    if not pub or pub < rec_cutoff:
-                        continue
-                scores[rid] = scores.get(rid, 0.0) + weight
-                meta_seen.setdefault(rid, listing_meta(rec))
-    elif lane["expand"] == "channel_latest":
-        # Channels watched but never subscribed to. The recommendation graph
-        # only ever recycles videos that already existed; this reads what those
-        # channels published since the last run, so the lane gets genuinely new
-        # content without depending on new watch history.
-        counts = {}
-        for vid in seeds:
-            cid = (run.fetcher.meta.get(vid) or {}).get("authorId")
-            if cid and cid not in run.subs and cid not in run.blocked:
-                counts[cid] = counts.get(cid, 0) + 1
-        # Weighted draw, not the plain top N: a channel watched twice still gets
-        # a turn now and then instead of never.
-        picks = sorted(counts.items(),
-                       key=lambda kv: -(random.random() ** (1.0 / max(kv[1], 1))))
-        picks = picks[:lane["max_channels"]]
-        log("  %d unsubscribed channels in the history, taking %d"
-            % (len(counts), len(picks)))
-        cutoff = time.time() - lane["max_age_days"] * 86400.0
-        for rank, (cid, n) in enumerate(picks):
-            try:
-                data = run.fetcher.channel_latest(cid)
-            except BudgetSpent as e:
-                log("  %s, read only the first %d channels" % (e, rank))
-                break
-            for rec in (data or {}).get("videos") or []:
-                rid = rec.get("videoId")
-                if not rid or not VID_RE.match(rid):
-                    continue
-                if rec.get("liveNow") or rec.get("isUpcoming"):
-                    continue
-                pub = parse_published(rec)
-                if pub and pub < cutoff:
-                    continue
-                age = max(0.0, (time.time() - pub) / 86400.0) if pub else 30.0
-                scores[rid] = max(scores.get(rid, 0.0), n * (0.93 ** age))
-                meta_seen.setdefault(rid, listing_meta(rec))
-    elif lane["expand"] == "subscription_feed":
-        # The subscription feed table, straight over SQL: no YouTube fetch at
-        # all. Its `kind` column is what makes a Shorts-only or live-only lane
-        # possible, and `views` comes free from the channel RSS.
-        sub_cfg = lane["subscription"]
-        kinds = [k for k in (sub_cfg.get("kinds") or ["video"]) if k in SUB_KINDS]
-        hours = int(sub_cfg.get("max_age_hours") or 0)
-        rank_by = sub_cfg.get("rank") or "views"
-        # A blocked channel may still be subscribed: the subscription feed is
-        # the one source that reads `subs` directly, so subtract there too.
-        feed_subs = run.subs - set(run.blocked)
-        if not kinds:
-            log("  no valid kinds configured, nothing to do")
-        elif not feed_subs:
-            log("  the account has no subscriptions, nothing to do")
-        else:
-            window = ("AND published > now() - interval '%d hours'" % hours) if hours else ""
-            order = "views DESC NULLS LAST" if rank_by == "views" else "published DESC"
-            rows = query(
-                "SELECT id, coalesce(title,''), coalesce(author,''), coalesce(ucid,''), "
-                "coalesce(length_seconds,0), coalesce(views,0) "
-                "FROM channel_videos WHERE ucid IN (%s) AND kind IN (%s) %s "
-                "ORDER BY %s LIMIT %d;"
-                % (",".join(lit(u) for u in sorted(feed_subs)),
-                   ",".join(lit(k) for k in kinds), window, order,
-                   max(60, room * 12)))
-            log("  %s: %d candidate(s) over %d channel(s), ranked by %s"
-                % (",".join(kinds), len(rows), len(feed_subs), rank_by))
-            for rank, (rid, title, author, ucid, seconds, views) in enumerate(rows):
-                if not VID_RE.match(rid):
-                    continue
-                # A rank-derived score, not the raw view count: the hourly
-                # shuffle multiplies the score by fatigue and jitter, and a
-                # seven-figure weight would swamp both.
-                scores[rid] = 10.0 * (0.99 ** rank)
-                meta_seen.setdefault(rid, listing_meta(
-                    {"lengthSeconds": int(seconds or 0), "authorId": ucid or None,
-                     "author": author, "title": title,
-                     "viewCount": int(views or 0) or None}))
-    else:                                              # expand: none
-        for rank, vid in enumerate(seeds):
-            scores[vid] = 1.0 - rank / 100000.0         # keep the watch order
-            meta_seen[vid] = run.fetcher.meta.get(vid, {})
+            if is_too_old(rec, rec_cutoff):
+                continue
+            scores[rid] = scores.get(rid, 0.0) + weight
+            meta_seen.setdefault(rid, listing_meta(rec))
     return scores, meta_seen
+
+
+def expand_by_channel_uploads(lane, seeds, room, run):
+    """New uploads from channels in the history the account never subscribed to.
+    The only source of a video published since the last run: the graph recycles."""
+    scores, meta_seen = {}, {}
+    watch_counts = {}
+    for vid in seeds:
+        cid = (run.fetcher.meta.get(vid) or {}).get("authorId")
+        if cid and cid not in run.subs and cid not in run.blocked:
+            watch_counts[cid] = watch_counts.get(cid, 0) + 1
+    picks = channels_to_read(watch_counts, lane["max_channels"])
+    log("  %d unsubscribed channels in the history, taking %d"
+        % (len(watch_counts), len(picks)))
+    cutoff = time.time() - lane["max_age_days"] * 86400.0
+    for rank, (cid, watched_times) in enumerate(picks):
+        try:
+            data = run.fetcher.channel_latest(cid)
+        except BudgetSpent as e:
+            log("  %s, read only the first %d channels" % (e, rank))
+            break
+        for rec in (data or {}).get("videos") or []:
+            rid = rec.get("videoId")
+            if not rid or not VID_RE.match(rid):
+                continue
+            if rec.get("liveNow") or rec.get("isUpcoming"):
+                continue
+            published = parse_published(rec)
+            if published and published < cutoff:
+                continue
+            age = max(0.0, (time.time() - published) / 86400.0) if published else 30.0
+            scores[rid] = max(scores.get(rid, 0.0), watched_times * (0.93 ** age))
+            meta_seen.setdefault(rid, listing_meta(rec))
+    return scores, meta_seen
+
+
+def expand_by_subscription_feed(lane, seeds, room, run):
+    """The subscription feed table, straight over SQL and costing no YouTube fetch."""
+    scores, meta_seen = {}, {}
+    sub_cfg = lane["subscription"]
+    kinds = [k for k in (sub_cfg.get("kinds") or ["video"]) if k in SUB_KINDS]
+    hours = int(sub_cfg.get("max_age_hours") or 0)
+    rank_by = sub_cfg.get("rank") or "views"
+    subscribed_and_not_blocked = run.subs - set(run.blocked)
+    if not kinds:
+        log("  no valid kinds configured, nothing to do")
+        return scores, meta_seen
+    if not subscribed_and_not_blocked:
+        log("  the account has no subscriptions, nothing to do")
+        return scores, meta_seen
+    window = ("AND published > now() - interval '%d hours'" % hours) if hours else ""
+    order = "views DESC NULLS LAST" if rank_by == "views" else "published DESC"
+    rows = query(
+        "SELECT id, coalesce(title,''), coalesce(author,''), coalesce(ucid,''), "
+        "coalesce(length_seconds,0), coalesce(views,0) "
+        "FROM channel_videos WHERE ucid IN (%s) AND kind IN (%s) %s "
+        "ORDER BY %s LIMIT %d;"
+        % (",".join(lit(u) for u in sorted(subscribed_and_not_blocked)),
+           ",".join(lit(k) for k in kinds), window, order,
+           max(60, room * 12)))
+    log("  %s: %d candidate(s) over %d channel(s), ranked by %s"
+        % (",".join(kinds), len(rows), len(subscribed_and_not_blocked), rank_by))
+    for rank, (rid, title, author, ucid, seconds, views) in enumerate(rows):
+        if not VID_RE.match(rid):
+            continue
+        scores[rid] = rank_derived_score(rank)
+        meta_seen.setdefault(rid, listing_meta(
+            {"lengthSeconds": int(seconds or 0), "authorId": ucid or None,
+             "author": author, "title": title,
+             "viewCount": int(views or 0) or None}))
+    return scores, meta_seen
+
+
+def expand_by_watch_order(lane, seeds, room, run):
+    """The seeds themselves, scored so the lane keeps the order they were watched in."""
+    scores, meta_seen = {}, {}
+    for rank, vid in enumerate(seeds):
+        scores[vid] = 1.0 - rank / 100000.0
+        meta_seen[vid] = run.fetcher.meta.get(vid, {})
+    return scores, meta_seen
+
+
+EXPANDERS = {"recommended": expand_by_recommendation,
+             "channel_latest": expand_by_channel_uploads,
+             "subscription_feed": expand_by_subscription_feed}
+
+
+def expand_candidates(lane, seeds, room, run):
+    """Candidate ids scored by the lane's expand source, with their listing meta."""
+    expand = EXPANDERS.get(lane["expand"], expand_by_watch_order)
+    return expand(lane, seeds, room, run)
+
+
+def videos_on_cooldown(lane_id, drop):
+    """Ids the lane may not offer again yet, including the ones it dropped this run."""
+    held = {r[0] for r in query(
+        "SELECT vid FROM suggest.cooldown "
+        "WHERE account=%s AND lane=%s AND until > now();" % (acct(), lit(lane_id)))}
+    return held | {v["videoId"] for v, _ in drop}
+
+
+def sample_pool_of(lane):
+    """How many top candidates to sample over. None for a lane whose score is watch order."""
+    return lane["sample_pool"] if lane["expand"] != "none" else 0
+
+
+def weighted_sample(ranked, pool):
+    """The top `pool` candidates reordered by Efraimidis-Spirakis, and how many moved."""
+    if pool <= 1 or len(ranked) <= 1:
+        return ranked, 0
+    head, tail = ranked[:pool], ranked[pool:]
+    head.sort(key=lambda kv: -(random.random() ** (1.0 / max(kv[1], 1e-6))))
+    return head + tail, len(head)
+
+
+def genre_check_cap(room):
+    """How many candidates a genre lane may look up before it gives up for this run."""
+    return max(20, room * 3)
 
 
 def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
     """The candidates that pass every filter, as [(vid, score, meta, song), ...]."""
     lane_id = lane["id"]
-    cool = {r[0] for r in query(
-        "SELECT vid FROM suggest.cooldown "
-        "WHERE account=%s AND lane=%s AND until > now();" % (acct(), lit(lane_id)))}
-    # A real run has already written the cooldown rows for this run's drops, but
-    # a dry run has not: without this the sweep would rotate a video out and the
-    # refill would put it straight back, which is not what the dry run is there
-    # to show.
-    cool |= {v["videoId"] for v, _ in drop}
+    cool = videos_on_cooldown(lane_id, drop)
     elsewhere = set()
     if lane["dedupe_across_lanes"]:
         elsewhere = {r[0] for r in query(
@@ -1332,21 +1285,10 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
         per_channel[v.get("authorId")] = per_channel.get(v.get("authorId"), 0) + 1
 
     ranked = sorted(scores.items(), key=lambda kv: -kv[1])
-
-    # Take a weighted sample of the good candidates rather than the strict top
-    # of the list. The score order hardly moves between runs, so a strict top N
-    # hands back the same videos night after night even when hundreds of other
-    # candidates scored nearly as well. Efraimidis-Spirakis: order by
-    # u**(1/weight) descending and a high score is still likely to win, just no
-    # longer certain to. Only for `recommended`; `none` uses the score to carry
-    # the watch order and must not be shuffled.
-    pool = lane["sample_pool"] if lane["expand"] != "none" else 0
-    if pool > 1 and len(ranked) > 1:
-        head, tail = ranked[:pool], ranked[pool:]
-        head.sort(key=lambda kv: -(random.random() ** (1.0 / max(kv[1], 1e-6))))
-        ranked = head + tail
+    ranked, sampled = weighted_sample(ranked, sample_pool_of(lane))
+    if sampled:
         log("  weighted sample over the top %d of %d candidates"
-            % (len(head), len(ranked)))
+            % (sampled, len(ranked)))
 
     rejected = {"watched": 0, "subscribed": 0, "cooldown": 0, "in_lane": 0,
                 "other_lane": 0, "short": 0, "long": 0, "genre": 0,
@@ -1360,7 +1302,7 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
         if vid in in_lane:
             rejected["in_lane"] += 1
             continue
-        if vid in run.fetcher.dead:          # known unfetchable, do not offer it again
+        if vid in run.fetcher.dead:
             rejected["dead"] += 1
             continue
         if lane["exclude_watched"] and vid in run.watched_set:
@@ -1387,9 +1329,7 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
             rejected["long"] += 1
             continue
         if genre_wanted:
-            # Lazy: check in ranked order only. The cap must allow for a high
-            # rejection rate; the real cost guard is the lane fetch_cap.
-            if checked >= max(20, room * 3):
+            if checked >= genre_check_cap(room):
                 log("  genre check cap reached after %d candidates" % checked)
                 break
             try:
@@ -1423,7 +1363,7 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
 def reconcile_playlist(lane, chosen, plid, run):
     """Add the chosen videos to the lane's playlist. Returns how many were refused."""
     lane_id = lane["id"]
-    refused, added = 0, []
+    refused, landed = 0, []
     for vid, score, meta, skey in chosen:
         log("  + %5.2f  %-52s %s" % (score, (meta.get("title") or vid)[:52],
                                      (meta.get("author") or meta.get("authorId") or "")[:24]))
@@ -1432,43 +1372,39 @@ def reconcile_playlist(lane, chosen, plid, run):
         if not add_to_lane(lane_id, plid, vid, score, skey, run.fetcher):
             refused += 1
             continue
-        added.append((vid, meta))
+        landed.append((vid, meta))
     if refused:
         log("  %d of %d adds refused by Invidious" % (refused, len(chosen)))
-    # Persist what the listings already told us about the videos that actually
-    # landed, so the Trending/Popular feed can show their view counts. Only the
-    # ones that landed, and in one statement: a run sees 300+ candidates, and a
-    # row per candidate would cost hundreds of psql round trips for nothing.
-    if not run.dry and added:
-        run.fetcher.remember_partial(added)
+    if not run.dry and landed:
+        run.fetcher.remember_partial(landed)
     return refused
 
 
-def run_lane_last_played(lane, run):
-    """Hold the N most recently PLAYED videos that match the lane.
+def plays_newest_first(watched):
+    """The watch history in last-played order, most recent first.
+    Really last-played: Invidious does array_append(array_remove(watched, id), id)."""
+    return reversed(watched)
 
-    Invidious does `array_append(array_remove(watched, id), id)` on every play, so
-    the position in `users.watched` is a real last-played order. The lane is
-    reconciled to the top N of that order: a replay lifts a video back to the
-    top, and a video nobody plays sinks past N and leaves. First in, last
-    played out.
 
-    Safety rule: if the scan could not reach N candidates (budget or scan depth),
-    NOTHING is evicted this run. The lane only grows. Otherwise a short scan
-    would delete videos it simply had not looked at yet.
-    """
-    lane_id = lane["id"]
-    log("\nlane %s  (%s)  policy last_played" % (lane_id, lane["title"]))
-    started = run.fetcher.fetches
-    run.fetcher.begin_lane(lane["fetch_cap"])
-    plid, playlist = playlist_of(lane, run.dry)
-    current = {v["videoId"]: v for v in (playlist.get("videos") or [])}
+def played_score(decay, rank):
+    """A last-played rank as a score, with a gradient wide enough to survive the shuffle.
+    Equal scores would make the hourly reorder pure noise instead of a rotation."""
+    return 10.0 * (decay ** rank)
 
+
+def eviction_is_safe(stopped):
+    """Whether this run may evict, given how the scan ended.
+    A budget-cut scan left entries unexamined; one merely short of `size` saw them all."""
+    return not stopped
+
+
+def scan_recent_plays(lane, run):
+    """The videos this lane wants, newest play first, and how far the scan got."""
     size = lane["size"]
     want_genre = (lane["seed"] or {}).get("genre")
     scan_limit = (lane["seed"] or {}).get("scan", size * 6)
     desired, keys, scanned, stopped = [], set(), 0, ""
-    for vid in reversed(run.watched):                  # newest play first
+    for vid in plays_newest_first(run.watched):
         if len(desired) >= size or scanned >= scan_limit:
             break
         scanned += 1
@@ -1491,46 +1427,54 @@ def run_lane_last_played(lane, run):
             if key:
                 keys.add(key)
         desired.append(vid)
+    return desired, scanned, stopped
 
-    # The scan walks newest-play-first, so a video in the playlist that the scan
-    # never met is provably older than everything it did meet: evicting it is
-    # correct even when fewer than `size` were found. Only a scan cut short by
-    # the FETCH BUDGET is unsafe — there entries went unexamined rather than
-    # unmatched, and one of them could be a recent play. (The earlier rule keyed
-    # on `len(desired) >= size`, which meant a lane whose window simply holds
-    # fewer than `size` matches could never evict anything at all.)
-    complete = not stopped
+
+def entries_to_evict(current, desired, run, may_evict):
+    """Entries that leave: those below the play window, plus any blocked channel.
+    A blocked channel leaves even when `may_evict` is false; grow-only is not for it."""
+    wanted = set(desired)
+    leaving = [v for vid, v in current.items() if vid not in wanted] if may_evict else []
+    already = {v["videoId"] for v in leaving}
+    return leaving + [v for vid, v in current.items()
+                      if vid not in already and v.get("authorId") in run.blocked]
+
+
+def rescore_by_play_order(lane_id, desired, decay):
+    """Write each entry's score from its position in the play order."""
+    values = ",".join(
+        "(%s,%s,%s,%s)" % (acct(), lit(lane_id), lit(vid),
+                           round(played_score(decay, rank), 4))
+        for rank, vid in enumerate(desired))
+    execute("UPDATE suggest.items i SET score = x.score::real "
+            "FROM (VALUES %s) AS x(account,lane,vid,score) "
+            "WHERE i.account = x.account AND i.lane = x.lane "
+            "AND i.vid = x.vid;" % values)
+
+
+def run_lane_last_played(lane, run):
+    """Hold the N most recently PLAYED videos that match the lane, evicting the rest.
+    A scan the fetch budget cut short evicts nothing: the lane only grows that run."""
+    lane_id = lane["id"]
+    log("\nlane %s  (%s)  policy last_played" % (lane_id, lane["title"]))
+    started = run.fetcher.fetches
+    run.fetcher.begin_lane(lane["fetch_cap"])
+    plid, playlist = playlist_of(lane, run.dry)
+    current = {v["videoId"]: v for v in (playlist.get("videos") or [])}
+
+    desired, scanned, stopped = scan_recent_plays(lane, run)
+    may_evict = eviction_is_safe(stopped)
     log("  scanned %d history entries, found %d of %d wanted%s"
-        % (scanned, len(desired), size, "; " + stopped if stopped else ""))
-    if not complete:
+        % (scanned, len(desired), lane["size"], "; " + stopped if stopped else ""))
+    if not may_evict:
         log("  the fetch budget cut the scan short, so nothing is evicted (grow only)")
 
-    keep_set = set(desired)
-    to_drop = [v for vid, v in current.items() if vid not in keep_set] if complete else []
-    # The grow-only rule above protects entries the scan never reached. A blocked
-    # channel is not one of those: its videos leave whether the scan finished or
-    # not, so they are collected separately and merged.
-    dropped = {v["videoId"] for v in to_drop}
-    to_drop += [v for vid, v in current.items()
-                if vid not in dropped and v.get("authorId") in run.blocked]
+    to_drop = entries_to_evict(current, desired, run, may_evict)
     to_add = [v for v in desired if v not in current]
 
-    # Give every entry a score from its last-played rank. This lane used to
-    # store 0 for all of them, which was harmless while the order was fixed —
-    # but the hourly shuffle ranks on score, and 96 identical scores make it
-    # pure noise instead of a rotation. An exponential keeps the gradient wide
-    # enough to survive the shuffle's jitter, so what was played most recently
-    # still leads and the reorder moves videos around inside that.
     decay = lane["played_decay"]
     if not run.dry and desired:
-        values = ",".join(
-            "(%s,%s,%s,%s)" % (acct(), lit(lane_id), lit(vid),
-                               round(10.0 * (decay ** rank), 4))
-            for rank, vid in enumerate(desired))
-        execute("UPDATE suggest.items i SET score = x.score::real "
-                "FROM (VALUES %s) AS x(account,lane,vid,score) "
-                "WHERE i.account = x.account AND i.lane = x.lane "
-                "AND i.vid = x.vid;" % values)
+        rescore_by_play_order(lane_id, desired, decay)
 
     for v in to_drop:
         log("  - %s: %s"
@@ -1545,7 +1489,7 @@ def run_lane_last_played(lane, run):
         if run.dry:
             continue
         if not add_to_lane(lane_id, plid, vid,
-                           10.0 * (decay ** desired.index(vid)),
+                           played_score(decay, desired.index(vid)),
                            song_key(meta.get("title"), meta.get("author")),
                            run.fetcher):
             refused += 1
@@ -1569,6 +1513,11 @@ def expand_source(src):
              "optional": True} for email in household]
 
 
+def share_key(src):
+    """The key weighted_mix counts shares by. It carries the account, not just the lane."""
+    return "%s/%s" % (src["user"], src["lane"]) if src["user"] else src["lane"]
+
+
 def mix_sources(mix):
     """The source list of a mix lane, as [{user, lane, share, key}, ...]."""
     if mix.get("sources"):
@@ -1581,10 +1530,8 @@ def mix_sources(mix):
         ratio = max(1, int(mix.get("ratio", 2)))
         out = [{"user": "", "lane": base, "share": float(ratio), "optional": False},
                {"user": "", "lane": blend, "share": 1.0, "optional": False}]
-    # Two people's "suggested" are two sources, so the key that weighted_mix
-    # counts shares by has to carry the account, not just the lane id.
     for s in out:
-        s["key"] = "%s/%s" % (s["user"], s["lane"]) if s["user"] else s["lane"]
+        s["key"] = share_key(s)
     return out
 
 
@@ -1595,13 +1542,7 @@ def source_order(src):
 
 
 def playlist_videos(plid):
-    """A playlist's videos in display order, as [(vid, ucid), ...], over SQL.
-
-    Read from the database rather than /api/v1/auth/playlists, because a mix may
-    read a lane belonging to somebody else: `playlists` joined to
-    `playlist_videos` needs no authentication at all, so the mix never has to
-    hold another account's session.
-    """
+    """A playlist's videos in display order, as [(vid, ucid), ...], over SQL."""
     return [(r[0], r[1]) for r in query(
         "SELECT pv.id, coalesce(pv.ucid,'') FROM playlists p "
         "CROSS JOIN LATERAL unnest(p.\"index\") WITH ORDINALITY AS u(idx, ord) "
@@ -1609,23 +1550,15 @@ def playlist_videos(plid):
         "WHERE p.id = %s ORDER BY u.ord;" % lit(plid))]
 
 
+def furthest_behind_its_share(ready, share, taken, placed):
+    """The source owing the most output, counting the pure head against its share.
+    Exempting the head was measured and worse: source one overdraws, then runs dry."""
+    return max(ready, key=lambda s: share[s["key"]] * (placed + 1) - taken[s["key"]])
+
+
 def weighted_mix(sources, size, pure=0):
     """Fill `size` slots from N sources, each holding its SHARE of the output.
-
-    `sources` = [{"lane": id, "vids": [...], "share": 0.9}, ...]. The first
-    `pure` slots come from the first source untouched, so the top of the feed is
-    never diluted. After that every slot goes to whichever source is furthest
-    behind its share, which spreads a small share evenly across the whole list.
-
-    A source that runs out simply stops being eligible and its remaining share is
-    absorbed by the others. That is the whole point of replacing the old
-    `pure`/`ratio` interleave: with a 30-video base and a 30-video blend, ratio
-    2 exhausted the base at position 34 and then appended the ENTIRE rest of the
-    blend, so a lane meant to be mostly base came out 50/50 with a 26-long blend
-    block at the end.
-
-    A video present in more than one source appears once, at its first claim.
-    """
+    A video in more than one source appears once, and a spent source's share is absorbed."""
     total = sum(max(s.get("share", 0.0), 0.0) for s in sources) or 1.0
     share = {s["key"]: max(s.get("share", 0.0), 0.0) / total for s in sources}
     cursor = {s["key"]: 0 for s in sources}
@@ -1650,27 +1583,17 @@ def weighted_mix(sources, size, pure=0):
     while sources and len(out) < min(pure, size) and peek(sources[0]) is not None:
         take(sources[0])
 
-    # The head DOES count toward the shares. Exempting it was tried and is worse:
-    # it smooths positions 11-19 but then overdraws the first source, which runs
-    # dry near the end and hands the tail to whatever is left — music went from
-    # 9% to 13% and the last nine slots clumped. Counting the head keeps the
-    # totals honest; keep `pure` small instead, since a large head is what makes
-    # the other sources catch up in a block.
     while len(out) < size:
         ready = [s for s in sources if peek(s) is not None]
         if not ready:
             break
-        take(max(ready, key=lambda s: share[s["key"]] * (len(out) + 1)
-                 - taken[s["key"]]))
+        take(furthest_behind_its_share(ready, share, taken, len(out)))
     return out
 
 
 def run_lane_mix(lane, run):
     """Rebuild one playlist from several source lanes, filtered for the viewer.
-
-    Costs no YouTube fetch and writes no suggest.items row, so the other lanes
-    never see a mix lane's content as taken.
-    """
+    Writes no suggest.items row, so no other lane sees a mix lane's content as taken."""
     lane_id = lane["id"]
     mix = lane.get("mix") or {}
     pure = int(mix.get("pure", 0))
@@ -1718,13 +1641,7 @@ def run_lane_mix(lane, run):
 
 
 def cmd_run(args):
-    """Fill every managed account's lanes, in one paced run.
-
-    One timer, one budget, one metadata cache. The accounts are a loop inside
-    this process rather than a unit each, because the thing that has to stay
-    scarce -- calls that reach YouTube -- is a property of the instance, not of
-    the account.
-    """
+    """Fill every managed account's lanes in one paced run: one timer, one budget."""
     all_lanes = load_config()
     warn_ignored_keys(all_lanes)
     users = accounts_wanted(args)
@@ -1740,7 +1657,7 @@ def cmd_run(args):
             args.budget, fetcher.fetches, len(users) - i)
         try:
             failed += run_account(user, all_lanes, fetcher, seed_override, args)
-        except Exception as e:            # one account must not cost the others
+        except Exception as e:
             failed += 1
             log("account %s: ERROR %r" % (user["email"], e))
     log("\ndone: %d fetches, %d cache hits, %d known-bad skips, %d lane failures"
@@ -1749,15 +1666,7 @@ def cmd_run(args):
 
 
 def budget_slice(total, spent, accounts_left):
-    """One account's share of the run's fetch budget.
-
-    Divide, do not multiply. The pacing is there to keep YouTube calm, which is
-    a property of the instance and not of the account, so a second person does
-    not double the calls -- they halve each share.
-
-    Recomputed from what is left each time, so a light account's unspent slice
-    rolls forward to whoever comes next instead of being lost.
-    """
+    """One account's share of what is LEFT of the run's fetch budget."""
     return max(0, total - spent) // max(1, accounts_left)
 
 
@@ -1770,6 +1679,31 @@ def accounts_wanted(args):
         if not users:
             sys.exit("no account %r in the users: block of %s" % (wanted, CONFIG))
     return account_order(users)
+
+
+def log_account_header(lanes, run):
+    """Announce the account's totals, watch count included."""
+    log("\naccount %s: %d watched, %d subscriptions, %d blocked, %d lanes, "
+        "%d fetches of budget"
+        % (ACCOUNT, len(run.watched), len(run.subs), len(run.blocked), len(lanes),
+           run.fetcher.budget - run.fetcher.fetches))
+
+
+def run_one_lane(lane, run):
+    """One lane's (removed, added, kept, fetches), and its error if it had one.
+    A lane that raises is recorded and never stops the account's other lanes."""
+    try:
+        if lane["policy"] == "last_played":
+            return run_lane_last_played(lane, run), None
+        if lane["policy"] == "mix":
+            return run_lane_mix(lane, run), None
+        return run_lane(lane, run), None
+    except Aborted as e:
+        log("  ABORTED: %s (the playlist keeps its content)" % e)
+        return (0, 0, 0, 0), str(e)
+    except Exception as e:
+        log("  ERROR: %r" % e)
+        return (0, 0, 0, 0), repr(e)
 
 
 def run_account(user, all_lanes, fetcher, seed_override, args):
@@ -1786,56 +1720,31 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
             return 0
     run = LaneRun(watched, set(watched), subs, read_blocked(), fetcher,
                   args.dry_run, seed_override)
-    # The watch count is logged because it is the whole cause of a thin lane on
-    # a new account, and nothing else makes that visible.
-    log("\naccount %s: %d watched, %d subscriptions, %d blocked, %d lanes, "
-        "%d fetches of budget"
-        % (ACCOUNT, len(watched), len(subs), len(run.blocked), len(lanes),
-           fetcher.budget - fetcher.fetches))
+    log_account_header(lanes, run)
     if held_back:
         log("held back until there is more history: %s" % ", ".join(held_back))
     if run.blocked:
         log("blocked: %s" % ", ".join(sorted(run.blocked.values())))
     failed = 0
     for lane in lanes:
-        error = None
-        try:
-            if lane["policy"] == "last_played":
-                removed, added, kept, used = run_lane_last_played(lane, run)
-            elif lane["policy"] == "mix":
-                removed, added, kept, used = run_lane_mix(lane, run)
-            else:
-                removed, added, kept, used = run_lane(lane, run)
-        except Aborted as e:
-            removed = added = kept = used = 0
-            error = str(e)
+        (removed, added, kept, used), error = run_one_lane(lane, run)
+        if error:
             failed += 1
-            log("  ABORTED: %s (the playlist keeps its content)" % e)
-        except Exception as e:                       # never let one lane kill the rest
-            removed = added = kept = used = 0
-            error = repr(e)
-            failed += 1
-            log("  ERROR: %r" % e)
         if not args.dry_run:
             execute("INSERT INTO suggest.runs"
                     "(account,lane,added,removed,kept,fetches,error) "
                     "VALUES (%s,%s,%s,%s,%s,%s,%s);"
                     % (acct(), lit(lane["id"]), added, removed, kept, used,
                        lit(error)))
-        if isinstance(error, str) and error and "budget" in error:
-            # This account's slice, not the run: the next account has its own.
+        this_accounts_budget_is_spent = bool(error) and "budget" in error
+        if this_accounts_budget_is_spent:
             log("fetch budget spent, stopping before %s's other lanes" % ACCOUNT)
             break
     return failed
 
 
 def cmd_dedupe(args):
-    """Keep one upload per song and remove the rest. The next run refills.
-
-    Per account: two people are each allowed their own copy of a song, and
-    dropping one because the other already has it is exactly the bleed the
-    account column exists to stop.
-    """
+    """Keep one upload per song per account and remove the rest. The next run refills."""
     for user in accounts_wanted(args):
         use_account(user["email"])
         log("account %s" % user["email"])
@@ -1847,11 +1756,7 @@ Upload = namedtuple("Upload", "song quality lane_rank title_len lane plid video"
 
 
 def dedupe_account(args):
-    """One account's duplicates.
-
-    The keeper is chosen on quality, not on lane order: the artist's own upload
-    beats a re-upload, and a lane earlier in lanes.yml beats a later one.
-    """
+    """One account's duplicates. The keeper wins on upload_quality first, lane order second."""
     order = {lane["id"]: i for i, lane in enumerate(load_config())}
     entries = []
     for lane_id, plid in query("SELECT lane, plid FROM suggest.lanes "
@@ -1903,18 +1808,8 @@ def dedupe_account(args):
     return 0
 
 
-def cmd_views(args):
-    """Refresh the recorded view counts of every video the bot's playlists hold.
-
-    Every /api/v1/videos/<id> call reaches YouTube, so this reuses the Fetcher's
-    pacing/budget/backoff exactly like a run -- but it must see the CURRENT
-    count, not whatever the metadata cache already has, so it calls video()
-    for every video regardless of what the cache says. video() itself already
-    treats a lone HTTP 500 as a known upstream parser bug: it logs, skips the
-    one video, and keeps going; only 5 consecutive failures of any kind abort.
-    """
-    # Every account's lanes into one set: a view count is a property of the
-    # video, so two accounts holding the same video pay for one refresh.
+def videos_across_every_lane(args):
+    """The distinct video ids held by every lane of every wanted account."""
     vids = set()
     for user in accounts_wanted(args):
         use_account(user["email"])
@@ -1925,6 +1820,13 @@ def cmd_views(args):
             log("%-24s lane %-16s %d videos"
                 % (user["email"], lane_id, len(videos)))
             vids.update(v["videoId"] for v in videos)
+    return vids
+
+
+def cmd_views(args):
+    """Refresh the recorded view counts of every video the bot's playlists hold.
+    Ignores the metadata cache on purpose: the whole point is the CURRENT count."""
+    vids = videos_across_every_lane(args)
     log("%d unique videos across every lane of every account" % len(vids))
 
     fetcher = Fetcher(rate_per_min=args.rate, budget=args.budget)
@@ -1934,7 +1836,7 @@ def cmd_views(args):
         before_500, before_dead = fetcher.skipped_500, fetcher.dead_hits
         try:
             data = fetcher.video(vid)
-        except Aborted as e:               # BudgetSpent is also an Aborted
+        except Aborted as e:
             stopped = str(e)
             break
         if data:
@@ -1964,14 +1866,7 @@ def _text_array(values):
 
 
 def read_order(plid, lane_id):
-    """One row per video in the playlist, in the order it is displayed now.
-
-    `playlists.index` IS the display order — the feed reads
-    `ORDER BY array_position(index, ...)` on every request — so reordering a
-    lane is a permutation of that array and nothing else. No API call, no
-    YouTube fetch, and `playlist_videos.index` (the client-visible indexId)
-    never changes.
-    """
+    """One row per video in the playlist, in the order it is displayed now."""
     return query(
         "SELECT u.idx, pv.id, coalesce(pv.ucid,''), coalesce(i.score,0), "
         "coalesce(i.top_hours,0), "
@@ -1986,45 +1881,97 @@ def read_order(plid, lane_id):
         "WHERE p.id = %s ORDER BY u.ord;" % (acct(), lit(lane_id), lit(plid)))
 
 
+def display_score(it, cfg):
+    """One item's display weight: its score discounted by fatigue, lifted by recency."""
+    s = it["score"] * (cfg["fatigue"] ** min(it["top"], cfg["fatigue_cap"]))
+    s *= 1.0 + cfg["recency_boost"] * (0.5 ** (it["age"] / cfg["recency_halflife"]))
+    if cfg["jitter"]:
+        s *= random.uniform(1.0 - cfg["jitter"], 1.0 + cfg["jitter"])
+    return s
+
+
+def rotate_top_slot(ordered, items):
+    """Give slot 1 to the best scorer among the half that has waited longest for it."""
+    half = max(1, len(ordered) // 2)
+    waited = sorted(items, key=lambda it: -it["since_top"])[:half]
+    lead = max(waited, key=lambda it: it["display"])
+    return [lead] + [it for it in ordered if it["vid"] != lead["vid"]]
+
+
+def spread_channels(ordered):
+    """Pull the order apart so two videos from one channel rarely sit back to back."""
+    out, pool = [], list(ordered)
+    while pool:
+        prev = out[-1]["ucid"] if out else ""
+        pick = next((it for it in pool
+                     if not it["ucid"] or it["ucid"] != prev), pool[0])
+        out.append(pick)
+        pool.remove(pick)
+    return out
+
+
 def rank_items(items, cfg):
     """The display order for one lane. Pure: same input, same distribution.
-
-    Each item needs score, top (hours already on screen), age (hours since it
-    was added) and since_top (hours since it last held slot 1).
-    """
+    Each item needs score, plus top, age and since_top, all counted in hours."""
     for it in items:
-        # Fatigue is the main lever: an hour on screen without being played is a
-        # small negative, the same impression discount a ranked feed applies to
-        # something it has already shown you.
-        s = it["score"] * (cfg["fatigue"] ** min(it["top"], cfg["fatigue_cap"]))
-        s *= 1.0 + cfg["recency_boost"] * (0.5 ** (it["age"] / cfg["recency_halflife"]))
-        if cfg["jitter"]:
-            s *= random.uniform(1.0 - cfg["jitter"], 1.0 + cfg["jitter"])
-        it["display"] = s
+        it["display"] = display_score(it, cfg)
     ordered = sorted(items, key=lambda it: -it["display"])
-
     if cfg["round_robin_top"] and len(ordered) > 2:
-        # Slot 1 is the scarce resource, so it is a rota, not a ranking. The half
-        # of the lane that has waited longest for the top is eligible and the
-        # best display score inside that half takes it, so every video reaches
-        # the top before any video returns to it.
-        half = max(1, len(ordered) // 2)
-        waited = sorted(items, key=lambda it: -it["since_top"])[:half]
-        lead = max(waited, key=lambda it: it["display"])
-        ordered = [lead] + [it for it in ordered if it["vid"] != lead["vid"]]
-
+        ordered = rotate_top_slot(ordered, items)
     if cfg["diversity"]:
-        # Two videos from one channel back to back is what makes a lane read as
-        # repetitive even when its content changed.
-        out, pool = [], list(ordered)
-        while pool:
-            prev = out[-1]["ucid"] if out else ""
-            pick = next((it for it in pool
-                         if not it["ucid"] or it["ucid"] != prev), pool[0])
-            out.append(pick)
-            pool.remove(pick)
-        ordered = out
+        ordered = spread_channels(ordered)
     return ordered
+
+
+def source_current_order(src, orders):
+    """A mix source's order: this run's, when it is ours; otherwise the stored one."""
+    return orders.get(src["lane"]) if not src["user"] else source_order(src)
+
+
+def restrict_to_present(sources, items):
+    """Cut every source down to the videos this playlist already holds.
+    A shuffle may only permute; membership stays the nightly run's call."""
+    present = {it["vid"] for it in items}
+    for s in sources:
+        s["vids"] = [vid for vid in s["order"] if vid in present]
+
+
+def mix_order(lane, items, orders):
+    """A mix lane's order, or None when a source has not been reordered this run."""
+    mix = lane.get("mix") or {}
+    sources = mix_sources(mix)
+    for s in sources:
+        s["order"] = source_current_order(s, orders)
+    sources = [s for s in sources if not (s["optional"] and s["order"] is None)]
+    if not sources or any(s["order"] is None for s in sources):
+        return None
+    restrict_to_present(sources, items)
+    want = weighted_mix(sources, len(items), int(mix.get("pure", 0)))
+    rank = {vid: n for n, vid in enumerate(want)}
+    return sorted(items, key=lambda it: rank.get(it["vid"], 10**6))
+
+
+def permute_playlist_index(plid, ordered):
+    """Reorder the playlist's index array in place, in one statement."""
+    execute("UPDATE playlists SET \"index\" = (SELECT coalesce(array_agg(idx ORDER BY "
+            "array_position(%s, idx)), '{}'::bigint[]) FROM unnest(\"index\") AS idx), "
+            "updated = now() WHERE id = %s;"
+            % (_bigint_array([it["idx"] for it in ordered]), lit(plid)))
+
+
+def age_fatigue(lane_id, cfg, after):
+    """Raise fatigue for what is on screen and lower it for what is not."""
+    visible = _text_array(after[:cfg["visible"]])
+    execute("UPDATE suggest.items SET top_hours = "
+            "least(coalesce(top_hours,0)+1, %d) "
+            "WHERE account=%s AND lane=%s AND vid = ANY(%s); "
+            "UPDATE suggest.items SET top_hours = greatest(coalesce(top_hours,0)-1, 0) "
+            "WHERE account=%s AND lane=%s AND NOT (vid = ANY(%s)); "
+            "UPDATE suggest.items SET last_top = now() "
+            "WHERE account=%s AND lane=%s AND vid=%s;"
+            % (cfg["fatigue_cap"], acct(), lit(lane_id), visible,
+               acct(), lit(lane_id), visible,
+               acct(), lit(lane_id), lit(after[0])))
 
 
 def shuffle_lane(lane, orders, dry):
@@ -2048,36 +1995,10 @@ def shuffle_lane(lane, orders, dry):
     before = [it["vid"] for it in items]
 
     if lane["policy"] == "mix":
-        # A mix lane holds no suggest.items rows and no score of its own: its
-        # order is the interleave of its sources. Recompute it from the orders
-        # THIS run just produced, otherwise the feed that reads it would only
-        # move once a night no matter how often the sources are reordered.
-        mix = lane.get("mix") or {}
-        sources = mix_sources(mix)
-        for s in sources:
-            # A source in another account was reordered by that account's own
-            # pass, which may not have happened yet. Read its current order out
-            # of the database instead: that is exactly what a reader of that
-            # lane sees right now, and it costs one query.
-            s["order"] = (orders.get(s["lane"]) if not s["user"]
-                          else source_order(s))
-        sources = [s for s in sources
-                   if not (s["optional"] and s["order"] is None)]
-        if not sources or any(s["order"] is None for s in sources):
+        ordered = mix_order(lane, items, orders)
+        if ordered is None:
             log("lane %-16s sources not reordered this run, skipped" % lane_id)
             return before
-        # Restrict each source to what this playlist ALREADY holds, and mix over
-        # exactly that many slots. A shuffle can only permute; it cannot add or
-        # remove. Mixing over the full sources would choose a different subset
-        # than the playlist contains, leaving the videos it did not choose to
-        # sort last — re-creating the very tail clump the share model exists to
-        # prevent. Membership stays the nightly run's decision.
-        present = {it["vid"] for it in items}
-        for s in sources:
-            s["vids"] = [vid for vid in s["order"] if vid in present]
-        want = weighted_mix(sources, len(items), int(mix.get("pure", 0)))
-        rank = {vid: n for n, vid in enumerate(want)}
-        ordered = sorted(items, key=lambda it: rank.get(it["vid"], 10**6))
     else:
         ordered = rank_items(items, cfg)
 
@@ -2088,30 +2009,9 @@ def shuffle_lane(lane, orders, dry):
     if dry:
         return after
 
-    # One statement, and it PERMUTES whatever the array holds right now rather
-    # than replacing it. A video the nightly run adds between the read and this
-    # write has no position in the desired list, sorts last and survives; none
-    # can be lost or duplicated. That is what makes the hourly timer safe to run
-    # against the nightly one.
-    execute("UPDATE playlists SET \"index\" = (SELECT coalesce(array_agg(idx ORDER BY "
-            "array_position(%s, idx)), '{}'::bigint[]) FROM unnest(\"index\") AS idx), "
-            "updated = now() WHERE id = %s;"
-            % (_bigint_array([it["idx"] for it in ordered]), lit(plid)))
-
+    permute_playlist_index(plid, ordered)
     if lane["policy"] != "mix":
-        visible = _text_array(after[:cfg["visible"]])
-        # Fatigue rises while a video is on screen and falls once it is not, so
-        # a buried video recovers instead of being held down for ever.
-        execute("UPDATE suggest.items SET top_hours = "
-                "least(coalesce(top_hours,0)+1, %d) "
-                "WHERE account=%s AND lane=%s AND vid = ANY(%s); "
-                "UPDATE suggest.items SET top_hours = greatest(coalesce(top_hours,0)-1, 0) "
-                "WHERE account=%s AND lane=%s AND NOT (vid = ANY(%s)); "
-                "UPDATE suggest.items SET last_top = now() "
-                "WHERE account=%s AND lane=%s AND vid=%s;"
-                % (cfg["fatigue_cap"], acct(), lit(lane_id), visible,
-                   acct(), lit(lane_id), visible,
-                   acct(), lit(lane_id), lit(after[0])))
+        age_fatigue(lane_id, cfg, after)
     execute("INSERT INTO suggest.shuffles(account,lane,videos,moved) "
             "VALUES (%s,%s,%s,%s);" % (acct(), lit(lane_id), len(after), moved))
     return after
@@ -2145,7 +2045,7 @@ def shuffle_account(user, all_lanes, args):
             result = shuffle_lane(lane, orders, args.dry_run)
             if result is not None:
                 orders[lane["id"]] = result
-        except Exception as e:          # one lane must not cost the others
+        except Exception as e:
             failed += 1
             log("lane %-16s ERROR: %r" % (lane["id"], e))
             if not args.dry_run:
@@ -2157,12 +2057,7 @@ def shuffle_account(user, all_lanes, args):
 
 
 def cmd_init(args):
-    """Prepare the schema, then every managed account. Safe to re-run.
-
-    Idempotent throughout: the migration only touches what it has not touched
-    before, a session is opened once and reused, and a playlist is created only
-    when the account has none for that lane. Nothing here recreates anything.
-    """
+    """Prepare the schema, then every managed account. Idempotent, so safe to re-run."""
     if not PRIMARY:
         sys.exit("set IV_SUGGEST_ACCOUNT: the migration needs to know which "
                  "account the rows written before multi-user belong to")
@@ -2249,12 +2144,7 @@ def run_field(row, index):
 
 
 def lane_video_count(policy, tracked, last_run):
-    """Videos one lane holds.
-
-    A mix lane keeps no suggest.items row -- its videos live in the source
-    lanes and it writes straight to the playlist -- so counting rows reports
-    zero for a playlist that is full. Read its last run instead.
-    """
+    """Videos one lane holds; a mix lane writes no items row, so its last run is read."""
     if policy != "mix":
         return tracked
     return run_field(last_run, RUN_KEPT) + run_field(last_run, RUN_ADDED)
@@ -2265,13 +2155,23 @@ def lane_target(lane):
     return 0 if lane["policy"] == "mix" else lane["size"]
 
 
+def lane_facts():
+    """Everything the metrics need about the current account's lanes, one query per table."""
+    return (tracked_by_lane(),
+            dict((r[0], float(r[1])) for r in query(
+                "SELECT lane, extract(epoch FROM max(added)) FROM suggest.items "
+                "WHERE account=%s GROUP BY 1;" % acct())),
+            last_run_by_lane(),
+            dict((r[0], r[1]) for r in query(
+                "SELECT lane, plid FROM suggest.lanes WHERE account=%s;" % acct())),
+            dict((r[0], r[1]) for r in query(
+                "SELECT DISTINCT ON (lane) lane, moved FROM suggest.shuffles "
+                "WHERE account=%s ORDER BY lane, ran DESC;" % acct())))
+
+
 def cmd_metrics(args):
     """Print the Prometheus text form. Database only, never a YouTube fetch.
-
-    Every per-lane series carries an `account` label. The cardinality that adds
-    is a household, not a tenant list, and without it two people's lanes of the
-    same name would collide into one series.
-    """
+    Every per-lane series carries an `account` label, or two people's lanes collide."""
     all_lanes = load_config()
     users = load_users()
     out = []
@@ -2292,24 +2192,11 @@ def cmd_metrics(args):
         lanes = enrolled_lanes(user, all_lanes)
         held_back = len(lanes_for(user, all_lanes)) - len(lanes)
 
-        # One query per table per account keeps this cheap enough to run every
-        # 15 minutes.
-        tracked = tracked_by_lane()
-        changed = dict((r[0], float(r[1])) for r in query(
-            "SELECT lane, extract(epoch FROM max(added)) FROM suggest.items "
-            "WHERE account=%s GROUP BY 1;" % acct()))
-        last = last_run_by_lane()
-        plids = dict((r[0], r[1]) for r in query(
-            "SELECT lane, plid FROM suggest.lanes WHERE account=%s;" % acct()))
-        shuffled = dict((r[0], r[1]) for r in query(
-            "SELECT DISTINCT ON (lane) lane, moved FROM suggest.shuffles "
-            "WHERE account=%s ORDER BY lane, ran DESC;" % acct()))
+        tracked, changed, last, plids, shuffled = lane_facts()
 
         def tag(lane, plids=plids):
-            # `expand` is exported so an alert can tell a lane whose supply is a
-            # fixed age window (subscription_feed) from one drawing on a growing
-            # recommendation graph. The first legitimately takes no new video for
-            # weeks when nothing was published; the second going quiet is a fault.
+            """One lane's Prometheus label set, `expand` included.
+            A subscription_feed lane can go weeks with no new video; an alert needs to know."""
             return '{account="%s",lane="%s",policy="%s",expand="%s",plid="%s"}' % (
                 ACCOUNT, lane["id"], lane["policy"], lane["expand"],
                 plids.get(lane["id"], ""))
@@ -2363,8 +2250,22 @@ def cmd_metrics(args):
                  one("SELECT coalesce(array_length(watched,1),0) FROM users "
                      "WHERE email=%s;" % lit(ACCOUNT)) or 0)])
 
-    # Instance wide. The fetch budget and the metadata cache are shared, so
-    # these stay unlabelled and the alerts written against them still work.
+    _instance_wide_metrics(metric, users)
+
+    for name in order:
+        help_text, kind, samples = series[name]
+        out.append("# HELP iv_suggest_%s %s" % (name, help_text))
+        out.append("# TYPE iv_suggest_%s %s" % (name, kind))
+        for labels, value in samples:
+            out.append("iv_suggest_%s%s %s" % (name, labels, value))
+
+    print("\n".join(out))
+    return 0
+
+
+def _instance_wide_metrics(metric, users):
+    """The series with no account label, because the budget and cache are shared.
+    Unlabelled also keeps the alerts already written against them working."""
     metric("scrape_timestamp_seconds",
            "When this exporter last read the database.", "gauge",
            [("", "%d" % time.time())])
@@ -2393,16 +2294,6 @@ def cmd_metrics(args):
                      "WHERE until > now();") or 0)])
     metric("up", "1 when this exporter read the database.", "gauge",
            [("", 1)])
-
-    for name in order:
-        help_text, kind, samples = series[name]
-        out.append("# HELP iv_suggest_%s %s" % (name, help_text))
-        out.append("# TYPE iv_suggest_%s %s" % (name, kind))
-        for labels, value in samples:
-            out.append("iv_suggest_%s%s %s" % (name, labels, value))
-
-    print("\n".join(out))
-    return 0
 
 
 def needs_credential(cmd):

@@ -101,6 +101,12 @@ iv-suggest metrics                                Prometheus text, database only
 
 `metrics` takes no token and makes no fetch, so it is safe to scrape often.
 
+`views` exists because the feed reads its numbers out of `suggest.video_meta`.
+A candidate that only ever arrived through `recommendedVideos` or
+`channels/latest` carries no numeric `viewCount` — only text like `154K` — so
+without the backfill it would show 0 for ever. The text form is parsed as a free
+fallback when a listing is stored, and this command refreshes the rest.
+
 ## More than one account
 
 `lanes.yml` is the shared library of lanes; `auto_enrol:` takes in every account
@@ -170,12 +176,14 @@ size 20 filled to 3 on a 75-channel instance, because only 35 of those channels
 ever stream.
 
 **The hourly shuffle is a permutation, nothing else.** `playlists.index` *is* the
-display order in Invidious, so reordering a lane is one SQL `UPDATE` on a
-`bigint[]` — no delete, no re-add, no API call. It is race-safe against the
-nightly run because it permutes whatever the array holds at write time. The
-ranking discounts what has already been on screen and treats slot 1 as a rota
-rather than a ranking, so at least half the lane leads before any video returns
-to the top.
+display order in Invidious — the feed reads `ORDER BY array_position(index, ...)`
+on every request — so reordering a lane is one SQL `UPDATE` on a `bigint[]`: no
+delete, no re-add, no API call, and the client-visible `indexId` in
+`playlist_videos.index` never moves. It is race-safe against the nightly run
+because it permutes whatever the array holds at write time, so a video added
+between the read and the write sorts last and survives. The ranking discounts
+what has already been on screen and treats slot 1 as a rota rather than a
+ranking, so at least half the lane leads before any video returns to the top.
 
 **Rate limiting toward YouTube is the main constraint.** Invidious's `videos`
 cache is unlogged and short-lived, so assume every `/api/v1/videos/<id>` reaches
@@ -212,8 +220,8 @@ bracketed qualifiers dropped, everything after `|` dropped, split on the dash,
 ~30 noise words removed (official, lyrics, remastered, 4K, live at…, OST, feat…,
 a bare year), accents and articles flattened, spaces removed so "Freebird"
 equals "Free Bird". The match key is the **song alone**, because a re-upload
-channel replaces the artist. Two different songs sharing a title collapse; that
-costs one slot and is accepted.
+channel replaces the artist ("American Pie Song" by "Hit Usa songs"). Two
+different songs sharing a title collapse; that costs one slot and is accepted.
 
 ## Tests
 
