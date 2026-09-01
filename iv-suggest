@@ -66,12 +66,7 @@ _ENV = _envfile()
 
 
 def setting(name, default=""):
-    """A setting from the real environment, else ENVFILE, else the default.
-
-    The file is read as well as the environment because the systemd units call
-    this script directly, with no EnvironmentFile — so a value set only in the
-    environment would be present interactively and absent from the nightly run.
-    """
+    """A setting from the real environment, else ENVFILE, else the default."""
     return os.environ.get(name) or _ENV.get(name) or default
 
 
@@ -294,11 +289,7 @@ def _flatten(text):
 
 
 def parse_song(title, author=""):
-    """Return (artist, song_key) for "Artist - Title (qualifiers)". Artist may be empty.
-
-    The key is the flattened TITLE alone, because a re-upload channel often
-    replaces the artist ("American Pie Song" by "Hit Usa songs").
-    """
+    """Return (artist, song_key) for "Artist - Title (qualifiers)". Artist may be empty."""
     raw = _BRACKETS_RE.sub(" ", title or "").split("|")[0].lstrip("@# ")
     parts = _SPLIT_RE.split(raw)
     if len(parts) >= 2 and len(_flatten(parts[0])) >= 2:
@@ -368,10 +359,7 @@ def lit(value):
 
 def _typed_views_literal(views):
     """A views value for a VALUES row, cast so an all-NULL batch still reads as bigint.
-
-    Postgres types a VALUES-derived column from its literals, not from the
-    insert target, and an untyped all-NULL column resolves to text.
-    """
+    Postgres types such a column from its literals, not from the insert target."""
     if isinstance(views, (int, float)):
         return str(int(views))
     return "NULL::bigint"
@@ -379,12 +367,7 @@ def _typed_views_literal(views):
 
 def parse_published(rec):
     """Unix seconds from a listing's `published`, or 0 when it carries none.
-
-    The two listings disagree on the type: `channels/latest` gives unix
-    seconds, `recommendedVideos` gives an RFC3339 string derived from the
-    relative "21 hours ago" text (so it is approximate, which is fine for a
-    day-scale cutoff). Comparing the string against a float raises.
-    """
+    `channels/latest` sends unix seconds, `recommendedVideos` an RFC3339 string."""
     pub = rec.get("published")
     if isinstance(pub, (int, float)):
         return float(pub)
@@ -408,15 +391,8 @@ def listing_meta(rec):
 
 
 def parse_views(rec):
-    """A numeric view count from a listing that may only carry the text form.
-
-    /api/v1/videos carries a numeric ``viewCount``; the ``recommendedVideos``
-    and ``channels/latest`` listings carry only ``viewCountText`` ("154K",
-    "8.9K", "2,471,179 views"). The Trending/Popular feed reads the number from
-    suggest.video_meta.views, so a candidate that only ever came through those
-    two listings would show 0 for ever. Parse the text as a free fallback (no
-    extra fetch); return None when neither field is usable.
-    """
+    """A view count from a listing that may carry only the text form ("154K"), else None.
+    Free: `recommendedVideos` and `channels/latest` omit the numeric `viewCount`."""
     v = rec.get("viewCount")
     if isinstance(v, (int, float)):
         return int(v)
@@ -447,12 +423,7 @@ def load_token():
 
 
 def session_of(email):
-    """The bot's session for an account, or "" when it has none yet.
-
-    Checked against session_ids on the way out, so a session the account has
-    since signed out of reads as absent and is issued again, instead of being
-    used to make every call fail.
-    """
+    """The bot's session for an account, or "" when its sid no longer joins session_ids."""
     if not email:
         return ""
     return one("SELECT a.sid FROM suggest.accounts a "

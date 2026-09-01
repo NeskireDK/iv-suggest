@@ -101,6 +101,12 @@ iv-suggest metrics                                Prometheus text, database only
 
 `metrics` takes no token and makes no fetch, so it is safe to scrape often.
 
+`views` exists because the feed reads its numbers out of `suggest.video_meta`.
+A candidate that only ever arrived through `recommendedVideos` or
+`channels/latest` carries no numeric `viewCount` — only text like `154K` — so
+without the backfill it would show 0 for ever. The text form is parsed as a free
+fallback when a listing is stored, and this command refreshes the rest.
+
 ## More than one account
 
 `lanes.yml` is the shared library of lanes; `auto_enrol:` takes in every account
@@ -212,8 +218,8 @@ bracketed qualifiers dropped, everything after `|` dropped, split on the dash,
 ~30 noise words removed (official, lyrics, remastered, 4K, live at…, OST, feat…,
 a bare year), accents and articles flattened, spaces removed so "Freebird"
 equals "Free Bird". The match key is the **song alone**, because a re-upload
-channel replaces the artist. Two different songs sharing a title collapse; that
-costs one slot and is accepted.
+channel replaces the artist ("American Pie Song" by "Hit Usa songs"). Two
+different songs sharing a title collapse; that costs one slot and is accepted.
 
 ## Tests
 

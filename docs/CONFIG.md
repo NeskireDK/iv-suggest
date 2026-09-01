@@ -123,7 +123,7 @@ Per-`expand` keys, ignored by the other modes:
 | Key | Default | Applies to | Meaning |
 |---|---|---|---|
 | `seed` | `{limit: 30}` | `recommended`, `channel_latest`, `none` | see below |
-| `recommend_max_age_days` | `0` | `recommended` | drop a recommendation older than this. `0` = off. Free — `recommendedVideos` carries `published` |
+| `recommend_max_age_days` | `0` | `recommended` | drop a recommendation older than this. `0` = off. Free — `recommendedVideos` carries `published`, as an RFC3339 string derived from its relative "21 hours ago" text, so it is approximate. Fine at day scale |
 | `max_channels` | `12` | `channel_latest` | channels to poll per run |
 | `max_age_days` | `21` | `channel_latest` | how new an upload must be |
 | `subscription` | see below | `subscription_feed` | see below |
