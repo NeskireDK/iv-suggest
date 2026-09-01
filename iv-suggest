@@ -696,14 +696,7 @@ def read_config():
 
 
 def merge_lane(base, patch):
-    """Lane settings with `patch` applied, merging the nested blocks key by key.
-
-    A patch that sets `shuffle: {jitter: 0}` must keep the other shuffle keys:
-    replacing the block wholesale leaves rank_items() without `fatigue`, which
-    raises inside the per-lane try/except and silently stops that lane
-    reordering for good. `seed` is deliberately absent from the merged blocks
-    and CONFIG.md commits to that: a seed patch replaces the block.
-    """
+    """Lane settings with `patch` applied, merging MERGED_LANE_BLOCKS key by key."""
     merged = dict(base)
     merged.update(patch)
     for block in MERGED_LANE_BLOCKS:
@@ -771,19 +764,7 @@ def named_users(cfg):
 
 
 def load_users():
-    """The accounts to manage, as [{email, lanes, overrides}, ...].
-
-    With no `auto_enrol:` block only the accounts written out in `users:` are
-    touched, and no block at all means the single IV_SUGGEST_ACCOUNT with every
-    lane -- exactly what a config written before multi-user did.
-
-    Writing `auto_enrol:` reverses that and takes in every account on the
-    instance,
-    including ones registered later. A `users:` entry still wins, so listing
-    somebody is how you give them different lanes rather than how you opt them
-    in. Lanes they cannot fill yet are held back by `min_watched`, so enrolment
-    does not hand a new account a dozen empty playlists.
-    """
+    """The accounts to manage, as [{email, lanes, overrides}, ...]."""
     if "users" in _CONFIG_CACHE:
         return _CONFIG_CACHE["users"]
     cfg = read_config()
@@ -806,32 +787,14 @@ def load_users():
 
 
 def enrolled_lanes(user, all_lanes):
-    """The lanes this account qualifies for right now, history gate applied.
-
-    Every reader of a lane list has to ask the same question the filler asks.
-    Asking it without the gate reports lanes the filler will skip, which is how
-    an auto-enrolled account with no history raised twelve "lane has not run"
-    alerts on the night it was added.
-    """
+    """The lanes this account qualifies for now, with the min_watched gate applied.
+    Every reader of a lane list needs the gate, or it names lanes the filler will skip."""
     return lanes_for(user, all_lanes, watch_count(user["email"]))
 
 
 def lanes_for(user, lanes, watched=None):
     """The lanes one account gets, in lanes.yml order, with its overrides applied.
-
-    `lanes: all` is for the account that wants the whole library; everyone else
-    names the few they want, because a three-lane household member does not
-    need Shorts, Live streams and two mixes.
-
-    The order is lanes.yml's, never the user's list: mix lanes have to run after
-    the lanes they read, and that ordering is a property of the config, not of
-    who is being filled.
-
-    Pass `watched` to drop the lanes this account has too little history to
-    fill. That is what keeps auto-enrolment from handing a new account a dozen
-    playlists that come back empty; the lanes appear on their own once the
-    history is there.
-    """
+    Pass `watched` to also drop the lanes it has too little history to fill."""
     want = user.get("lanes", "all")
     if want != "all":
         want = set(want or [])
@@ -850,11 +813,7 @@ def lanes_for(user, lanes, watched=None):
 
 def overridden_lane(lane, patch):
     """One lane with a per-user patch applied, its inert-key list recomputed.
-
-    Without the recompute an override that sets a key the policy never reads is
-    the one place `ignored` cannot warn about, which is the case most likely to
-    be written by hand and never noticed.
-    """
+    Recomputed because an override is the one place `ignored` would not warn."""
     merged = merge_lane(lane, patch)
     merged["ignored"] = sorted(
         set(lane.get("ignored") or []) | set(ignored_keys(merged["policy"], patch)))
@@ -862,12 +821,7 @@ def overridden_lane(lane, patch):
 
 
 def account_order(users):
-    """Accounts least-recently-succeeded first.
-
-    The fetch budget is global and divided, so whoever is served last is the one
-    an exhausted budget starves. Rotating on the last successful run means that
-    is a different account each night instead of the same one for ever.
-    """
+    """Accounts least-recently-succeeded first, so a spent budget starves a different one."""
     seen = dict((r[0], float(r[1] or 0)) for r in query(
         "SELECT account, extract(epoch FROM max(started)) FROM suggest.runs "
         "WHERE coalesce(error,'') = '' GROUP BY 1;"))
@@ -876,10 +830,7 @@ def account_order(users):
 
 def read_user():
     """This account's watch history, newest last, and its subscription ucids.
-
-    A missing account aborts rather than exits: one misspelled `users:` entry
-    must not cost the correctly spelled accounts their nightly run.
-    """
+    A missing account raises rather than exits, so one bad `users:` entry costs only itself."""
     if not ACCOUNT:
         sys.exit("set IV_SUGGEST_ACCOUNT to the Invidious account to fill "
                  "(the value in users.email)")
@@ -893,19 +844,7 @@ def read_user():
 
 
 def read_blocked():
-    """Channel ids no lane may offer, as {ucid: channel name}.
-
-    Two sources, unioned. The first is a plain Invidious playlist on the bot's
-    own account: every client can already add a video to a playlist, and the
-    playlist is server side, so the list needs no new endpoint, no fork change
-    and no per-device sync. A video is only a handle on its channel here — one
-    entry blocks everything that channel publishes, and the entry can stay in
-    the playlist as the record of why. The second is `blocklist.channels` in
-    the config, for a channel with no video convenient to tap.
-
-    A lane playlist is excluded by id: naming a lane "Blocked" would otherwise
-    feed the lane's own contents back as a blocklist and empty it.
-    """
+    """Channel ids no lane may offer, as {ucid: channel name}, from the playlist and the config."""
     cfg = dict(BLOCKLIST_DEFAULTS)
     cfg.update(read_config().get("blocklist") or {})
     blocked = {}
@@ -921,11 +860,7 @@ def read_blocked():
 
 def channels_tapped_by_playlist(title):
     """(ucid, author) of every video in this account's playlist of that title.
-
-    Lanes are excluded across every account, deliberately: a playlist id is
-    unique instance wide, so scoping the exclusion would let one account's
-    "Blocked" playlist swallow another account's lane.
-    """
+    Lanes are excluded across every account: a plid is unique instance wide."""
     return query("SELECT DISTINCT coalesce(pv.ucid,''), coalesce(pv.author,'') "
                  "FROM playlists p JOIN playlist_videos pv ON pv.plid = p.id "
                  "WHERE p.author=%s AND lower(p.title)=lower(%s) "
@@ -940,11 +875,7 @@ def lane_plid(account, lane_id):
 
 
 def force_privacy(plid, title, privacy):
-    """Re-apply privacy after a create, which Invidious ignores and stores Public.
-
-    A public playlist is readable by anyone holding the plid, and /api/ has no
-    Authelia in front of it.
-    """
+    """Re-apply privacy after a create, which Invidious ignores and stores Public."""
     api("PATCH", "/api/v1/auth/playlists/" + plid,
         {"title": title, "privacy": privacy})
 
@@ -977,15 +908,7 @@ def playlist_of(lane, dry):
 
 
 def seed_order(watched, seed_cfg):
-    """History ids in the order the seed picker walks them, newest first.
-
-    The default order is the plain history, so the same run picks the same
-    seeds, expands the same recommendations and lands on the same candidates.
-    `shuffle_window: N` draws the N most recent entries in random order instead,
-    which makes the candidate set different every night even if nothing new was
-    watched. `recent: M` pins the M newest in front of the shuffle, so what was
-    just played still leads.
-    """
+    """History ids in the order the seed picker walks them, newest first."""
     hist = list(reversed(watched))
     window = int((seed_cfg or {}).get("shuffle_window") or 0)
     if window < 2:
@@ -997,11 +920,7 @@ def seed_order(watched, seed_cfg):
 
 
 def cooldown_days_for(lane, why):
-    """Days a swept video is held out; a blocked channel gets none.
-
-    Unblocking a channel has to let its videos back the same night, so the
-    blocklist stays the only thing keeping them out.
-    """
+    """Days a swept video is held out; a blocked channel gets none, so unblocking is instant."""
     if why == "blocked":
         return 0
     return {"watched": lane["watched_cooldown_days"],
