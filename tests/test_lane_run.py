@@ -193,6 +193,11 @@ class LaneCase(unittest.TestCase):
         return self.mod.merge_lane(
             base, dict({"id": "lane1", "title": "Lane One"}, **patch))
 
+    def context(self, watched=(), subs=(), blocked=None, dry=False,
+                seed_override=None):
+        return self.mod.LaneRun(list(watched), set(watched), set(subs),
+                                blocked or {}, self.fetch, dry, seed_override)
+
     def fill(self, lane, watched=(), subs=(), blocked=None, dry=False,
              seed_override=None, db=None, api=None, fetch=None):
         self.db = db or Db()
@@ -200,8 +205,8 @@ class LaneCase(unittest.TestCase):
         self.fetch = fetch or Fetch()
         self.db.install(self.mod)
         self.api.install(self.mod)
-        return self.mod.run_lane(lane, list(watched), set(watched), set(subs),
-                                 blocked or {}, self.fetch, dry, seed_override)
+        return self.mod.run_lane(
+            lane, self.context(watched, subs, blocked, dry, seed_override))
 
     def logged(self, fragment):
         return [line for line in self.said if fragment in line]
@@ -493,6 +498,32 @@ class Filter(LaneCase):
         self.assertEqual(2, len(got))
 
 
+class RunContext(LaneCase):
+    """The values that hold still for a whole account must not be interchangeable."""
+
+    def test_watched_subscribed_and_blocked_each_reject_their_own_candidate(self):
+        recs = {"h0000000000": {"recommendedVideos": [
+            rec("ccccccccccc", author_id="UC-ok"),
+            rec("ddddddddddd", author_id="UC-sub"),
+            rec("eeeeeeeeeee", author_id="UC-bad"),
+            rec("fffffffffff", author_id="UC-ok")]}}
+        self.fill(self.lane(), watched=["h0000000000", "fffffffffff"],
+                  subs=["UC-sub"], blocked={"UC-bad": "Bad"},
+                  db=Db(), api=Api(), fetch=Fetch(recs=recs))
+        self.assertEqual(["ccccccccccc"], self.api.added())
+        rejected = self.logged("rejected")[0]
+        self.assertIn("'watched': 1", rejected)
+        self.assertIn("'subscribed': 1", rejected)
+        self.assertIn("'blocked': 1", rejected)
+
+    def test_one_fetcher_is_shared_by_the_seed_scan_and_the_expansion(self):
+        fetch = Fetch(recs={"h0000000000": {"recommendedVideos": [rec("ccccccccccc")]}})
+        removed, added, kept, used = self.fill(
+            self.lane(), watched=["h0000000000"], db=Db(), api=Api(), fetch=fetch)
+        self.assertEqual(fetch.fetches, used)
+        self.assertEqual(1, added)
+
+
 class GenreAndSampling(LaneCase):
     """The branches that cost extra fetches or bring randomness in."""
 
@@ -609,8 +640,8 @@ class LastPlayed(LaneCase):
         self.fetch = fetch or Fetch()
         self.db.install(self.mod)
         self.api.install(self.mod)
-        return self.mod.run_lane_last_played(lane, list(watched), blocked or {},
-                                             self.fetch, dry)
+        return self.mod.run_lane_last_played(
+            lane, self.context(watched, blocked=blocked, dry=dry))
 
     def test_the_most_recently_played_become_the_lane_newest_first(self):
         self.play(self.lane(policy="last_played", size=2),

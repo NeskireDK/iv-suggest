@@ -117,10 +117,13 @@ class PerViewer(unittest.TestCase):
         lane.update(over)
         return lane
 
+    def context(self, watched=(), blocked=(), dry=True):
+        return self.mod.LaneRun(list(watched), set(watched), set(),
+                                set(blocked), None, dry, None)
+
     # NB: not called run(); that is TestCase's own entry point.
     def mixed(self, watched=(), blocked=()):
-        return self.mod.run_lane_mix(self.lane(), set(watched), set(blocked),
-                                     dry=True)
+        return self.mod.run_lane_mix(self.lane(), self.context(watched, blocked))
 
     def test_the_sources_are_read_over_sql_not_the_api(self):
         """Blending another account's lane must not need their session."""
@@ -156,7 +159,7 @@ class PerViewer(unittest.TestCase):
         self.mod.execute = lambda sql: self.fail("a mix wrote state: %s" % sql)
         self.mod.api = lambda method, path, body=None: calls.append(method)
         removed, added, kept, used = self.mod.run_lane_mix(
-            self.lane(), set(), set(), dry=False)
+            self.lane(), self.context(dry=False))
         self.assertEqual(0, used)
         self.assertTrue(added)
         self.assertEqual({"POST"}, set(calls))
@@ -167,7 +170,7 @@ class PerViewer(unittest.TestCase):
         self.mod.api = lambda method, path, body=None: calls.append((method, path))
         self.mod.playlist_of = lambda lane, dry: (
             "PL_home", {"videos": [{"videoId": "old1", "indexId": "ix1"}]})
-        self.mod.run_lane_mix(self.lane(), set(), set(), dry=False)
+        self.mod.run_lane_mix(self.lane(), self.context(dry=False))
         self.assertEqual(("DELETE", "/api/v1/auth/playlists/PL_home/videos/ix1"),
                          calls[0])
         self.assertEqual({"POST"}, {m for m, _ in calls[1:]})

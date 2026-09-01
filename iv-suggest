@@ -1062,25 +1062,27 @@ def add_to_lane(lane_id, plid, vid, score, song, fetcher):
     return True
 
 
-def run_lane(lane, watched, watched_set, subs, blocked, fetcher, dry,
-             seed_override=None):
+LaneRun = namedtuple(
+    "LaneRun", "watched watched_set subs blocked fetcher dry seed_override")
+
+
+def run_lane(lane, run):
     lane_id = lane["id"]
     log("\nlane %s  (%s)" % (lane_id, lane["title"]))
-    started = fetcher.fetches
-    fetcher.begin_lane(lane["fetch_cap"])
-    plid, playlist = playlist_of(lane, dry)
+    started = run.fetcher.fetches
+    run.fetcher.begin_lane(lane["fetch_cap"])
+    plid, playlist = playlist_of(lane, run.dry)
     current = playlist.get("videos") or []
-    drop, keep, room = sweep_lane(lane, current, watched_set, blocked, plid, dry)
+    drop, keep, room = sweep_lane(lane, current, plid, run)
     if room <= 0:
-        return len(drop), 0, len(keep), fetcher.fetches - started
-    seeds, seed_free = pick_seeds(lane, watched, blocked, fetcher, seed_override)
+        return len(drop), 0, len(keep), run.fetcher.fetches - started
+    seeds, seed_free = pick_seeds(lane, run)
     if not seeds and not seed_free:
-        return len(drop), 0, len(keep), fetcher.fetches - started
-    scores, meta_seen = expand_candidates(lane, seeds, subs, blocked, fetcher, room)
-    chosen = choose_candidates(lane, scores, meta_seen, keep, drop, watched_set,
-                               subs, blocked, fetcher, room)
-    refused = reconcile_playlist(lane, chosen, plid, fetcher, dry)
-    return len(drop), len(chosen) - refused, len(keep), fetcher.fetches - started
+        return len(drop), 0, len(keep), run.fetcher.fetches - started
+    scores, meta_seen = expand_candidates(lane, seeds, room, run)
+    chosen = choose_candidates(lane, scores, meta_seen, keep, drop, room, run)
+    refused = reconcile_playlist(lane, chosen, plid, run)
+    return len(drop), len(chosen) - refused, len(keep), run.fetcher.fetches - started
 
 
 def adopted_item_state(lane_id, current, dry):
@@ -1109,10 +1111,10 @@ def adopted_item_state(lane_id, current, dry):
     return added_at, added_ts, item_score
 
 
-def sweep_lane(lane, current, watched_set, blocked, plid, dry):
+def sweep_lane(lane, current, plid, run):
     """What leaves the lane tonight, what stays, and the room that opens up."""
     lane_id = lane["id"]
-    added_at, added_ts, item_score = adopted_item_state(lane_id, current, dry)
+    added_at, added_ts, item_score = adopted_item_state(lane_id, current, run.dry)
     ttl = lane["ttl_days"]
     old = one("SELECT to_char(now() - interval '%d days','YYYY-MM-DD');" % ttl) if ttl else ""
     drop, keep = [], []
@@ -1121,9 +1123,9 @@ def sweep_lane(lane, current, watched_set, blocked, plid, dry):
         why = None
         # Blocked first: a channel blocked today must leave the lanes tonight,
         # not in `ttl_days` time.
-        if v.get("authorId") in blocked:
+        if v.get("authorId") in run.blocked:
             why = "blocked"
-        elif lane["exclude_watched"] and vid in watched_set:
+        elif lane["exclude_watched"] and vid in run.watched_set:
             why = "watched"
         elif ttl and added_at.get(vid, "9999") < old:
             why = "expired"
@@ -1145,14 +1147,14 @@ def sweep_lane(lane, current, watched_set, blocked, plid, dry):
 
     for v, why in drop:
         log("  - %-9s %s" % (why, v["title"][:60]))
-        if not dry:
+        if not run.dry:
             retire_item(lane_id, plid, v, cooldown_days_for(lane, why), why)
     room = lane["size"] - len(keep)
     log("  swept %d, kept %d, room for %d" % (len(drop), len(keep), room))
     return drop, keep, room
 
 
-def pick_seeds(lane, watched, blocked, fetcher, seed_override):
+def pick_seeds(lane, run):
     """The history ids this lane expands. A subscription_feed lane needs none."""
     seed_free = lane["expand"] == "subscription_feed"
     seeds = []
@@ -1161,21 +1163,21 @@ def pick_seeds(lane, watched, blocked, fetcher, seed_override):
     seed_cfg = lane["seed"]
     want_genre = (seed_cfg or {}).get("genre")
     limit = seed_cfg.get("limit", lane["size"])
-    if seed_override:
-        limit = min(limit, seed_override)
+    if run.seed_override:
+        limit = min(limit, run.seed_override)
     scan = seed_cfg.get("scan", limit * 20 if want_genre else limit)
     short = ""
-    for vid in ([] if seed_free else seed_order(watched, seed_cfg)):
+    for vid in ([] if seed_free else seed_order(run.watched, seed_cfg)):
         if len(seeds) >= limit or scan <= 0:
             break
         scan -= 1
         # Cache only, never a fetch: an unknown seed is worth expanding, and the
         # candidate check catches its recommendations anyway.
-        if (fetcher.meta.get(vid) or {}).get("authorId") in blocked:
+        if (run.fetcher.meta.get(vid) or {}).get("authorId") in run.blocked:
             continue
         if want_genre:
             try:
-                meta = fetcher.meta_of(vid)
+                meta = run.fetcher.meta_of(vid)
             except BudgetSpent as e:
                 short = " [%s, using what was found]" % e
                 break
@@ -1184,11 +1186,11 @@ def pick_seeds(lane, watched, blocked, fetcher, seed_override):
         seeds.append(vid)
     if not seed_free:
         log("  seeds %d (lane fetches %d, cache hits %d)%s"
-            % (len(seeds), fetcher.lane_used, fetcher.cache_hits, short))
+            % (len(seeds), run.fetcher.lane_used, run.fetcher.cache_hits, short))
     return seeds, seed_free
 
 
-def expand_candidates(lane, seeds, subs, blocked, fetcher, room):
+def expand_candidates(lane, seeds, room, run):
     """Candidate ids scored by the lane's expand source, with their listing meta."""
     scores, meta_seen = {}, {}
     rec_age = lane["recommend_max_age_days"]
@@ -1196,7 +1198,7 @@ def expand_candidates(lane, seeds, subs, blocked, fetcher, room):
     if lane["expand"] == "recommended":
         for rank, vid in enumerate(seeds):
             try:
-                data = fetcher.video(vid)
+                data = run.fetcher.video(vid)
             except BudgetSpent as e:
                 log("  %s, expanding only the first %d seeds" % (e, rank))
                 break
@@ -1222,8 +1224,8 @@ def expand_candidates(lane, seeds, subs, blocked, fetcher, room):
         # content without depending on new watch history.
         counts = {}
         for vid in seeds:
-            cid = (fetcher.meta.get(vid) or {}).get("authorId")
-            if cid and cid not in subs and cid not in blocked:
+            cid = (run.fetcher.meta.get(vid) or {}).get("authorId")
+            if cid and cid not in run.subs and cid not in run.blocked:
                 counts[cid] = counts.get(cid, 0) + 1
         # Weighted draw, not the plain top N: a channel watched twice still gets
         # a turn now and then instead of never.
@@ -1235,7 +1237,7 @@ def expand_candidates(lane, seeds, subs, blocked, fetcher, room):
         cutoff = time.time() - lane["max_age_days"] * 86400.0
         for rank, (cid, n) in enumerate(picks):
             try:
-                data = fetcher.channel_latest(cid)
+                data = run.fetcher.channel_latest(cid)
             except BudgetSpent as e:
                 log("  %s, read only the first %d channels" % (e, rank))
                 break
@@ -1261,7 +1263,7 @@ def expand_candidates(lane, seeds, subs, blocked, fetcher, room):
         rank_by = sub_cfg.get("rank") or "views"
         # A blocked channel may still be subscribed: the subscription feed is
         # the one source that reads `subs` directly, so subtract there too.
-        feed_subs = subs - set(blocked)
+        feed_subs = run.subs - set(run.blocked)
         if not kinds:
             log("  no valid kinds configured, nothing to do")
         elif not feed_subs:
@@ -1293,12 +1295,11 @@ def expand_candidates(lane, seeds, subs, blocked, fetcher, room):
     else:                                              # expand: none
         for rank, vid in enumerate(seeds):
             scores[vid] = 1.0 - rank / 100000.0         # keep the watch order
-            meta_seen[vid] = fetcher.meta.get(vid, {})
+            meta_seen[vid] = run.fetcher.meta.get(vid, {})
     return scores, meta_seen
 
 
-def choose_candidates(lane, scores, meta_seen, keep, drop, watched_set, subs,
-                      blocked, fetcher, room):
+def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
     """The candidates that pass every filter, as [(vid, score, meta, song), ...]."""
     lane_id = lane["id"]
     cool = {r[0] for r in query(
@@ -1359,10 +1360,10 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, watched_set, subs,
         if vid in in_lane:
             rejected["in_lane"] += 1
             continue
-        if vid in fetcher.dead:          # known unfetchable, do not offer it again
+        if vid in run.fetcher.dead:          # known unfetchable, do not offer it again
             rejected["dead"] += 1
             continue
-        if lane["exclude_watched"] and vid in watched_set:
+        if lane["exclude_watched"] and vid in run.watched_set:
             rejected["watched"] += 1
             continue
         if vid in cool:
@@ -1371,11 +1372,11 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, watched_set, subs,
         if vid in elsewhere:
             rejected["other_lane"] += 1
             continue
-        meta = fetcher.known(vid) or meta_seen.get(vid) or {}
-        if meta.get("authorId") in blocked:
+        meta = run.fetcher.known(vid) or meta_seen.get(vid) or {}
+        if meta.get("authorId") in run.blocked:
             rejected["blocked"] += 1
             continue
-        if lane["exclude_subscribed"] and meta.get("authorId") in subs:
+        if lane["exclude_subscribed"] and meta.get("authorId") in run.subs:
             rejected["subscribed"] += 1
             continue
         secs = meta.get("seconds") or 0
@@ -1392,7 +1393,7 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, watched_set, subs,
                 log("  genre check cap reached after %d candidates" % checked)
                 break
             try:
-                full = fetcher.meta_of(vid)
+                full = run.fetcher.meta_of(vid)
             except BudgetSpent as e:
                 log("  %s during the genre check" % e)
                 break
@@ -1419,16 +1420,16 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, watched_set, subs,
     return chosen
 
 
-def reconcile_playlist(lane, chosen, plid, fetcher, dry):
+def reconcile_playlist(lane, chosen, plid, run):
     """Add the chosen videos to the lane's playlist. Returns how many were refused."""
     lane_id = lane["id"]
     refused, added = 0, []
     for vid, score, meta, skey in chosen:
         log("  + %5.2f  %-52s %s" % (score, (meta.get("title") or vid)[:52],
                                      (meta.get("author") or meta.get("authorId") or "")[:24]))
-        if dry:
+        if run.dry:
             continue
-        if not add_to_lane(lane_id, plid, vid, score, skey, fetcher):
+        if not add_to_lane(lane_id, plid, vid, score, skey, run.fetcher):
             refused += 1
             continue
         added.append((vid, meta))
@@ -1438,12 +1439,12 @@ def reconcile_playlist(lane, chosen, plid, fetcher, dry):
     # landed, so the Trending/Popular feed can show their view counts. Only the
     # ones that landed, and in one statement: a run sees 300+ candidates, and a
     # row per candidate would cost hundreds of psql round trips for nothing.
-    if not dry and added:
-        fetcher.remember_partial(added)
+    if not run.dry and added:
+        run.fetcher.remember_partial(added)
     return refused
 
 
-def run_lane_last_played(lane, watched, blocked, fetcher, dry):
+def run_lane_last_played(lane, run):
     """Hold the N most recently PLAYED videos that match the lane.
 
     Invidious does `array_append(array_remove(watched, id), id)` on every play, so
@@ -1458,30 +1459,30 @@ def run_lane_last_played(lane, watched, blocked, fetcher, dry):
     """
     lane_id = lane["id"]
     log("\nlane %s  (%s)  policy last_played" % (lane_id, lane["title"]))
-    started = fetcher.fetches
-    fetcher.begin_lane(lane["fetch_cap"])
-    plid, playlist = playlist_of(lane, dry)
+    started = run.fetcher.fetches
+    run.fetcher.begin_lane(lane["fetch_cap"])
+    plid, playlist = playlist_of(lane, run.dry)
     current = {v["videoId"]: v for v in (playlist.get("videos") or [])}
 
     size = lane["size"]
     want_genre = (lane["seed"] or {}).get("genre")
     scan_limit = (lane["seed"] or {}).get("scan", size * 6)
     desired, keys, scanned, stopped = [], set(), 0, ""
-    for vid in reversed(watched):                      # newest play first
+    for vid in reversed(run.watched):                  # newest play first
         if len(desired) >= size or scanned >= scan_limit:
             break
         scanned += 1
         if want_genre:
             try:
-                meta = fetcher.meta_of(vid)
+                meta = run.fetcher.meta_of(vid)
             except BudgetSpent as e:
                 stopped = str(e)
                 break
             if not meta or (meta.get("genre") or "") != want_genre:
                 continue
         else:
-            meta = fetcher.meta.get(vid) or {}
-        if meta.get("authorId") in blocked:
+            meta = run.fetcher.meta.get(vid) or {}
+        if meta.get("authorId") in run.blocked:
             continue
         if lane["dedupe_songs"]:
             key = song_key(meta.get("title"), meta.get("author"))
@@ -1511,7 +1512,7 @@ def run_lane_last_played(lane, watched, blocked, fetcher, dry):
     # not, so they are collected separately and merged.
     dropped = {v["videoId"] for v in to_drop}
     to_drop += [v for vid, v in current.items()
-                if vid not in dropped and v.get("authorId") in blocked]
+                if vid not in dropped and v.get("authorId") in run.blocked]
     to_add = [v for v in desired if v not in current]
 
     # Give every entry a score from its last-played rank. This lane used to
@@ -1521,7 +1522,7 @@ def run_lane_last_played(lane, watched, blocked, fetcher, dry):
     # enough to survive the shuffle's jitter, so what was played most recently
     # still leads and the reorder moves videos around inside that.
     decay = lane["played_decay"]
-    if not dry and desired:
+    if not run.dry and desired:
         values = ",".join(
             "(%s,%s,%s,%s)" % (acct(), lit(lane_id), lit(vid),
                                round(10.0 * (decay ** rank), 4))
@@ -1533,26 +1534,26 @@ def run_lane_last_played(lane, watched, blocked, fetcher, dry):
 
     for v in to_drop:
         log("  - %s: %s"
-            % ("blocked" if v.get("authorId") in blocked else "not played lately",
+            % ("blocked" if v.get("authorId") in run.blocked else "not played lately",
                (v["title"] or "")[:60]))
-        if not dry:
+        if not run.dry:
             retire_item(lane_id, plid, v, cooldown_days=0)
     refused = 0
     for vid in to_add:
-        meta = fetcher.meta.get(vid) or {}
+        meta = run.fetcher.meta.get(vid) or {}
         log("  + %-52s %s" % ((meta.get("title") or vid)[:52], (meta.get("author") or "")[:24]))
-        if dry:
+        if run.dry:
             continue
         if not add_to_lane(lane_id, plid, vid,
                            10.0 * (decay ** desired.index(vid)),
                            song_key(meta.get("title"), meta.get("author")),
-                           fetcher):
+                           run.fetcher):
             refused += 1
     kept = len(current) - len(to_drop)
     added = len(to_add) - refused
     log("  now %d videos (kept %d, added %d, removed %d)"
         % (kept + added, kept, added, len(to_drop)))
-    return len(to_drop), added, kept, fetcher.fetches - started
+    return len(to_drop), added, kept, run.fetcher.fetches - started
 
 
 def expand_source(src):
@@ -1664,7 +1665,7 @@ def weighted_mix(sources, size, pure=0):
     return out
 
 
-def run_lane_mix(lane, watched_set, blocked, dry):
+def run_lane_mix(lane, run):
     """Rebuild one playlist from several source lanes, filtered for the viewer.
 
     Costs no YouTube fetch and writes no suggest.items row, so the other lanes
@@ -1684,8 +1685,8 @@ def run_lane_mix(lane, watched_set, blocked, dry):
             raise Aborted("source lane %r of %s has no playlist yet"
                           % (src["lane"], owner))
         return [vid for vid, ucid in playlist_videos(src_plid)
-                if ucid not in blocked
-                and not (lane["exclude_watched"] and vid in watched_set)]
+                if ucid not in run.blocked
+                and not (lane["exclude_watched"] and vid in run.watched_set)]
 
     sources = []
     for s in mix_sources(mix):
@@ -1700,12 +1701,12 @@ def run_lane_mix(lane, watched_set, blocked, dry):
            ", ".join("%s %d avail/%.0f%%" % (s["key"], len(s["vids"]),
                                              s["share"] * 100) for s in sources)))
 
-    plid, playlist = playlist_of(lane, dry)
+    plid, playlist = playlist_of(lane, run.dry)
     current = [v["videoId"] for v in (playlist.get("videos") or [])]
     if current == desired:
         log("  order unchanged, %d videos, nothing to do" % len(current))
         return 0, 0, len(current), 0
-    if dry:
+    if run.dry:
         log("  would rebuild to %d videos (%d now)" % (len(desired), len(current)))
         return len(current), len(desired), 0, 0
     for v in (playlist.get("videos") or []):
@@ -1783,32 +1784,28 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
         if not lanes:
             log("\naccount %s: no lane %r" % (ACCOUNT, args.lane))
             return 0
-    watched_set = set(watched)
-    blocked = read_blocked()
+    run = LaneRun(watched, set(watched), subs, read_blocked(), fetcher,
+                  args.dry_run, seed_override)
     # The watch count is logged because it is the whole cause of a thin lane on
     # a new account, and nothing else makes that visible.
     log("\naccount %s: %d watched, %d subscriptions, %d blocked, %d lanes, "
         "%d fetches of budget"
-        % (ACCOUNT, len(watched), len(subs), len(blocked), len(lanes),
+        % (ACCOUNT, len(watched), len(subs), len(run.blocked), len(lanes),
            fetcher.budget - fetcher.fetches))
     if held_back:
         log("held back until there is more history: %s" % ", ".join(held_back))
-    if blocked:
-        log("blocked: %s" % ", ".join(sorted(blocked.values())))
+    if run.blocked:
+        log("blocked: %s" % ", ".join(sorted(run.blocked.values())))
     failed = 0
     for lane in lanes:
         error = None
         try:
             if lane["policy"] == "last_played":
-                removed, added, kept, used = run_lane_last_played(
-                    lane, watched, blocked, fetcher, args.dry_run)
+                removed, added, kept, used = run_lane_last_played(lane, run)
             elif lane["policy"] == "mix":
-                removed, added, kept, used = run_lane_mix(
-                    lane, watched_set, blocked, args.dry_run)
+                removed, added, kept, used = run_lane_mix(lane, run)
             else:
-                removed, added, kept, used = run_lane(
-                    lane, watched, watched_set, subs, blocked, fetcher,
-                    args.dry_run, seed_override)
+                removed, added, kept, used = run_lane(lane, run)
         except Aborted as e:
             removed = added = kept = used = 0
             error = str(e)
