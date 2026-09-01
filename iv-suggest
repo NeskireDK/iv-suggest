@@ -2064,18 +2064,12 @@ def dedupe_account(args):
     return 0
 
 
-def cmd_views(args):
-    """Refresh the recorded view counts of every video the bot's playlists hold.
+def videos_across_every_lane(args):
+    """The distinct video ids held by every lane of every wanted account.
 
-    Every /api/v1/videos/<id> call reaches YouTube, so this reuses the Fetcher's
-    pacing/budget/backoff exactly like a run -- but it must see the CURRENT
-    count, not whatever the metadata cache already has, so it calls video()
-    for every video regardless of what the cache says. video() itself already
-    treats a lone HTTP 500 as a known upstream parser bug: it logs, skips the
-    one video, and keeps going; only 5 consecutive failures of any kind abort.
+    Distinct because a view count is a property of the video: two accounts
+    holding the same one pay for a single refresh.
     """
-    # Every account's lanes into one set: a view count is a property of the
-    # video, so two accounts holding the same video pay for one refresh.
     vids = set()
     for user in accounts_wanted(args):
         use_account(user["email"])
@@ -2086,6 +2080,20 @@ def cmd_views(args):
             log("%-24s lane %-16s %d videos"
                 % (user["email"], lane_id, len(videos)))
             vids.update(v["videoId"] for v in videos)
+    return vids
+
+
+def cmd_views(args):
+    """Refresh the recorded view counts of every video the bot's playlists hold.
+
+    Every /api/v1/videos/<id> call reaches YouTube, so this reuses the Fetcher's
+    pacing/budget/backoff exactly like a run -- but it must see the CURRENT
+    count, not whatever the metadata cache already has, so it calls video()
+    for every video regardless of what the cache says. video() itself already
+    treats a lone HTTP 500 as a known upstream parser bug: it logs, skips the
+    one video, and keeps going; only 5 consecutive failures of any kind abort.
+    """
+    vids = videos_across_every_lane(args)
     log("%d unique videos across every lane of every account" % len(vids))
 
     fetcher = Fetcher(rate_per_min=args.rate, budget=args.budget)
@@ -2095,7 +2103,7 @@ def cmd_views(args):
         before_500, before_dead = fetcher.skipped_500, fetcher.dead_hits
         try:
             data = fetcher.video(vid)
-        except Aborted as e:               # BudgetSpent is also an Aborted
+        except Aborted as e:
             stopped = str(e)
             break
         if data:
@@ -2350,7 +2358,7 @@ def shuffle_account(user, all_lanes, args):
             result = shuffle_lane(lane, orders, args.dry_run)
             if result is not None:
                 orders[lane["id"]] = result
-        except Exception as e:          # one lane must not cost the others
+        except Exception as e:
             failed += 1
             log("lane %-16s ERROR: %r" % (lane["id"], e))
             if not args.dry_run:
@@ -2470,6 +2478,24 @@ def lane_target(lane):
     return 0 if lane["policy"] == "mix" else lane["size"]
 
 
+def lane_facts():
+    """Everything the metrics need about the current account's lanes.
+
+    One query per table, which is what keeps the exporter cheap enough to
+    scrape every 15 minutes.
+    """
+    return (tracked_by_lane(),
+            dict((r[0], float(r[1])) for r in query(
+                "SELECT lane, extract(epoch FROM max(added)) FROM suggest.items "
+                "WHERE account=%s GROUP BY 1;" % acct())),
+            last_run_by_lane(),
+            dict((r[0], r[1]) for r in query(
+                "SELECT lane, plid FROM suggest.lanes WHERE account=%s;" % acct())),
+            dict((r[0], r[1]) for r in query(
+                "SELECT DISTINCT ON (lane) lane, moved FROM suggest.shuffles "
+                "WHERE account=%s ORDER BY lane, ran DESC;" % acct())))
+
+
 def cmd_metrics(args):
     """Print the Prometheus text form. Database only, never a YouTube fetch.
 
@@ -2497,24 +2523,16 @@ def cmd_metrics(args):
         lanes = enrolled_lanes(user, all_lanes)
         held_back = len(lanes_for(user, all_lanes)) - len(lanes)
 
-        # One query per table per account keeps this cheap enough to run every
-        # 15 minutes.
-        tracked = tracked_by_lane()
-        changed = dict((r[0], float(r[1])) for r in query(
-            "SELECT lane, extract(epoch FROM max(added)) FROM suggest.items "
-            "WHERE account=%s GROUP BY 1;" % acct()))
-        last = last_run_by_lane()
-        plids = dict((r[0], r[1]) for r in query(
-            "SELECT lane, plid FROM suggest.lanes WHERE account=%s;" % acct()))
-        shuffled = dict((r[0], r[1]) for r in query(
-            "SELECT DISTINCT ON (lane) lane, moved FROM suggest.shuffles "
-            "WHERE account=%s ORDER BY lane, ran DESC;" % acct()))
+        tracked, changed, last, plids, shuffled = lane_facts()
 
         def tag(lane, plids=plids):
-            # `expand` is exported so an alert can tell a lane whose supply is a
-            # fixed age window (subscription_feed) from one drawing on a growing
-            # recommendation graph. The first legitimately takes no new video for
-            # weeks when nothing was published; the second going quiet is a fault.
+            """One lane's Prometheus label set, `expand` included.
+
+            An alert needs `expand` to tell a lane whose supply is a fixed age
+            window (subscription_feed) from one drawing on a growing
+            recommendation graph: the first legitimately takes no new video for
+            weeks, while the second going quiet is a fault.
+            """
             return '{account="%s",lane="%s",policy="%s",expand="%s",plid="%s"}' % (
                 ACCOUNT, lane["id"], lane["policy"], lane["expand"],
                 plids.get(lane["id"], ""))
@@ -2568,8 +2586,24 @@ def cmd_metrics(args):
                  one("SELECT coalesce(array_length(watched,1),0) FROM users "
                      "WHERE email=%s;" % lit(ACCOUNT)) or 0)])
 
-    # Instance wide. The fetch budget and the metadata cache are shared, so
-    # these stay unlabelled and the alerts written against them still work.
+    _instance_wide_metrics(metric, users)
+
+    for name in order:
+        help_text, kind, samples = series[name]
+        out.append("# HELP iv_suggest_%s %s" % (name, help_text))
+        out.append("# TYPE iv_suggest_%s %s" % (name, kind))
+        for labels, value in samples:
+            out.append("iv_suggest_%s%s %s" % (name, labels, value))
+
+    print("\n".join(out))
+    return 0
+
+
+def _instance_wide_metrics(metric, users):
+    """The series with no account label, because the budget and cache are shared.
+
+    Unlabelled is what keeps the alerts already written against them working.
+    """
     metric("scrape_timestamp_seconds",
            "When this exporter last read the database.", "gauge",
            [("", "%d" % time.time())])
@@ -2598,16 +2632,6 @@ def cmd_metrics(args):
                      "WHERE until > now();") or 0)])
     metric("up", "1 when this exporter read the database.", "gauge",
            [("", 1)])
-
-    for name in order:
-        help_text, kind, samples = series[name]
-        out.append("# HELP iv_suggest_%s %s" % (name, help_text))
-        out.append("# TYPE iv_suggest_%s %s" % (name, kind))
-        for labels, value in samples:
-            out.append("iv_suggest_%s%s %s" % (name, labels, value))
-
-    print("\n".join(out))
-    return 0
 
 
 def needs_credential(cmd):
