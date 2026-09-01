@@ -1,7 +1,8 @@
 # TODO: the public feed, and what a brand new account sees
 
-Status: **section 2 built and live; section 1 specified, not built.** Written
-2026-08-31.
+Status: **section 2 built and live; section 1 built 2026-09-01 and not
+enabled** — no lane in `lanes.yml` sets `policy: consensus`, so nothing on the
+instance uses it yet. Written 2026-08-31.
 
 Two gaps, one moment: somebody opens the instance and the engine has nothing
 personal to offer them. A logged-out visitor has no account at all; a new account
@@ -23,7 +24,7 @@ is what the scoring below already wants — not as an access control.
 This unblocks section 1: the compiled playlist can be `privacy: public` and can
 be what `popular_playlists` points at.
 
-## 1. A public mix, compiled from everybody's — SPECIFIED
+## 1. A public mix, compiled from everybody's — BUILT, NOT ENABLED
 
 Decided 2026-08-31 (Andre): **the public feed is every account's home mix,
 resampled at random every hour, with a video ranked up the more mixes hold it.**
@@ -88,14 +89,43 @@ cannot regress the status quo.
 - **It lives on the bot's own account**, because nobody in particular owns it,
   with `privacy: public`, and `popular_playlists` points at it.
 
-### Open before building
+### Settled while building
 
-- `k`, the agreement multiplier's shape, and the sample size — all three are
-  taste, and all three are cheap to change once the lane exists.
-- Whether the hourly redraw should keep a video that is currently on screen
-  (the `fatigue` machinery in `shuffle` exists for exactly this) or draw fully
-  fresh each hour. Fully fresh is simpler and this playlist has no single viewer
-  to disorient.
+`policy: consensus`, its keys and their defaults are in
+[CONFIG.md](CONFIG.md#consensus); this is only why each number is what it is.
+
+- **`k` = 4** (`consensus.rank_offset`). It sets how much of the feed is the
+  mixes' own order and how much is agreement. At `k=1` the top of a mix
+  outweighs its tenth entry ten to one, so each mix's head is effectively
+  pinned; at `k=20` the mix's order barely survives and only agreement counts.
+  At 4 the ratio over the first ten entries is 3.5 to 1, and a video two mixes
+  hold at rank 4 outweighs another account's top pick — which is the editorial
+  stance this feed is meant to take.
+- **The agreement multiplier is `holders ** 1.0`** (`consensus.agreement_power`),
+  so two accounts agreeing doubles the weight and three treble it. Linear is the
+  simplest shape that makes agreement beat any depth a single mix can reach, and
+  the exponent is there because that is the knob worth turning: `0.0` is "no
+  consensus at all" and reads as a sanity switch.
+- **The sample size is the lane's own `size`.** No new key: `size` already means
+  "videos the lane holds", and a second name for it would be one more thing to
+  keep in step. The live value is a config change, not a code one.
+- **The hourly redraw is fully fresh.** No fatigue counter, no memory of what
+  was on screen last hour. A compiled lane writes no `suggest.items` row, so
+  there is nowhere to age a counter anyway, and there is no one viewer to
+  disorient. Membership still changes only nightly: the reorder permutes, which
+  is the same division `mix` already lives under.
+
+Two things the spec left ambiguous, resolved the same way:
+
+- "Redrawn every hour" and "the nightly run decides what is eligible" pull in
+  different directions once the pool is bigger than the lane. Membership is
+  nightly and the **order** is hourly, because the hourly reorder can only
+  permute a playlist without spending upstream writes on it, and because a
+  visitor opening the feed twice in a day sees a different top either way.
+- A source naming an account that has no such lane still aborts the lane, as it
+  does for `mix`: that is a typo, not enrolment. Only the `users: all` form is
+  allowed to skip a member silently, which is what makes an empty `home-mix`
+  contribute nothing.
 
 ## 2. Auto-enrol every account, and carry the ones with no history — BUILT
 

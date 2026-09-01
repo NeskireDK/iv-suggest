@@ -254,7 +254,16 @@ UNIVERSAL_LANE_KEYS = frozenset(
 POLICY_LANE_KEYS = {
     "last_played": frozenset(["seed", "dedupe_songs", "played_decay"]),
     "mix": frozenset(["exclude_watched", "mix"]),
+    "consensus": frozenset(["consensus"]),
 }
+
+CONSENSUS_DEFAULTS = {
+    "sources": [{"users": "all", "lane": "home-mix"}],
+    "rank_offset": 4.0,
+    "agreement_power": 1.0,
+}
+
+COMPILED_POLICIES = ("mix", "consensus")
 
 SHUFFLE_DEFAULTS = {
     "enabled": True,
@@ -683,7 +692,7 @@ def log(msg):
 
 
 _CONFIG_CACHE = {}
-MERGED_LANE_BLOCKS = ("shuffle", "subscription", "mix")
+MERGED_LANE_BLOCKS = ("shuffle", "subscription", "mix", "consensus")
 
 
 def read_config():
@@ -843,19 +852,37 @@ def read_user():
     return watched, subs
 
 
-def read_blocked():
-    """Channel ids no lane may offer, as {ucid: channel name}: the playlist plus the config."""
-    cfg = dict(BLOCKLIST_DEFAULTS)
-    cfg.update(read_config().get("blocklist") or {})
-    blocked = {}
-    title = (cfg.get("playlist") or "").strip()
-    if title and ACCOUNT:
-        for ucid, author in channels_tapped_by_playlist(title):
-            if ucid:
-                blocked[ucid] = author or ucid
-    for ucid in cfg.get("channels") or []:
+def blocklist_config():
+    """The `blocklist` block of lanes.yml over BLOCKLIST_DEFAULTS."""
+    return dict(BLOCKLIST_DEFAULTS, **(read_config().get("blocklist") or {}))
+
+
+def blocklist_title():
+    """The playlist title carrying the blocklist, or "" when that half is off."""
+    return (blocklist_config().get("playlist") or "").strip()
+
+
+def blocked_channels(tapped):
+    """{ucid: channel name} from tapped playlist rows, plus the channels in the config."""
+    blocked = {ucid: author or ucid for ucid, author in tapped if ucid}
+    for ucid in blocklist_config().get("channels") or []:
         blocked.setdefault(str(ucid), str(ucid))
     return blocked
+
+
+def read_blocked():
+    """Channel ids no lane may offer, as {ucid: channel name}: the playlist plus the config."""
+    title = blocklist_title()
+    return blocked_channels(
+        channels_tapped_by_playlist(title) if title and ACCOUNT else [])
+
+
+def household_blocked():
+    """Every managed account's blocklist, unioned: a consensus feed has no one viewer."""
+    title = blocklist_title()
+    accounts = [u["email"] for u in load_users()]
+    return blocked_channels(
+        channels_blocked_by_anyone(title, accounts) if title and accounts else [])
 
 
 def channels_tapped_by_playlist(title):
@@ -866,6 +893,15 @@ def channels_tapped_by_playlist(title):
                  "WHERE p.author=%s AND lower(p.title)=lower(%s) "
                  "AND p.id NOT IN (SELECT plid FROM suggest.lanes);"
                  % (lit(ACCOUNT), lit(title)))
+
+
+def channels_blocked_by_anyone(title, accounts):
+    """(ucid, author) of every video in any of these accounts' blocklist playlists."""
+    return query("SELECT DISTINCT coalesce(pv.ucid,''), coalesce(pv.author,'') "
+                 "FROM playlists p JOIN playlist_videos pv ON pv.plid = p.id "
+                 "WHERE p.author = ANY(%s) AND lower(p.title)=lower(%s) "
+                 "AND p.id NOT IN (SELECT plid FROM suggest.lanes);"
+                 % (_text_array(accounts), lit(title)))
 
 
 def lane_plid(account, lane_id):
@@ -1624,7 +1660,12 @@ def run_lane_mix(lane, run):
         % (len(desired), lane["size"],
            ", ".join("%s %d avail/%.0f%%" % (s["key"], len(s["vids"]),
                                              s["share"] * 100) for s in sources)))
+    return rebuild_playlist(lane, desired, run)
 
+
+def rebuild_playlist(lane, desired, run):
+    """Replace a compiled lane's playlist with `desired`, in order.
+    Returns (removed, added, kept, fetches), and its fetches are always none."""
     plid, playlist = playlist_of(lane, run.dry)
     current = [v["videoId"] for v in (playlist.get("videos") or [])]
     if current == desired:
@@ -1639,6 +1680,89 @@ def run_lane_mix(lane, run):
         api("POST", "/api/v1/auth/playlists/%s/videos" % plid, {"videoId": vid})
     log("  rebuilt: %d videos (was %d)" % (len(desired), len(current)))
     return len(current), len(desired), 0, 0
+
+
+def consensus_config(lane):
+    """One consensus lane's `consensus:` block over CONSENSUS_DEFAULTS, validated."""
+    cfg = dict(CONSENSUS_DEFAULTS, **(lane.get("consensus") or {}))
+    if float(cfg["rank_offset"]) <= 0:
+        raise Aborted("consensus.rank_offset must be above zero: rank 0 divides by it")
+    return cfg
+
+
+def consensus_source_mixes(cfg):
+    """A consensus lane's sources, one entry per account once `users: all` expands."""
+    mixes = [expanded for src in (cfg.get("sources") or [])
+             for expanded in expand_source(src)]
+    for src in mixes:
+        src["key"] = share_key(src)
+    return mixes
+
+
+def consensus_mixes(cfg, blocked):
+    """Every source mix that exists, its videos in display order, blocked channels dropped."""
+    mixes = []
+    for src in consensus_source_mixes(cfg):
+        owner = src["user"] or ACCOUNT
+        plid = lane_plid(owner, src["lane"])
+        if not plid:
+            if src["optional"]:
+                continue
+            raise Aborted("source lane %r of %s has no playlist yet"
+                          % (src["lane"], owner))
+        src["vids"] = [vid for vid, ucid in playlist_videos(plid)
+                       if ucid not in blocked]
+        mixes.append(src)
+    return mixes
+
+
+def agreement_counts(mixes):
+    """How many of the source mixes hold each video."""
+    counts = {}
+    for src in mixes:
+        for vid in set(src["vids"]):
+            counts[vid] = counts.get(vid, 0) + 1
+    return counts
+
+
+def depth_weights(mixes, rank_offset):
+    """Each video's 1/(rank+k), summed over every mix holding it."""
+    depth = {}
+    for src in mixes:
+        for rank, vid in enumerate(dict.fromkeys(src["vids"])):
+            depth[vid] = depth.get(vid, 0.0) + 1.0 / (rank + rank_offset)
+    return depth
+
+
+def consensus_weights(mixes, cfg):
+    """Each video's draw weight: its depth in the mixes, lifted by how many agree."""
+    counts = agreement_counts(mixes)
+    power = float(cfg["agreement_power"])
+    return {vid: depth * counts[vid] ** power for vid, depth
+            in depth_weights(mixes, float(cfg["rank_offset"])).items()}
+
+
+def consensus_draw(weights, size):
+    """`size` videos sampled without replacement, each pick proportional to its weight.
+    Efraimidis-Spirakis in its exponential form, so a tiny weight cannot underflow to zero."""
+    return sorted(weights,
+                  key=lambda vid: random.expovariate(1.0) / weights[vid])[:size]
+
+
+def run_lane_consensus(lane, run):
+    """Rebuild one playlist from every account's mix, the agreed-on videos likeliest.
+    No watch-history filter: nobody watches this lane, so the blocklists are unioned instead."""
+    cfg = consensus_config(lane)
+    log("\nlane %s  (%s)  policy consensus" % (lane["id"], lane["title"]))
+    mixes = consensus_mixes(cfg, household_blocked())
+    if not mixes:
+        raise Aborted("no source mix of %r exists yet" % lane["id"])
+    weights = consensus_weights(mixes, cfg)
+    counts = agreement_counts(mixes)
+    log("  %d mixes (%s); %d videos, %d held by more than one"
+        % (len(mixes), ", ".join("%s %d" % (s["key"], len(s["vids"])) for s in mixes),
+           len(counts), sum(1 for held in counts.values() if held > 1)))
+    return rebuild_playlist(lane, consensus_draw(weights, lane["size"]), run)
 
 
 def cmd_run(args):
@@ -1698,6 +1822,8 @@ def run_one_lane(lane, run):
             return run_lane_last_played(lane, run), None
         if lane["policy"] == "mix":
             return run_lane_mix(lane, run), None
+        if lane["policy"] == "consensus":
+            return run_lane_consensus(lane, run), None
         return run_lane(lane, run), None
     except Aborted as e:
         log("  ABORTED: %s (the playlist keeps its content)" % e)
@@ -1952,6 +2078,34 @@ def mix_order(lane, items, orders):
     return sorted(items, key=lambda it: rank.get(it["vid"], 10**6))
 
 
+def consensus_mixes_now(cfg, orders):
+    """Each source mix in the order it holds this hour, dropping the accounts with none."""
+    mixes = consensus_source_mixes(cfg)
+    for src in mixes:
+        src["order"] = source_current_order(src, orders)
+    return [src for src in mixes if src["order"]]
+
+
+def consensus_order(lane, items, orders):
+    """A consensus lane's hourly redraw: a fresh weighted sample of what it already holds.
+    None when no source mix has an order yet, which is the caller's cue to skip the lane."""
+    cfg = consensus_config(lane)
+    mixes = consensus_mixes_now(cfg, orders)
+    if not mixes:
+        return None
+    restrict_to_present(mixes, items)
+    drawn = consensus_draw(consensus_weights(mixes, cfg), len(items))
+    rank = {vid: n for n, vid in enumerate(drawn)}
+    return sorted(items, key=lambda it: rank.get(it["vid"], 10**6))
+
+
+def compiled_order(lane, items, orders):
+    """The new order of a lane compiled from other lanes, or None when its sources are not ready."""
+    if lane["policy"] == "consensus":
+        return consensus_order(lane, items, orders)
+    return mix_order(lane, items, orders)
+
+
 def permute_playlist_index(plid, ordered):
     """Reorder the playlist's index array in place, in one statement."""
     execute("UPDATE playlists SET \"index\" = (SELECT coalesce(array_agg(idx ORDER BY "
@@ -1995,8 +2149,8 @@ def shuffle_lane(lane, orders, dry):
                       "age": float(age_h), "since_top": float(since_top_h)})
     before = [it["vid"] for it in items]
 
-    if lane["policy"] == "mix":
-        ordered = mix_order(lane, items, orders)
+    if lane["policy"] in COMPILED_POLICIES:
+        ordered = compiled_order(lane, items, orders)
         if ordered is None:
             log("lane %-16s sources not reordered this run, skipped" % lane_id)
             return before
@@ -2011,7 +2165,7 @@ def shuffle_lane(lane, orders, dry):
         return after
 
     permute_playlist_index(plid, ordered)
-    if lane["policy"] != "mix":
+    if lane["policy"] not in COMPILED_POLICIES:
         age_fatigue(lane_id, cfg, after)
     execute("INSERT INTO suggest.shuffles(account,lane,videos,moved) "
             "VALUES (%s,%s,%s,%s);" % (acct(), lit(lane_id), len(after), moved))
@@ -2144,15 +2298,15 @@ def run_field(row, index):
 
 
 def lane_video_count(policy, tracked, last_run):
-    """Videos one lane holds; a mix lane writes no items row, so its last run is read."""
-    if policy != "mix":
+    """Videos one lane holds; a compiled lane writes no items row, so its last run is read."""
+    if policy not in COMPILED_POLICIES:
         return tracked
     return run_field(last_run, RUN_KEPT) + run_field(last_run, RUN_ADDED)
 
 
 def lane_target(lane):
-    """The size to alert against; a mix lane gets none, its sources set its size."""
-    return 0 if lane["policy"] == "mix" else lane["size"]
+    """The size to alert against; a compiled lane gets none, its sources set its size."""
+    return 0 if lane["policy"] in COMPILED_POLICIES else lane["size"]
 
 
 def lane_facts():
