@@ -1381,26 +1381,20 @@ def reconcile_playlist(lane, chosen, plid, run):
 
 
 def plays_newest_first(watched):
-    """The watch history in last-played order, most recent first."""
+    """The watch history in last-played order, most recent first.
+    Really last-played: Invidious does array_append(array_remove(watched, id), id)."""
     return reversed(watched)
 
 
 def played_score(decay, rank):
-    """A last-played rank as a score with a gradient wide enough to survive the shuffle.
-
-    Scores that are all equal make the hourly reorder pure noise instead of a
-    rotation; the exponential keeps what was played most recently leading.
-    """
+    """A last-played rank as a score, with a gradient wide enough to survive the shuffle.
+    Equal scores would make the hourly reorder pure noise instead of a rotation."""
     return 10.0 * (decay ** rank)
 
 
 def eviction_is_safe(stopped):
     """Whether this run may evict, given how the scan ended.
-
-    A scan cut short by the fetch budget left entries unexamined rather than
-    unmatched, and one could be a recent play; a scan that merely found fewer
-    than `size` matches looked at everything and may still evict.
-    """
+    A budget-cut scan left entries unexamined; one merely short of `size` saw them all."""
     return not stopped
 
 
@@ -1438,10 +1432,7 @@ def scan_recent_plays(lane, run):
 
 def entries_to_evict(current, desired, run, may_evict):
     """Entries that leave: those below the play window, plus any blocked channel.
-
-    A blocked channel leaves whether or not the scan finished. The grow-only
-    rule protects entries the scan never reached, and a blocked one is not that.
-    """
+    A blocked channel leaves even when `may_evict` is false; grow-only is not for it."""
     wanted = set(desired)
     leaving = [v for vid, v in current.items() if vid not in wanted] if may_evict else []
     already = {v["videoId"] for v in leaving}
@@ -1462,18 +1453,8 @@ def rescore_by_play_order(lane_id, desired, decay):
 
 
 def run_lane_last_played(lane, run):
-    """Hold the N most recently PLAYED videos that match the lane.
-
-    Invidious does `array_append(array_remove(watched, id), id)` on every play, so
-    the position in `users.watched` is a real last-played order. The lane is
-    reconciled to the top N of that order: a replay lifts a video back to the
-    top, and a video nobody plays sinks past N and leaves. First in, last
-    played out.
-
-    Safety rule: if the scan could not reach N candidates (budget or scan depth),
-    NOTHING is evicted this run. The lane only grows. Otherwise a short scan
-    would delete videos it simply had not looked at yet.
-    """
+    """Hold the N most recently PLAYED videos that match the lane, evicting the rest.
+    A scan the fetch budget cut short evicts nothing: the lane only grows that run."""
     lane_id = lane["id"]
     log("\nlane %s  (%s)  policy last_played" % (lane_id, lane["title"]))
     started = run.fetcher.fetches
@@ -1533,10 +1514,7 @@ def expand_source(src):
 
 
 def share_key(src):
-    """The key weighted_mix counts shares by. It carries the account, not just the lane.
-
-    Two people's "suggested" are two different sources.
-    """
+    """The key weighted_mix counts shares by. It carries the account, not just the lane."""
     return "%s/%s" % (src["user"], src["lane"]) if src["user"] else src["lane"]
 
 
@@ -1564,13 +1542,7 @@ def source_order(src):
 
 
 def playlist_videos(plid):
-    """A playlist's videos in display order, as [(vid, ucid), ...], over SQL.
-
-    Read from the database rather than /api/v1/auth/playlists, because a mix may
-    read a lane belonging to somebody else: `playlists` joined to
-    `playlist_videos` needs no authentication at all, so the mix never has to
-    hold another account's session.
-    """
+    """A playlist's videos in display order, as [(vid, ucid), ...], over SQL."""
     return [(r[0], r[1]) for r in query(
         "SELECT pv.id, coalesce(pv.ucid,'') FROM playlists p "
         "CROSS JOIN LATERAL unnest(p.\"index\") WITH ORDINALITY AS u(idx, ord) "
@@ -1580,31 +1552,13 @@ def playlist_videos(plid):
 
 def furthest_behind_its_share(ready, share, taken, placed):
     """The source owing the most output, counting the pure head against its share.
-
-    Exempting the head was measured and is worse: the first source overdraws,
-    runs dry near the end and hands the tail to whatever is left. Keep `pure`
-    small instead.
-    """
+    Exempting the head was measured and worse: source one overdraws, then runs dry."""
     return max(ready, key=lambda s: share[s["key"]] * (placed + 1) - taken[s["key"]])
 
 
 def weighted_mix(sources, size, pure=0):
     """Fill `size` slots from N sources, each holding its SHARE of the output.
-
-    `sources` = [{"lane": id, "vids": [...], "share": 0.9}, ...]. The first
-    `pure` slots come from the first source untouched, so the top of the feed is
-    never diluted. After that every slot goes to whichever source is furthest
-    behind its share, which spreads a small share evenly across the whole list.
-
-    A source that runs out simply stops being eligible and its remaining share is
-    absorbed by the others. That is the whole point of replacing the old
-    `pure`/`ratio` interleave: with a 30-video base and a 30-video blend, ratio
-    2 exhausted the base at position 34 and then appended the ENTIRE rest of the
-    blend, so a lane meant to be mostly base came out 50/50 with a 26-long blend
-    block at the end.
-
-    A video present in more than one source appears once, at its first claim.
-    """
+    A video in more than one source appears once, and a spent source's share is absorbed."""
     total = sum(max(s.get("share", 0.0), 0.0) for s in sources) or 1.0
     share = {s["key"]: max(s.get("share", 0.0), 0.0) / total for s in sources}
     cursor = {s["key"]: 0 for s in sources}
@@ -1639,10 +1593,7 @@ def weighted_mix(sources, size, pure=0):
 
 def run_lane_mix(lane, run):
     """Rebuild one playlist from several source lanes, filtered for the viewer.
-
-    Costs no YouTube fetch and writes no suggest.items row, so the other lanes
-    never see a mix lane's content as taken.
-    """
+    Writes no suggest.items row, so no other lane sees a mix lane's content as taken."""
     lane_id = lane["id"]
     mix = lane.get("mix") or {}
     pure = int(mix.get("pure", 0))

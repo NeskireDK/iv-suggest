@@ -172,7 +172,12 @@ resolves each added video server-side, outside the bot's pacing.
 | `pure` | `0` | first N slots come from the first source alone, in its own order |
 
 The older `{base, blend, ratio}` form is still read so a pre-2026-08-17 config
-keeps working: `ratio: N` (default `2`) means N `base` per 1 `blend`.
+keeps working: `ratio: N` (default `2`) means N `base` per 1 `blend`. It was
+replaced because a fixed interleave cannot absorb a source running out: with a
+30-video base and a 30-video blend at `ratio: 2` the base was exhausted at
+position 34, the entire rest of the blend was appended, and a lane meant to be
+mostly base came out 50/50 with a 26-long blend block at the end. Under `share`
+a spent source simply stops being eligible and the others take its share.
 
 Filtering is per **viewer**, not per source: whatever anyone contributed is
 dropped if this viewer already watched it or blocked its channel.
