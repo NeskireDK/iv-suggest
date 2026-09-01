@@ -142,6 +142,7 @@ RATE_PER_MIN = 20
 MAX_FETCHES = 320
 DAYS_BEFORE_RETRYING_A_BROKEN_VIDEO = 30
 MAX_CONSECUTIVE_FAILS = 5
+STORED_SCORE_DECIMALS = 4   # suggest.items.score is rounded to this before it is written
 DRY_SEEDS = 10          # a dry run uses few seeds; the nightly run uses the config
 
 SCHEMA_SQL = """
@@ -510,6 +511,11 @@ class Fetcher:
     def begin_lane(self, cap):
         self.lane_cap, self.lane_used = cap, 0
 
+    def _spend_one_fetch(self):
+        """Charge one call upstream to the run budget and to the lane's share of it."""
+        self.fetches += 1
+        self.lane_used += 1
+
     def video(self, vid):
         """Full API answer, or None when the video is gone or upstream cannot parse it."""
         if vid in self.dead:
@@ -519,13 +525,12 @@ class Fetcher:
             raise BudgetSpent("run budget %d spent" % self.budget)
         if self.lane_cap and self.lane_used >= self.lane_cap:
             raise BudgetSpent("lane fetch cap %d reached" % self.lane_cap)
-        self.lane_used += 1
         delay = 5.0
         for attempt in range(3):
             self._pace()
             try:
                 data = api("GET", "/api/v1/videos/" + vid)
-                self.fetches += 1
+                self._spend_one_fetch()
                 self.fails = 0
                 if data and not data.get("error"):
                     self._remember(vid, data)
@@ -533,7 +538,7 @@ class Fetcher:
                 self.bury(vid, DAYS_BEFORE_RETRYING_A_BROKEN_VIDEO, "no such video")
                 return None
             except urllib.error.HTTPError as e:
-                self.fetches += 1
+                self._spend_one_fetch()
                 if e.code in (404, 410):
                     self.fails = 0
                     self.bury(vid, 365, "http %d" % e.code)
@@ -548,7 +553,7 @@ class Fetcher:
                 self._trouble(e, delay)
                 delay *= 2
             except Exception as e:
-                self.fetches += 1
+                self._spend_one_fetch()
                 self._trouble(e, delay)
                 delay *= 2
         return None
@@ -572,15 +577,14 @@ class Fetcher:
             raise BudgetSpent("run budget %d spent" % self.budget)
         if self.lane_cap and self.lane_used >= self.lane_cap:
             raise BudgetSpent("lane fetch cap %d reached" % self.lane_cap)
-        self.lane_used += 1
         self._pace()
         try:
             data = api("GET", "/api/v1/channels/%s/latest" % ucid)
-            self.fetches += 1
+            self._spend_one_fetch()
             self.fails = 0
             return data
         except urllib.error.HTTPError as e:
-            self.fetches += 1
+            self._spend_one_fetch()
             if e.code in (404, 410):
                 self.fails = 0
                 return None
@@ -590,7 +594,7 @@ class Fetcher:
                 return None
             self._trouble(e, 5.0)
         except Exception as e:
-            self.fetches += 1
+            self._spend_one_fetch()
             self._trouble(e, 5.0)
         return None
 
@@ -910,10 +914,10 @@ def playlist_of(lane, dry):
 def seed_order(watched, seed_cfg):
     """History ids in the order the seed picker walks them, newest first."""
     hist = list(reversed(watched))
-    window = int((seed_cfg or {}).get("shuffle_window") or 0)
+    window = int(seed_cfg.get("shuffle_window") or 0)
     if window < 2:
         return hist
-    recent = int((seed_cfg or {}).get("recent") or 0)
+    recent = int(seed_cfg.get("recent") or 0)
     pool = hist[recent:window]
     random.shuffle(pool)
     return hist[:recent] + pool + hist[window:]
@@ -957,7 +961,8 @@ def add_to_lane(lane_id, plid, vid, score, song, fetcher):
     execute("INSERT INTO suggest.items(account,lane,vid,score,song_key) VALUES "
             "(%s,%s,%s,%s,%s) ON CONFLICT (account,lane,vid) DO UPDATE SET "
             "added=now(), score=EXCLUDED.score, song_key=EXCLUDED.song_key;"
-            % (acct(), lit(lane_id), lit(vid), round(score, 4), lit(song)))
+            % (acct(), lit(lane_id), lit(vid),
+               round(score, STORED_SCORE_DECIMALS), lit(song)))
     return True
 
 
@@ -1066,8 +1071,8 @@ def pick_seeds(lane, run):
     seeds = []
     if seed_free:
         log("  no seeds needed (%s)" % lane["expand"])
-    seed_cfg = lane["seed"]
-    want_genre = (seed_cfg or {}).get("genre")
+    seed_cfg = lane["seed"] or {}
+    want_genre = seed_cfg.get("genre")
     limit = seed_cfg.get("limit", lane["size"])
     if run.seed_override:
         limit = min(limit, run.seed_override)
@@ -1111,7 +1116,7 @@ def channels_to_read(watch_counts, most):
 
 
 def rank_derived_score(rank):
-    """A score from feed position rather than from raw views.
+    """A score from list position, spread so consecutive ranks differ once stored.
     Raw views would swamp the hourly shuffle's fatigue and jitter multipliers."""
     return 10.0 * (0.99 ** rank)
 
@@ -1216,7 +1221,7 @@ def expand_by_watch_order(lane, seeds, room, run):
     """The seeds themselves, scored so the lane keeps the order they were watched in."""
     scores, meta_seen = {}, {}
     for rank, vid in enumerate(seeds):
-        scores[vid] = 1.0 - rank / 100000.0
+        scores[vid] = rank_derived_score(rank)
         meta_seen[vid] = run.fetcher.meta.get(vid, {})
     return scores, meta_seen
 
@@ -1444,7 +1449,7 @@ def rescore_by_play_order(lane_id, desired, decay):
     """Write each entry's score from its position in the play order."""
     values = ",".join(
         "(%s,%s,%s,%s)" % (acct(), lit(lane_id), lit(vid),
-                           round(played_score(decay, rank), 4))
+                           round(played_score(decay, rank), STORED_SCORE_DECIMALS))
         for rank, vid in enumerate(desired))
     execute("UPDATE suggest.items i SET score = x.score::real "
             "FROM (VALUES %s) AS x(account,lane,vid,score) "

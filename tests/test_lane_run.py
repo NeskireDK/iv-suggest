@@ -313,6 +313,17 @@ class Seeds(LaneCase):
                   db=Db(), api=Api(), fetch=fetch)
         self.assertEqual(2, len(self.db_added_vids()))
 
+    def test_a_valueless_seed_key_still_fills_the_lane(self):
+        history = ["h%010d" % i for i in range(2)]
+        self.fill(self.lane(expand="none", exclude_watched=False, seed=None),
+                  watched=history, db=Db(), api=Api())
+        self.assertEqual(["h0000000001", "h0000000000"], self.db_added_vids())
+
+    def test_a_valueless_seed_key_survives_the_lane_merge_as_none(self):
+        self.assertIsNone(self.lane(seed=None)["seed"],
+                          "the seed block is replaced wholesale, so pick_seeds "
+                          "is what has to cope with a key written bare")
+
     def test_an_account_with_no_history_makes_no_api_call_at_all(self):
         removed, added, kept, used = self.fill(self.lane(), db=Db(), api=Api())
         self.assertEqual((0, 0, 0), (removed, added, kept))
@@ -392,7 +403,17 @@ class Expand(LaneCase):
                   watched=["h0000000000", "h0000000001"], db=Db(), api=Api())
         rows = self.db.item_rows()
         self.assertEqual(["h0000000001", "h0000000000"], [r[0] for r in rows])
-        self.assertGreaterEqual(rows[0][1], rows[1][1])
+        self.assertGreater(rows[0][1], rows[1][1])
+
+    def test_expand_none_keeps_consecutive_ranks_apart_once_stored(self):
+        history = ["h%010d" % i for i in range(6)]
+        self.fill(self.lane(expand="none", exclude_watched=False, size=6),
+                  watched=history, db=Db(), api=Api())
+        stored = [score for _, score, _ in self.db.item_rows()]
+        self.assertEqual(len(history), len(stored))
+        self.assertEqual(sorted(set(stored), reverse=True), stored,
+                         "a rank the stored rounding flattens leaves the hourly "
+                         "shuffle ranking on noise instead of the watch order")
 
 
 class Filter(LaneCase):
