@@ -1866,14 +1866,7 @@ def _text_array(values):
 
 
 def read_order(plid, lane_id):
-    """One row per video in the playlist, in the order it is displayed now.
-
-    `playlists.index` IS the display order — the feed reads
-    `ORDER BY array_position(index, ...)` on every request — so reordering a
-    lane is a permutation of that array and nothing else. No API call, no
-    YouTube fetch, and `playlist_videos.index` (the client-visible indexId)
-    never changes.
-    """
+    """One row per video in the playlist, in the order it is displayed now."""
     return query(
         "SELECT u.idx, pv.id, coalesce(pv.ucid,''), coalesce(i.score,0), "
         "coalesce(i.top_hours,0), "
@@ -1889,12 +1882,7 @@ def read_order(plid, lane_id):
 
 
 def display_score(it, cfg):
-    """One item's display weight: its score discounted by fatigue, lifted by recency.
-
-    Fatigue is the main lever -- an hour on screen without a play is a small
-    negative, the same impression discount a ranked feed applies to something
-    it has already shown you.
-    """
+    """One item's display weight: its score discounted by fatigue, lifted by recency."""
     s = it["score"] * (cfg["fatigue"] ** min(it["top"], cfg["fatigue_cap"]))
     s *= 1.0 + cfg["recency_boost"] * (0.5 ** (it["age"] / cfg["recency_halflife"]))
     if cfg["jitter"]:
@@ -1903,11 +1891,7 @@ def display_score(it, cfg):
 
 
 def rotate_top_slot(ordered, items):
-    """Give slot 1 to the best scorer among the half that has waited longest for it.
-
-    Slot 1 is the scarce resource, so it is a rota and not a ranking: every
-    video reaches the top before any video returns to it.
-    """
+    """Give slot 1 to the best scorer among the half that has waited longest for it."""
     half = max(1, len(ordered) // 2)
     waited = sorted(items, key=lambda it: -it["since_top"])[:half]
     lead = max(waited, key=lambda it: it["display"])
@@ -1915,11 +1899,7 @@ def rotate_top_slot(ordered, items):
 
 
 def spread_channels(ordered):
-    """Pull the order apart so two videos from one channel rarely sit back to back.
-
-    Back to back is what makes a lane read as repetitive even when its content
-    changed.
-    """
+    """Pull the order apart so two videos from one channel rarely sit back to back."""
     out, pool = [], list(ordered)
     while pool:
         prev = out[-1]["ucid"] if out else ""
@@ -1932,10 +1912,7 @@ def spread_channels(ordered):
 
 def rank_items(items, cfg):
     """The display order for one lane. Pure: same input, same distribution.
-
-    Each item needs score, top (hours already on screen), age (hours since it
-    was added) and since_top (hours since it last held slot 1).
-    """
+    Each item needs score, plus top, age and since_top, all counted in hours."""
     for it in items:
         it["display"] = display_score(it, cfg)
     ordered = sorted(items, key=lambda it: -it["display"])
@@ -1947,33 +1924,20 @@ def rank_items(items, cfg):
 
 
 def source_current_order(src, orders):
-    """A mix source's order: this run's, when it is ours; otherwise the stored one.
-
-    Another account's pass may not have happened yet, and what the database
-    holds is exactly what a reader of that lane sees right now.
-    """
+    """A mix source's order: this run's, when it is ours; otherwise the stored one."""
     return orders.get(src["lane"]) if not src["user"] else source_order(src)
 
 
 def restrict_to_present(sources, items):
     """Cut every source down to the videos this playlist already holds.
-
-    A shuffle may only permute. Mixing over the full sources would pick a
-    different subset and leave the rest to sort last, re-creating the tail clump
-    the share model exists to prevent; membership stays the nightly run's call.
-    """
+    A shuffle may only permute; membership stays the nightly run's call."""
     present = {it["vid"] for it in items}
     for s in sources:
         s["vids"] = [vid for vid in s["order"] if vid in present]
 
 
 def mix_order(lane, items, orders):
-    """A mix lane's order, or None when a source has not been reordered this run.
-
-    A mix lane holds no suggest.items row and no score of its own, so without
-    recomputing from the orders this run just produced its feed would move once
-    a night however often the sources are reordered.
-    """
+    """A mix lane's order, or None when a source has not been reordered this run."""
     mix = lane.get("mix") or {}
     sources = mix_sources(mix)
     for s in sources:
@@ -1988,13 +1952,7 @@ def mix_order(lane, items, orders):
 
 
 def permute_playlist_index(plid, ordered):
-    """Reorder the playlist's index array in place, in one statement.
-
-    It permutes whatever the array holds at write time rather than replacing it,
-    so a video the nightly run adds between the read and this write sorts last
-    and survives. That is what makes the hourly timer safe to run against the
-    nightly one.
-    """
+    """Reorder the playlist's index array in place, in one statement."""
     execute("UPDATE playlists SET \"index\" = (SELECT coalesce(array_agg(idx ORDER BY "
             "array_position(%s, idx)), '{}'::bigint[]) FROM unnest(\"index\") AS idx), "
             "updated = now() WHERE id = %s;"
@@ -2002,11 +1960,7 @@ def permute_playlist_index(plid, ordered):
 
 
 def age_fatigue(lane_id, cfg, after):
-    """Raise fatigue for what is on screen and lower it for what is not.
-
-    Falling again is what lets a buried video recover instead of being held
-    down for ever.
-    """
+    """Raise fatigue for what is on screen and lower it for what is not."""
     visible = _text_array(after[:cfg["visible"]])
     execute("UPDATE suggest.items SET top_hours = "
             "least(coalesce(top_hours,0)+1, %d) "
@@ -2190,12 +2144,7 @@ def run_field(row, index):
 
 
 def lane_video_count(policy, tracked, last_run):
-    """Videos one lane holds.
-
-    A mix lane keeps no suggest.items row -- its videos live in the source
-    lanes and it writes straight to the playlist -- so counting rows reports
-    zero for a playlist that is full. Read its last run instead.
-    """
+    """Videos one lane holds; a mix lane writes no items row, so its last run is read."""
     if policy != "mix":
         return tracked
     return run_field(last_run, RUN_KEPT) + run_field(last_run, RUN_ADDED)
@@ -2207,11 +2156,7 @@ def lane_target(lane):
 
 
 def lane_facts():
-    """Everything the metrics need about the current account's lanes.
-
-    One query per table, which is what keeps the exporter cheap enough to
-    scrape every 15 minutes.
-    """
+    """Everything the metrics need about the current account's lanes, one query per table."""
     return (tracked_by_lane(),
             dict((r[0], float(r[1])) for r in query(
                 "SELECT lane, extract(epoch FROM max(added)) FROM suggest.items "
@@ -2226,11 +2171,7 @@ def lane_facts():
 
 def cmd_metrics(args):
     """Print the Prometheus text form. Database only, never a YouTube fetch.
-
-    Every per-lane series carries an `account` label. The cardinality that adds
-    is a household, not a tenant list, and without it two people's lanes of the
-    same name would collide into one series.
-    """
+    Every per-lane series carries an `account` label, or two people's lanes collide."""
     all_lanes = load_config()
     users = load_users()
     out = []
@@ -2255,12 +2196,7 @@ def cmd_metrics(args):
 
         def tag(lane, plids=plids):
             """One lane's Prometheus label set, `expand` included.
-
-            An alert needs `expand` to tell a lane whose supply is a fixed age
-            window (subscription_feed) from one drawing on a growing
-            recommendation graph: the first legitimately takes no new video for
-            weeks, while the second going quiet is a fault.
-            """
+            A subscription_feed lane can go weeks with no new video; an alert needs to know."""
             return '{account="%s",lane="%s",policy="%s",expand="%s",plid="%s"}' % (
                 ACCOUNT, lane["id"], lane["policy"], lane["expand"],
                 plids.get(lane["id"], ""))
@@ -2329,9 +2265,7 @@ def cmd_metrics(args):
 
 def _instance_wide_metrics(metric, users):
     """The series with no account label, because the budget and cache are shared.
-
-    Unlabelled is what keeps the alerts already written against them working.
-    """
+    Unlabelled also keeps the alerts already written against them working."""
     metric("scrape_timestamp_seconds",
            "When this exporter last read the database.", "gauge",
            [("", "%d" % time.time())])

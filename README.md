@@ -176,9 +176,12 @@ size 20 filled to 3 on a 75-channel instance, because only 35 of those channels
 ever stream.
 
 **The hourly shuffle is a permutation, nothing else.** `playlists.index` *is* the
-display order in Invidious, so reordering a lane is one SQL `UPDATE` on a
-`bigint[]` — no delete, no re-add, no API call. It is race-safe against the
-nightly run because it permutes whatever the array holds at write time. The
+display order in Invidious — the feed reads `ORDER BY array_position(index, ...)`
+on every request — so reordering a lane is one SQL `UPDATE` on a `bigint[]`: no
+delete, no re-add, no API call, and the client-visible `indexId` in
+`playlist_videos.index` never moves. It is race-safe against the nightly run
+because it permutes whatever the array holds at write time, so a video added
+between the read and the write sorts last and survives. The
 ranking discounts what has already been on screen and treats slot 1 as a rota
 rather than a ranking, so at least half the lane leads before any video returns
 to the top.
