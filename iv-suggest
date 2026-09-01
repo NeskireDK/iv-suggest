@@ -1692,8 +1692,11 @@ def consensus_config(lane):
 
 def consensus_source_mixes(cfg):
     """A consensus lane's sources, one entry per account once `users: all` expands."""
-    return [expanded for src in (cfg.get("sources") or [])
-            for expanded in expand_source(src)]
+    mixes = [expanded for src in (cfg.get("sources") or [])
+             for expanded in expand_source(src)]
+    for src in mixes:
+        src["key"] = share_key(src)
+    return mixes
 
 
 def consensus_mixes(cfg, blocked):
