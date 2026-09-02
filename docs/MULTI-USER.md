@@ -1,12 +1,16 @@
 # Multi-user: why it is shaped this way
 
-Status: **live since 2026-08-31 12:49, running single-account.** The schema, the
-per-account session and the account scoping are deployed and in use. What is not
-exercised is multi-account operation itself: with no `users:` block,
-`load_users()` falls through to the single `IV_SUGGEST_ACCOUNT` path, so the
-`users:` code, session minting for a *new* account and the cross-account mix
-source have never run. Auto-enrolment, which changes that, is in
-[PUBLIC-FEED.md](PUBLIC-FEED.md).
+Status: **live and multi-account since 2026-08-31 18:16.** Auto-enrolment took
+in every account on the instance, so the `users:` path, per-account session
+minting and the cross-account mix source are all exercised nightly rather than
+merely deployed. Two accounts run: one with a full history, one held back from
+most lanes by `min_watched`.
+
+Everything the earlier version of this note said was untested has since run in
+anger. Session minting per account was re-proved on 2026-09-01, when every row
+in `session_ids` was deleted and the engine re-minted for both accounts. The
+cross-account mix source backs the `household` lane and now the `consensus`
+policy as well.
 
 How to configure it is in [CONFIG.md](CONFIG.md). This is the reasoning, the
 findings that are not obvious from the code, and the decisions that were taken
