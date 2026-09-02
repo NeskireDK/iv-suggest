@@ -81,6 +81,35 @@ a lane cost.
 The `suggest.*` schema is **not** in the fixture. `iv-suggest init` creates it,
 so the fixture cannot drift away from the migration.
 
+## Why the fast suite keeps its own doubles
+
+`tests/test_lane_run.py` hand-rolls a `Db`, an `Api` and a `Fetch` instead of
+using this harness. That is deliberate, and it was reconsidered on 2026-09-02
+before being kept.
+
+The two answer different questions. This harness asks *does the engine work* —
+real SQL, real playlist writes, a real account boundary. The doubles ask *why
+did this lane make that decision* — the SQL a run wrote, the calls it made, the
+order it picked. A test that names one cooldown row is unreadable through a
+container, and a test that proves the mix reads its sources over SQL is
+meaningless without one.
+
+Two things pushed the other way and neither survived checking:
+
+- The doubles were said to hide the credential-selection branch inside `api()`,
+  because `ApiStub.install()` replaces `api` wholesale. That branch is covered:
+  `tests/test_sessions.py` `Credentials` stubs `urllib.request.urlopen`, one
+  layer lower, and pins which credential goes on the wire.
+- The `Fetch` double was said to have drifted from `Fetcher` over the fetch
+  counters. It had not — the double charges the run budget and the lane's share
+  together, which is what `_spend_one_fetch` does. Nothing was checking that,
+  though, so `TheDoubleChargesWhatTheRealFetcherCharges` in
+  `tests/test_lane_run.py` now does.
+
+Requiring Docker for the fast suite is the cost that would have bought nothing:
+`python3 -m unittest discover -s tests -t tests` has to stay runnable on a box
+with no container runtime, because that is where the engine is edited.
+
 ## Files
 
 | file | what |

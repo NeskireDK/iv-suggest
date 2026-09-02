@@ -9,6 +9,7 @@ tests hold however it is split into functions.
 import os
 import re
 import tempfile
+import time
 import unittest
 import urllib.error
 
@@ -173,12 +174,69 @@ def entry(vid, title=None, author_id="UC-a", index=None):
             "authorId": author_id, "author": "A", "indexId": index or ("ix-" + vid)}
 
 
+class Unhurried:
+    """The time module with the pacing sleep taken out."""
+
+    monotonic = staticmethod(time.monotonic)
+    time = staticmethod(time.time)
+
+    @staticmethod
+    def sleep(seconds):
+        pass
+
+
 def rec(vid, title=None, author_id="UC-r", seconds=600, published=None):
     out = {"videoId": vid, "title": title or vid.upper(), "author": "R",
            "authorId": author_id, "lengthSeconds": seconds}
     if published is not None:
         out["published"] = published
     return out
+
+
+class TheDoubleChargesWhatTheRealFetcherCharges(unittest.TestCase):
+    """`Fetch` against the class it stands in for, on the calls it models.
+
+    The double re-implements the counters rather than inheriting them, because
+    a real `Fetcher` reads the database to build its caches before it will
+    answer anything. Nothing else in the suite would notice the two drifting.
+    """
+
+    def setUp(self):
+        self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+        self.mod.query = lambda sql: []
+        self.mod.execute = lambda sql: None
+        self.mod.log = lambda line: None
+        self.mod.time = Unhurried
+
+    def spent(self, fetch, call):
+        fetch.begin_lane(5)
+        call(fetch)
+        return fetch.fetches, fetch.lane_used
+
+    def real(self, answer):
+        self.mod.api = lambda method, path, body=None: answer
+        return self.mod.Fetcher(budget=10)
+
+    def test_a_video_costs_the_same(self):
+        video = rec("ccccccccccc")
+        self.assertEqual(
+            self.spent(self.real(video), lambda f: f.video("ccccccccccc")),
+            self.spent(Fetch(recs={"ccccccccccc": video}),
+                       lambda f: f.video("ccccccccccc")))
+
+    def test_a_channel_listing_costs_the_same(self):
+        listing = {"videos": [rec("ccccccccccc")]}
+        self.assertEqual(
+            self.spent(self.real(listing), lambda f: f.channel_latest("UC-a")),
+            self.spent(Fetch(channels={"UC-a": listing}),
+                       lambda f: f.channel_latest("UC-a")))
+
+    def test_the_double_answers_every_call_a_fetcher_offers(self):
+        offered = {name for name in dir(self.mod.Fetcher)
+                   if not name.startswith("_")}
+        self.assertEqual(set(), offered - set(dir(Fetch)),
+                         "Fetcher grew a method the double does not answer, so "
+                         "a lane could reach past the double to the network")
 
 
 class LaneCase(unittest.TestCase):
