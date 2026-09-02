@@ -302,6 +302,23 @@ class Rebuilding(unittest.TestCase):
                          self.calls[0])
         self.assertEqual({"POST"}, {m for m, _ in self.calls[1:]})
 
+    def test_sources_that_exist_but_are_empty_keep_the_playlist_as_it_is(self):
+        """A public feed going blank is a source problem, not an answer to publish."""
+        self.mixes = {"PL_" + ME: [], "PL_" + OTHER: []}
+        self.mod.playlist_of = lambda lane, dry: (
+            "PL_feed", {"videos": [{"videoId": "old1", "indexId": "ix1"}]})
+        with self.assertRaises(self.mod.Aborted) as caught:
+            self.mod.run_lane_consensus(self.lane(), self.context())
+        self.assertIn("keeping the 1 videos", str(caught.exception))
+        self.assertEqual([], self.calls)
+
+    def test_an_empty_draw_into_an_empty_playlist_is_not_an_error(self):
+        """Nothing to keep, so nothing to protect: the first run of a new lane."""
+        self.mixes = {"PL_" + ME: [], "PL_" + OTHER: []}
+        removed, added, kept, used = self.mod.run_lane_consensus(
+            self.lane(), self.context())
+        self.assertEqual((0, 0, 0, 0), (removed, added, kept, used))
+
     def test_a_dry_run_writes_nothing_at_all(self):
         self.mod.api = lambda *a, **k: self.fail("a dry run called the API")
         removed, added, kept, used = self.mod.run_lane_consensus(

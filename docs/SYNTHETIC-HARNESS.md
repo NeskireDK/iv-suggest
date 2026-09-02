@@ -106,6 +106,14 @@ Two things pushed the other way and neither survived checking:
   though, so `TheDoubleChargesWhatTheRealFetcherCharges` in
   `tests/test_lane_run.py` now does.
 
+The double is deliberately **not** a faithful `Fetcher`, and that test says
+which part of it is checked. It answers a call and charges for it; it does not
+raise `BudgetSpent` at a cap and does not model a retry, because a lane test
+scripts what upstream returns and never makes it fail. Those live in
+`tests/test_fetch_budget.py` against the real class. What the test does hold is
+that the double answers **every** attribute the engine reads off a fetcher, so a
+lane cannot reach past it to the network.
+
 Requiring Docker for the fast suite is the cost that would have bought nothing:
 `python3 -m unittest discover -s tests -t tests` has to stay runnable on a box
 with no container runtime, because that is where the engine is edited.

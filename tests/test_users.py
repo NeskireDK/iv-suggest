@@ -49,8 +49,8 @@ class Users(ConfigCase):
     def test_no_users_block_means_the_one_account_in_the_environment(self):
         """A config from before multi-user has to keep working unchanged."""
         mod = self.loaded(LANES)
-        self.assertEqual([{"email": ME, "lanes": "all", "overrides": {}}],
-                         mod.load_users())
+        self.assertEqual([{"email": ME, "named": True, "lanes": "all",
+                           "overrides": {}}], mod.load_users())
 
     def test_an_account_not_listed_is_never_enrolled(self):
         mod = self.loaded(LANES + """
@@ -177,6 +177,73 @@ class Order(unittest.TestCase):
     def test_a_failed_run_does_not_count_as_a_turn(self):
         runs = [(ME, 100.0, ""), (OTHER, 900.0, "budget spent")]
         self.assertEqual([OTHER, ME], self.order(runs, [ME, OTHER]))
+
+
+class Spent:
+    """A fetcher with nothing left, so only the log line reads it."""
+
+    budget = 320
+    fetches = 320
+
+
+class Args:
+
+    def __init__(self, **over):
+        self.dry_run = False
+        self.lane = None
+        self.__dict__.update(over)
+
+
+class ASpentBudget(unittest.TestCase):
+    """What a run still does for an account whose fetch budget is gone.
+
+    It used to stop at the lane that overspent. The lanes after it that cost
+    nothing -- a mix, and now the public feeds -- were skipped with it, so a
+    heavy night left what visitors see un-rebuilt and nothing looked wrong.
+    """
+
+    LANES = [{"id": "suggested", "policy": "refill", "min_watched": 0},
+             {"id": "fresh-uploads", "policy": "refill", "min_watched": 0},
+             {"id": "popular", "policy": "consensus", "min_watched": 0},
+             {"id": "home-mix", "policy": "mix", "min_watched": 0}]
+
+    def setUp(self):
+        self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+        self.mod.log = lambda line: None
+        self.mod.serve_account = lambda email: None
+        self.mod.read_user = lambda: ([], set())
+        self.mod.read_blocked = lambda: {}
+        self.mod.watch_count = lambda email: 900
+        self.mod.execute = lambda sql: self.written.append(sql)
+        self.written = []
+        self.ran = []
+        self.mod.run_one_lane = self.run_one_lane
+
+    def run_one_lane(self, lane, run):
+        self.ran.append(lane["id"])
+        if lane["id"] == "suggested":
+            return (0, 0, 0, 0), "BudgetSpent('run budget 320 spent')"
+        return (0, 1, 0, 0), None
+
+    def fill(self):
+        user = {"email": ME, "named": True, "lanes": "all", "overrides": {}}
+        return self.mod.run_account(user, self.LANES, Spent(), None, Args())
+
+    def test_a_lane_that_would_spend_a_fetch_is_skipped(self):
+        self.fill()
+        self.assertNotIn("fresh-uploads", self.ran)
+
+    def test_a_lane_compiled_from_other_lanes_still_runs(self):
+        self.fill()
+        self.assertEqual(["suggested", "popular", "home-mix"], self.ran)
+
+    def test_only_the_lanes_that_ran_record_a_run_row(self):
+        self.fill()
+        rows = [sql for sql in self.written if "INSERT INTO suggest.runs" in sql]
+        self.assertEqual(3, len(rows))
+
+    def test_the_overspending_lane_is_still_counted_as_a_failure(self):
+        self.assertEqual(1, self.fill())
 
 
 class Budget(unittest.TestCase):

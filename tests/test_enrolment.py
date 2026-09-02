@@ -235,6 +235,31 @@ class OnePublicCopy(ConfigCase):
         mod = self.enrolled("users:\n  - email: %s\n    lanes: [popular]\n" % OTHER)
         self.assertEqual(["popular"], self.lane_ids(mod, OTHER))
 
+    def test_an_auto_enrol_lane_list_does_not_hand_out_a_copy_either(self):
+        """The rule has to hold for the list form, or it holds for nothing."""
+        mod = self.loaded(WITH_A_PUBLIC_LANE
+                          + "auto_enrol: {lanes: [suggested, popular]}\n",
+                          instance=(ME, OTHER))
+        self.assertEqual(["suggested", "popular"], self.lane_ids(mod, ME))
+        self.assertEqual(["suggested"], self.lane_ids(mod, OTHER))
+
+    def test_nobody_holding_it_is_said_out_loud(self):
+        mod = self.loaded(WITH_A_PUBLIC_LANE + "auto_enrol: {}\n",
+                          account="", instance=(ME, OTHER))
+        said = []
+        mod.log = said.append
+        mod.warn_orphaned_compiled_lanes(mod.load_config())
+        self.assertEqual(1, len(said), said)
+        self.assertIn("popular", said[0])
+        self.assertIn("no managed account holds it", said[0])
+
+    def test_a_lane_with_a_holder_says_nothing(self):
+        mod = self.enrolled()
+        said = []
+        mod.log = said.append
+        mod.warn_orphaned_compiled_lanes(mod.load_config())
+        self.assertEqual([], said)
+
 
 class HistoryGate(ConfigCase):
 

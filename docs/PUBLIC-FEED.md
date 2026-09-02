@@ -1,12 +1,14 @@
 # The public feed, and what a brand new account sees
 
-Both sections are live. This file is the reasoning behind them; the keys
-themselves are in [CONFIG.md](CONFIG.md#consensus).
+Why the two compiled feeds are shaped the way they are. The keys themselves are
+in [CONFIG.md](CONFIG.md#consensus), and whether an instance has them switched
+on is a question for its own `lanes.yml`, not for this file.
 
 Two gaps, one moment: somebody opens the instance and the engine has nothing
-personal to offer them. A logged-out visitor has no account at all; a new account
-has one but no history yet. Today both land on whatever `popular_playlists`
-points at, which is one specific person's Home mix.
+personal to offer them. A logged-out visitor has no account at all; a new
+account has one but no history yet. Before either section, both landed on
+whatever `popular_playlists` pointed at, which was one specific person's Home
+mix.
 
 ## Decided: how public is public?
 
@@ -86,7 +88,9 @@ cannot regress the status quo.
   with. Do *not* filter on watch history: there is no viewer whose history it
   could be.
 - **It lives on the bot's own account**, because nobody in particular owns it,
-  with `privacy: public`, and `popular_playlists` points at it.
+  with `privacy: public`, and `popular_playlists` is pointed at it. That last
+  step is a compose change on the instance, so it is deliberately not something
+  merging the lane does.
 
 ### Settled while building
 
