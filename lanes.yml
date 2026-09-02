@@ -235,6 +235,43 @@ lanes:
       # A source may name another account, which makes this the household feed:
       #   - {user: them@example.com, lane: suggested, share: 0.2}
 
+  # THE PUBLIC FEEDS. One playlist each for the whole instance, compiled from
+  # every account's mix and weighted by how many of them hold a video, so
+  # agreement decides the top rather than any one person's taste. `privacy:
+  # public` because a logged-out visitor is the audience; no watch-history
+  # filter, because there is no one viewer whose history it could be. Zero
+  # fetches: both read lanes that are already in the database.
+  #
+  # Only PRIMARY gets a consensus lane, and the engine enforces that rather
+  # than this file -- a per-account copy would hold the same videos twice over.
+  #
+  # Membership can lag one run for an account whose source mix is rebuilt later
+  # in the same night: the run order is least-recently-succeeded first, not the
+  # file's. It self-corrects the next night, and the hourly redraw is unaffected
+  # because that reads each source's stored order.
+  - id: popular
+    title: "Popular"
+    policy: consensus
+    privacy: public
+    # 54 is home-mix's own size, so the page is the same length as the one this
+    # lane replaces.
+    size: 54
+    min_watched: 0
+    consensus:
+      sources:
+        - {users: all, lane: home-mix}
+
+  # Music only, which is what this slot already pointed at.
+  - id: trending
+    title: "Trending"
+    policy: consensus
+    privacy: public
+    size: 30
+    min_watched: 0
+    consensus:
+      sources:
+        - {users: all, lane: music-discover}
+
   # What a newly enrolled account opens onto, and a standing household feed for
   # everyone else. `users: all` names nobody, so it keeps working as accounts
   # come and go, and a member without the source lane yet is skipped rather

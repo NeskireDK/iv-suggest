@@ -806,11 +806,20 @@ def enrolled_lanes(user, all_lanes):
     return lanes_for(user, all_lanes, watch_count(user["email"]))
 
 
+def compiles_one_playlist_for_the_whole_instance(lane):
+    """True for a lane whose content is the same for everybody, so one copy is all there is."""
+    return lane["policy"] == "consensus"
+
+
 def lanes_for(user, lanes, watched=None):
     """The lanes one account gets, in lanes.yml order, with its overrides applied.
     Pass `watched` to also drop the lanes it has too little history to fill."""
     want = user.get("lanes", "all")
-    if want != "all":
+    if want == "all":
+        lanes = [lane for lane in lanes
+                 if user["email"] == PRIMARY
+                 or not compiles_one_playlist_for_the_whole_instance(lane)]
+    else:
         want = set(want or [])
         missing = want - {lane["id"] for lane in lanes}
         if missing:

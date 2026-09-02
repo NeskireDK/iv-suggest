@@ -35,6 +35,18 @@ lanes:
 """
 
 
+WITH_A_PUBLIC_LANE = LANES + """
+  - id: popular
+    title: Popular
+    policy: consensus
+    privacy: public
+    min_watched: 0
+    consensus:
+      sources:
+        - {users: all, lane: suggested}
+"""
+
+
 class ConfigCase(unittest.TestCase):
 
     def loaded(self, text, account=ME, instance=()):
@@ -190,6 +202,38 @@ users:
         mod = self.loaded(LANES + "auto_enrol: {exclude: [%s]}\n" % OTHER,
                           instance=(ME, OTHER, THIRD))
         self.assertNotIn(OTHER, [u["email"] for u in mod.load_users()])
+
+
+class OnePublicCopy(ConfigCase):
+    """A consensus lane is one playlist for the instance, so only PRIMARY holds it.
+
+    `auto_enrol: {lanes: all}` hands every lane to every account. Without this
+    rule, turning on a public feed would create one private copy of it per
+    account -- every copy holding the same videos, and every copy costing an
+    upstream rebuild.
+    """
+
+    def lane_ids(self, mod, email):
+        user = [u for u in mod.load_users() if u["email"] == email][0]
+        return [lane["id"] for lane in mod.lanes_for(user, mod.load_config())]
+
+    def enrolled(self, extra=""):
+        return self.loaded(WITH_A_PUBLIC_LANE + "auto_enrol: {}\n" + extra,
+                           instance=(ME, OTHER))
+
+    def test_the_primary_account_holds_the_compiled_lane(self):
+        self.assertIn("popular", self.lane_ids(self.enrolled(), ME))
+
+    def test_an_auto_enrolled_account_does_not_get_a_copy(self):
+        self.assertNotIn("popular", self.lane_ids(self.enrolled(), OTHER))
+
+    def test_its_ordinary_lanes_are_untouched(self):
+        self.assertEqual(["suggested", "fresh-uploads", "household"],
+                         self.lane_ids(self.enrolled(), OTHER))
+
+    def test_an_account_that_names_the_lane_still_gets_it(self):
+        mod = self.enrolled("users:\n  - email: %s\n    lanes: [popular]\n" % OTHER)
+        self.assertEqual(["popular"], self.lane_ids(mod, OTHER))
 
 
 class HistoryGate(ConfigCase):

@@ -54,6 +54,11 @@ held back rather than created empty, and appears on its own once the history is
 there. Give the account something in the meantime — a `mix` lane sourced from
 `users: all` costs nothing and needs no history.
 
+⚠️ **`lanes: all` never includes a `consensus` lane.** That policy compiles one
+playlist for the whole instance, so a copy per account would hold the same
+videos in every one of them. `IV_SUGGEST_ACCOUNT` holds it; another account gets
+it only by naming the lane id in its own `users:` entry.
+
 ### `users`
 
 Per-account settings. With `auto_enrol` this is how you give somebody
@@ -216,11 +221,11 @@ Three things follow from the feed having no viewer:
   a public playlist has no one viewer to disorient. Membership stays the nightly
   run's call, exactly as for `mix`.
 
-Give the lane `privacy: public` if visitors are to see it. Scope it to **one
-account**: with `auto_enrol` every account is given every lane, so name the
-owner in `users:` and leave the consensus lane out of `auto_enrol.lanes`, or the
-instance grows one copy of the feed per account. Pointing `popular_playlists` at
-its plid is a compose change, not a setting here.
+Give the lane `privacy: public` if visitors are to see it. Scoping it to one
+account is not your job: `lanes: all` never hands out a consensus lane, so it
+lands on `IV_SUGGEST_ACCOUNT` and nowhere else unless another account names the
+lane id itself. Pointing `popular_playlists` at its plid is a compose change,
+not a setting here.
 
 #### `shuffle`
 
