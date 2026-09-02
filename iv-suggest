@@ -756,8 +756,21 @@ def warn_ignored_keys(lanes):
                 % (lane["id"], lane["policy"], ", ".join(lane["ignored"])))
 
 
+def warn_about_lanes_nobody_asked_for(lanes):
+    """Name a lane id in `users:` or `auto_enrol.lanes` that no lane in the file has."""
+    known = {lane["id"] for lane in lanes}
+    asked = {"auto_enrol.lanes": auto_enrolled_lanes()}
+    asked.update({user["email"]: wanted_lanes(user) for user in load_users()
+                  if user.get("named")})
+    for who, want in sorted(asked.items()):
+        missing = want - known
+        if missing:
+            log("%s asks for lanes that do not exist: %s"
+                % (who, ", ".join(sorted(missing))))
+
+
 def warn_about_compiled_lanes(lanes):
-    """Say which compiled lanes reach nobody, and which reach only one of the accounts asking."""
+    """Say which compiled lanes reach nobody, and who asked for one another account holds."""
     compiled = [lane["id"] for lane in lanes
                 if compiles_one_playlist_for_the_whole_instance(lane)]
     if not compiled:
@@ -773,12 +786,16 @@ def warn_about_compiled_lanes(lanes):
                 "name the lane in a users: entry, or lower its min_watched."
                 % lane_id)
             continue
+        if lane_id in auto_enrolled_lanes():
+            log("lane %s: auto_enrol.lanes names it, but one account holds the "
+                "instance's only copy. %s has it; nobody else is given one."
+                % (lane_id, holders[0]))
         refused = sorted(user["email"] for user in users
                          if user["email"] not in holders
-                         and lane_id in wanted_lanes(user))
+                         and claims_the_lane(user, lane_id))
         if refused:
-            log("lane %s: %s holds the instance's one copy, so %s get none"
-                % (lane_id, holders[0], ", ".join(refused)))
+            log("lane %s: %s holds the instance's only copy, so %s asks for it "
+                "in vain" % (lane_id, holders[0], ", ".join(refused)))
 
 
 def instance_accounts():
@@ -795,6 +812,20 @@ def watch_count(email):
     return _WATCH_COUNTS[email]
 
 
+def checked_overrides(email, overrides):
+    """One account's override block, refusing the two shapes that would not survive a merge."""
+    for lane_id, patch in (overrides or {}).items():
+        if not isinstance(patch, dict):
+            sys.exit("%s: override of lane %r in %s must be a block of keys"
+                     % (email, lane_id, CONFIG))
+        if "policy" in patch:
+            sys.exit("%s: override of lane %r in %s sets policy. A policy is "
+                     "what a lane IS, not a per-account setting: give the "
+                     "account a lane of its own instead."
+                     % (email, lane_id, CONFIG))
+    return overrides or {}
+
+
 def named_users(cfg):
     """The accounts written out in the users: block."""
     users = []
@@ -804,7 +835,8 @@ def named_users(cfg):
             sys.exit("a users: entry in %s has no email" % CONFIG)
         users.append({"email": email, "named": True,
                       "lanes": entry.get("lanes", "all"),
-                      "overrides": entry.get("overrides") or {}})
+                      "overrides": checked_overrides(
+                          email, entry.get("overrides"))})
     return users
 
 
@@ -844,6 +876,14 @@ def compiles_one_playlist_for_the_whole_instance(lane):
     return lane["policy"] == "consensus"
 
 
+def auto_enrolled_lanes():
+    """The lane ids `auto_enrol.lanes` names, empty when it names them all or is absent."""
+    auto = read_config().get("auto_enrol")
+    auto = auto if isinstance(auto, dict) else {}
+    asked_for = auto.get("lanes", "all")
+    return set() if asked_for == "all" else set(asked_for or [])
+
+
 def wanted_lanes(user):
     """The lane ids this account's `lanes:` key names, empty when it names them all."""
     asked_for = user.get("lanes", "all")
@@ -865,20 +905,15 @@ def holds_the_instance_copy(user, lane_id):
 
 
 def lanes_asked_for(user, lanes):
-    """The lanes this account's own `lanes:` key selects, naming any that do not exist."""
-    want = user.get("lanes", "all")
-    if want == "all":
+    """The lanes this account's own `lanes:` key selects. Silent: the config warnings name a typo."""
+    want = wanted_lanes(user)
+    if user.get("lanes", "all") == "all":
         return lanes
-    want = set(want or [])
-    missing = want - {lane["id"] for lane in lanes}
-    if missing:
-        log("  %s asks for lanes that do not exist: %s"
-            % (user["email"], ", ".join(sorted(missing))))
     return [lane for lane in lanes if lane["id"] in want]
 
 
 def without_the_compiled_lanes_somebody_else_holds(user, lanes):
-    """Drop the compiled lanes another account holds. Says nothing: warn_about_compiled_lanes does."""
+    """Drop the compiled lanes another account holds. Silent: warn_about_compiled_lanes names them."""
     return [lane for lane in lanes
             if not compiles_one_playlist_for_the_whole_instance(lane)
             or holds_the_instance_copy(user, lane["id"])]
@@ -887,11 +922,11 @@ def without_the_compiled_lanes_somebody_else_holds(user, lanes):
 def lanes_for(user, lanes, watched=None):
     """The lanes one account gets, in lanes.yml order, with its overrides applied.
     Pass `watched` to also drop the lanes it has too little history to fill."""
-    lanes = lanes_asked_for(user, lanes)
+    lanes = without_the_compiled_lanes_somebody_else_holds(
+        user, lanes_asked_for(user, lanes))
     overrides = user.get("overrides") or {}
     lanes = [overridden_lane(lane, overrides[lane["id"]])
              if lane["id"] in overrides else lane for lane in lanes]
-    lanes = without_the_compiled_lanes_somebody_else_holds(user, lanes)
     if watched is None:
         return lanes
     return [lane for lane in lanes if watched >= lane["min_watched"]]
@@ -1746,9 +1781,9 @@ def rebuild_playlist(lane, desired, run):
     plid, playlist = playlist_of(lane, run.dry)
     current = [v["videoId"] for v in (playlist.get("videos") or [])]
     if not desired and current and lane["size"]:
-        raise Aborted("the rebuild came back empty; keeping the %d this lane "
-                      "already holds rather than publishing nothing"
-                      % len(current))
+        raise Aborted("the rebuild came back empty; keeping the %d video%s "
+                      "this lane already holds rather than publishing nothing"
+                      % (len(current), "" if len(current) == 1 else "s"))
     if current == desired:
         log("  order unchanged, %d videos, nothing to do" % len(current))
         return 0, 0, len(current), 0
@@ -1850,6 +1885,7 @@ def cmd_run(args):
     """Fill every managed account's lanes in one paced run: one timer, one budget."""
     all_lanes = load_config()
     warn_ignored_keys(all_lanes)
+    warn_about_lanes_nobody_asked_for(all_lanes)
     warn_about_compiled_lanes(all_lanes)
     users = accounts_wanted(args)
     fetcher = Fetcher(rate_per_min=args.rate, budget=args.budget)
@@ -2318,6 +2354,7 @@ def cmd_init(args):
         u for u in load_users() if u["email"] == PRIMARY]
     all_lanes = load_config()
     warn_ignored_keys(all_lanes)
+    warn_about_lanes_nobody_asked_for(all_lanes)
     warn_about_compiled_lanes(all_lanes)
     for user in users:
         log("account %s" % user["email"])

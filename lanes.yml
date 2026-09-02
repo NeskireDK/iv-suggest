@@ -245,9 +245,10 @@ lanes:
   # viewer whose history it could be. Zero fetches: both read lanes that are
   # already in the database.
   #
-  # Exactly one account holds a consensus lane and the engine decides which,
-  # so there is no way to spell a second copy here. A `users:` entry naming the
-  # lane claims it; otherwise it lands on IV_SUGGEST_ACCOUNT.
+  # Exactly one account holds a consensus lane and the engine decides which, so
+  # there is no way to spell a second copy: an override may not change a
+  # policy, and neither form of auto_enrol hands one out. A `users:` entry
+  # naming the lane claims it; otherwise it lands on IV_SUGGEST_ACCOUNT.
   #
   # Membership can lag one run for an account whose source mix is rebuilt later
   # in the same night: the run order is least-recently-succeeded first, not the

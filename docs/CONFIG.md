@@ -73,7 +73,7 @@ which is what it did before multi-user.
 |---|---|---|
 | `email` | — | **Required.** the `users.email` value |
 | `lanes` | `all` | `all`, or a list of lane ids. Order is always the file's, so mix lanes still run last |
-| `overrides` | `{}` | `{lane-id: {key: value}}` — lane keys changed for this account only |
+| `overrides` | `{}` | `{lane-id: {key: value}}` — lane keys changed for this account only. **`policy` is refused**: it decides which keys the lane reads and how many copies of it exist, so it is what a lane *is*, not a per-account setting. Give the account a lane of its own instead |
 
 An override patch merges into `shuffle`, `subscription`, `mix` and `consensus`
 key by key, so setting one of their keys keeps the rest. Every other block,
@@ -170,7 +170,8 @@ the fetch budget**, never needs another account's session, and runs even after a
 run has spent its budget on the lanes that do. It is not free upstream, though:
 a rebuild is one DELETE and one POST per video, and Invidious resolves each
 added video server-side, outside the bot's pacing. See
-[Compiled lanes](#compiled-lanes) for the two rules it shares with `consensus`.
+[the shared rules](#rules-the-two-compiled-policies-share) for the two it
+follows along with `consensus`.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -230,10 +231,10 @@ account is not your job — see the note under [`auto_enrol`](#auto_enrol).
 Pointing `popular_playlists` at its plid is a compose change, not a setting
 here.
 
-See [Compiled lanes](#compiled-lanes) for the two things `mix` and `consensus`
-both do differently from a `refill` lane.
+See [the shared rules](#rules-the-two-compiled-policies-share) for the two
+things `mix` and `consensus` both do differently from a `refill` lane.
 
-#### Compiled lanes
+#### Rules the two compiled policies share
 
 `mix` and `consensus` both build their content out of other lanes rather than
 choosing it, and two rules follow from that.
@@ -241,10 +242,10 @@ choosing it, and two rules follow from that.
 **A rebuild that would empty the lane is refused.** It keeps what it holds and
 records the reason on the run row instead, so the lane counts as failed and
 `run` exits non-zero. What reaches this point is a draw that came back empty
-from sources that exist: every source empty, or — for a `mix`, which does filter
-per viewer — every candidate already watched. A source lane with no playlist at
-all aborts earlier and by name. A lane with `size: 0` is exempt, because that
-asks for empty.
+from sources that exist: every source empty, or everything they offered dropped
+by the blocklist, or — for a `mix`, which also filters per viewer — every
+candidate already watched. A source lane with no playlist at all aborts earlier
+and by name. A lane with `size: 0` is exempt, because that asks for empty.
 
 **`dedupe` leaves them alone.** A compiled lane holds copies of its sources on
 purpose, so its copy is not a duplicate. Dropping it took the video out of the

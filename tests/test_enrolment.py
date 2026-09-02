@@ -281,21 +281,38 @@ class OnePublicCopy(ConfigCase):
         mod = self.enrolled("users:\n  - email: %s\n    lanes: [popular]\n" % OTHER)
         self.assertNotIn("popular", self.lane_ids(mod, ME))
 
-    def test_an_override_cannot_spell_a_second_copy(self):
-        """`overrides` may set `policy`, so the rule has to run after they merge."""
+    def test_an_override_may_not_change_a_policy_at_all(self):
+        """A policy decides which keys are read and how many copies exist. Not per account."""
         mod = self.loaded(WITH_A_PUBLIC_LANE + """
 auto_enrol: {}
 users:
   - email: %s
     lanes: [suggested]
     overrides: {suggested: {policy: consensus}}
+""" % OTHER, instance=(ME, OTHER))
+        with self.assertRaises(SystemExit) as caught:
+            mod.load_users()
+        self.assertIn("sets policy", str(caught.exception))
+
+    def test_an_override_that_is_not_a_block_of_keys_is_refused(self):
+        """It used to reach merge_lane and take the whole run down with a ValueError."""
+        mod = self.loaded(WITH_A_PUBLIC_LANE + """
+auto_enrol: {}
+users:
   - email: %s
-    lanes: [suggested]
-    overrides: {suggested: {policy: consensus}}
-""" % (ME, OTHER), instance=(ME, OTHER))
-        holders = [email for email in (ME, OTHER)
-                   if "suggested" in self.lane_ids(mod, email)]
-        self.assertEqual(1, len(holders), holders)
+    overrides: {suggested: nonsense}
+""" % OTHER, instance=(ME, OTHER))
+        with self.assertRaises(SystemExit) as caught:
+            mod.load_users()
+        self.assertIn("must be a block of keys", str(caught.exception))
+
+    def test_the_auto_enrol_list_naming_it_is_reported_against_that_key(self):
+        mod = self.loaded(WITH_A_PUBLIC_LANE
+                          + "auto_enrol: {lanes: [suggested, popular]}\n",
+                          instance=(ME, OTHER))
+        said = self.warnings(mod)
+        self.assertEqual(1, len(said), said)
+        self.assertIn("auto_enrol.lanes names it", said[0])
 
     def test_an_account_refused_the_lane_is_named_once(self):
         mod = self.enrolled(

@@ -40,8 +40,11 @@ class ConfigCase(unittest.TestCase):
         self.addCleanup(os.unlink, fh.name)
         return fh.name
 
-    def loaded(self, text, account=ME):
-        return load(IV_SUGGEST_CONFIG=self.write(text), IV_SUGGEST_ACCOUNT=account)
+    def loaded(self, text, account=ME, instance=()):
+        mod = load(IV_SUGGEST_CONFIG=self.write(text), IV_SUGGEST_ACCOUNT=account)
+        mod.instance_accounts = lambda: list(instance)
+        mod.watch_count = lambda email: 900
+        return mod
 
 
 class Users(ConfigCase):
@@ -109,7 +112,32 @@ users:
         user = mod.load_users()[0]
         self.assertEqual(["suggested"],
                          [l["id"] for l in mod.lanes_for(user, mod.load_config())])
+        self.assertEqual([], said, "lanes_for is a reader, not a reporter")
+        mod.warn_about_lanes_nobody_asked_for(mod.load_config())
         self.assertIn("typo-lane", " ".join(said))
+
+    def test_a_typo_is_reported_once_however_many_times_the_lanes_are_read(self):
+        """run_account reads them twice and the warnings once, so a log there triples."""
+        mod = self.loaded(LANES + """
+users:
+  - email: %s
+    lanes: [typo-lane]
+""" % OTHER)
+        said = []
+        mod.log = said.append
+        mod.warn_about_lanes_nobody_asked_for(mod.load_config())
+        for _ in range(3):
+            mod.lanes_for(mod.load_users()[0], mod.load_config())
+        self.assertEqual(1, len(said), said)
+
+    def test_a_typo_in_the_auto_enrol_list_is_reported_against_that_key(self):
+        mod = self.loaded(LANES + "auto_enrol: {lanes: [suggested, typo-lane]}\n",
+                          instance=(ME, OTHER))
+        said = []
+        mod.log = said.append
+        mod.warn_about_lanes_nobody_asked_for(mod.load_config())
+        self.assertEqual(1, len(said), said)
+        self.assertIn("auto_enrol.lanes", said[0])
 
     def test_an_override_applies_to_that_account_only(self):
         mod = self.loaded(LANES + """
