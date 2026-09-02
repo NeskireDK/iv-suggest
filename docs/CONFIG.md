@@ -54,6 +54,13 @@ held back rather than created empty, and appears on its own once the history is
 there. Give the account something in the meantime — a `mix` lane sourced from
 `users: all` costs nothing and needs no history.
 
+⚠️ **A `consensus` lane reaches exactly one account, whatever this block says.**
+That policy compiles one playlist for the whole instance, so a copy per account
+would hold the same videos in every one of them. Neither the `all` form nor the
+list form hands one out. A `users:` entry naming the lane id claims it; if none
+does, it lands on `IV_SUGGEST_ACCOUNT`. `run` and `init` say so when a compiled
+lane reaches nobody at all.
+
 ### `users`
 
 Per-account settings. With `auto_enrol` this is how you give somebody
@@ -66,7 +73,7 @@ which is what it did before multi-user.
 |---|---|---|
 | `email` | — | **Required.** the `users.email` value |
 | `lanes` | `all` | `all`, or a list of lane ids. Order is always the file's, so mix lanes still run last |
-| `overrides` | `{}` | `{lane-id: {key: value}}` — lane keys changed for this account only |
+| `overrides` | `{}` | `{lane-id: {key: value}}` — lane keys changed for this account only. **`policy` is refused**: it decides which keys the lane reads and how many copies of it exist, so it is what a lane *is*, not a per-account setting. Give the account a lane of its own instead |
 
 An override patch merges into `shuffle`, `subscription`, `mix` and `consensus`
 key by key, so setting one of their keys keeps the rest. Every other block,
@@ -112,7 +119,7 @@ only**. `init` and `run` name any inert key a lane sets:
 | `exclude_watched` | `true` | drop what this account already watched |
 | `exclude_subscribed` | `true` | drop channels this account subscribes to — their feed already shows them. `false` does not re-admit them under `channel_latest`, which skips subscribed channels when choosing whom to poll |
 | `dedupe_across_lanes` | `true` | a video sits in one lane at a time, per account |
-| `dedupe_songs` | `true` | one upload per song, across every lane. See [README](../README.md#song-identity) |
+| `dedupe_songs` | `true` | one upload per song, across every lane a person holds. A compiled lane is not one of them — `dedupe` skips those. See [README](../README.md#song-identity) |
 | `min_seconds` | `120` | drop anything shorter, **when the length is known** — a candidate reporting `0` seconds passes. `0` = off |
 | `max_seconds` | `0` | drop anything longer. `0` = no bound; use it against compilations |
 | `max_per_channel` | `2` | most entries one channel may hold. `0` = no limit |
@@ -159,9 +166,12 @@ filter on.
 
 `policy: mix` interleaves other lanes, under the lane's `mix:` key. It rebuilds
 from its sources every run and reads them over SQL, so it spends **nothing from
-the fetch budget** and never needs another account's session. It is not free
-upstream, though: a rebuild is one DELETE and one POST per video, and Invidious
-resolves each added video server-side, outside the bot's pacing.
+the fetch budget**, never needs another account's session, and runs even after a
+run has spent its budget on the lanes that do. It is not free upstream, though:
+a rebuild is one DELETE and one POST per video, and Invidious resolves each
+added video server-side, outside the bot's pacing. See
+[the shared rules](#rules-the-two-compiled-policies-share) for the two it
+follows along with `consensus`.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -216,11 +226,31 @@ Three things follow from the feed having no viewer:
   a public playlist has no one viewer to disorient. Membership stays the nightly
   run's call, exactly as for `mix`.
 
-Give the lane `privacy: public` if visitors are to see it. Scope it to **one
-account**: with `auto_enrol` every account is given every lane, so name the
-owner in `users:` and leave the consensus lane out of `auto_enrol.lanes`, or the
-instance grows one copy of the feed per account. Pointing `popular_playlists` at
-its plid is a compose change, not a setting here.
+Give the lane `privacy: public` if visitors are to see it. Scoping it to one
+account is not your job — see the note under [`auto_enrol`](#auto_enrol).
+Pointing `popular_playlists` at its plid is a compose change, not a setting
+here.
+
+See [the shared rules](#rules-the-two-compiled-policies-share) for the two
+things `mix` and `consensus` both do differently from a `refill` lane.
+
+#### Rules the two compiled policies share
+
+`mix` and `consensus` both build their content out of other lanes rather than
+choosing it, and two rules follow from that.
+
+**A rebuild that would empty the lane is refused.** It keeps what it holds and
+records the reason on the run row instead, so the lane counts as failed and
+`run` exits non-zero. What reaches this point is a draw that came back empty
+from sources that exist: every source empty, or everything they offered dropped
+by the blocklist, or — for a `mix`, which also filters per viewer — every
+candidate already watched. A source lane with no playlist at all aborts earlier
+and by name. A lane with `size: 0` is exempt, because that asks for empty.
+
+**`dedupe` leaves them alone.** A compiled lane holds copies of its sources on
+purpose, so its copy is not a duplicate. Dropping it took the video out of the
+visible feed while the source kept it, and for a `public` lane that is a hole in
+the page.
 
 #### `shuffle`
 

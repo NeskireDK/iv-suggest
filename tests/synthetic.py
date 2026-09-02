@@ -516,6 +516,7 @@ class Instance:
         for ucid in account.subscriptions:
             self._publish(ucid)
         self.engine._CONFIG_CACHE.pop("users", None)
+        self.engine._WATCH_COUNTS.clear()
         return account
 
     def _publish(self, ucid):

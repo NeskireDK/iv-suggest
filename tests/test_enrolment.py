@@ -35,6 +35,18 @@ lanes:
 """
 
 
+WITH_A_PUBLIC_LANE = LANES + """
+  - id: popular
+    title: Popular
+    policy: consensus
+    privacy: public
+    min_watched: 0
+    consensus:
+      sources:
+        - {users: all, lane: suggested}
+"""
+
+
 class ConfigCase(unittest.TestCase):
 
     def loaded(self, text, account=ME, instance=()):
@@ -44,6 +56,7 @@ class ConfigCase(unittest.TestCase):
         self.addCleanup(os.unlink, fh.name)
         mod = load(IV_SUGGEST_CONFIG=fh.name, IV_SUGGEST_ACCOUNT=account)
         mod.instance_accounts = lambda: list(instance)
+        mod.watch_count = lambda email: 900
         return mod
 
 
@@ -190,6 +203,135 @@ users:
         mod = self.loaded(LANES + "auto_enrol: {exclude: [%s]}\n" % OTHER,
                           instance=(ME, OTHER, THIRD))
         self.assertNotIn(OTHER, [u["email"] for u in mod.load_users()])
+
+
+class OnePublicCopy(ConfigCase):
+    """A consensus lane is one playlist for the instance, so only PRIMARY holds it.
+
+    `auto_enrol: {lanes: all}` hands every lane to every account. Without this
+    rule, turning on a public feed would create one private copy of it per
+    account -- every copy holding the same videos, and every copy costing an
+    upstream rebuild.
+    """
+
+    def lane_ids(self, mod, email):
+        user = [u for u in mod.load_users() if u["email"] == email][0]
+        return [lane["id"] for lane in mod.lanes_for(user, mod.load_config())]
+
+    def enrolled(self, extra=""):
+        return self.loaded(WITH_A_PUBLIC_LANE + "auto_enrol: {}\n" + extra,
+                           instance=(ME, OTHER, THIRD))
+
+    def test_the_primary_account_holds_the_compiled_lane(self):
+        self.assertIn("popular", self.lane_ids(self.enrolled(), ME))
+
+    def test_an_auto_enrolled_account_does_not_get_a_copy(self):
+        self.assertNotIn("popular", self.lane_ids(self.enrolled(), OTHER))
+
+    def test_its_ordinary_lanes_are_untouched(self):
+        self.assertEqual(["suggested", "fresh-uploads", "household"],
+                         self.lane_ids(self.enrolled(), OTHER))
+
+    def test_an_account_that_names_the_lane_still_gets_it(self):
+        mod = self.enrolled("users:\n  - email: %s\n    lanes: [popular]\n" % OTHER)
+        self.assertEqual(["popular"], self.lane_ids(mod, OTHER))
+
+    def test_an_auto_enrol_lane_list_does_not_hand_out_a_copy_either(self):
+        """The rule has to hold for the list form, or it holds for nothing."""
+        mod = self.loaded(WITH_A_PUBLIC_LANE
+                          + "auto_enrol: {lanes: [suggested, popular]}\n",
+                          instance=(ME, OTHER))
+        self.assertEqual(["suggested", "popular"], self.lane_ids(mod, ME))
+        self.assertEqual(["suggested"], self.lane_ids(mod, OTHER))
+
+    def test_nobody_holding_it_is_said_out_loud(self):
+        mod = self.loaded(WITH_A_PUBLIC_LANE + "auto_enrol: {}\n",
+                          account="", instance=(ME, OTHER))
+        said = []
+        mod.log = said.append
+        mod.warn_about_compiled_lanes(mod.load_config())
+        self.assertEqual(1, len(said), said)
+        self.assertIn("popular", said[0])
+        self.assertIn("no managed account is given it", said[0])
+
+    def test_a_lane_with_a_holder_says_nothing(self):
+        mod = self.enrolled()
+        self.assertEqual([], self.warnings(mod))
+
+    def test_a_holder_whose_own_lane_list_leaves_it_out_is_still_orphaned(self):
+        """PRIMARY being named is not the same as PRIMARY being given the lane."""
+        mod = self.enrolled("users:\n  - email: %s\n    lanes: [suggested]\n" % ME)
+        self.assertEqual(1, len(self.warnings(mod)))
+
+    def test_a_lane_held_back_by_min_watched_is_orphaned_too(self):
+        mod = self.loaded(WITH_A_PUBLIC_LANE.replace("    min_watched: 0\n", "")
+                          + "auto_enrol: {}\n", instance=(ME, OTHER))
+        mod.watch_count = lambda email: 3
+        self.assertEqual(1, len(self.warnings(mod)))
+
+    def test_two_named_claimants_still_leave_one_holder(self):
+        mod = self.enrolled(
+            "users:\n  - email: %s\n    lanes: [popular]\n"
+            "  - email: %s\n    lanes: [popular]\n" % (OTHER, THIRD))
+        holders = [email for email in (ME, OTHER, THIRD)
+                   if "popular" in self.lane_ids(mod, email)]
+        self.assertEqual([OTHER], holders)
+
+    def test_a_claim_takes_the_lane_off_the_primary_account(self):
+        mod = self.enrolled("users:\n  - email: %s\n    lanes: [popular]\n" % OTHER)
+        self.assertNotIn("popular", self.lane_ids(mod, ME))
+
+    def test_an_override_may_not_change_a_policy_at_all(self):
+        """A policy decides which keys are read and how many copies exist. Not per account."""
+        mod = self.loaded(WITH_A_PUBLIC_LANE + """
+auto_enrol: {}
+users:
+  - email: %s
+    lanes: [suggested]
+    overrides: {suggested: {policy: consensus}}
+""" % OTHER, instance=(ME, OTHER))
+        with self.assertRaises(SystemExit) as caught:
+            mod.load_users()
+        self.assertIn("sets policy", str(caught.exception))
+
+    def test_an_override_that_is_not_a_block_of_keys_is_refused(self):
+        """It used to reach merge_lane and take the whole run down with a ValueError."""
+        mod = self.loaded(WITH_A_PUBLIC_LANE + """
+auto_enrol: {}
+users:
+  - email: %s
+    overrides: {suggested: nonsense}
+""" % OTHER, instance=(ME, OTHER))
+        with self.assertRaises(SystemExit) as caught:
+            mod.load_users()
+        self.assertIn("must be a block of keys", str(caught.exception))
+
+    def test_the_auto_enrol_list_naming_it_is_reported_against_that_key(self):
+        mod = self.loaded(WITH_A_PUBLIC_LANE
+                          + "auto_enrol: {lanes: [suggested, popular]}\n",
+                          instance=(ME, OTHER))
+        said = self.warnings(mod)
+        self.assertEqual(1, len(said), said)
+        self.assertIn("auto_enrol.lanes names it", said[0])
+
+    def test_an_account_refused_the_lane_is_named_once(self):
+        mod = self.enrolled(
+            "users:\n  - email: %s\n    lanes: [popular]\n"
+            "  - email: %s\n    lanes: [popular]\n" % (OTHER, THIRD))
+        said = self.warnings(mod)
+        self.assertEqual(1, len(said), said)
+        self.assertIn(OTHER, said[0])
+        self.assertIn(THIRD, said[0])
+
+    def test_the_ordinary_config_says_nothing_about_who_missed_out(self):
+        """Every account inheriting `lanes: all` asked for nothing in particular."""
+        self.assertEqual([], self.warnings(self.enrolled()))
+
+    def warnings(self, mod):
+        said = []
+        mod.log = said.append
+        mod.warn_about_compiled_lanes(mod.load_config())
+        return said
 
 
 class HistoryGate(ConfigCase):

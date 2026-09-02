@@ -103,7 +103,10 @@ lanes:
     max_channels: 16
     max_age_days: 30
     max_per_channel: 2
-    fetch_cap: 20
+    # 16 channels at one fetch each, plus headroom for the retries a channel
+    # listing now takes: at 20 the cap bound mid-lane on a rate-limited night
+    # and the lane read about half its channels.
+    fetch_cap: 30
 
   # The 5 biggest things the subscriptions put out in the last 48 hours. Every
   # other lane excludes subscribed channels; this one is the deliberate
@@ -209,9 +212,8 @@ lanes:
     keep_min: 12
     fetch_cap: 60
 
-  # THE LANDING PAGE: this lane IS the Popular feed (popular_playlists in the
-  # compose file points at its plid). Spec: ~10% music, the rest recommendation
-  # driven.
+  # One person's whole front page, and the source `popular` compiles from.
+  # Spec: ~10% music, the rest recommendation driven.
   #
   # size 54 is what the shares and the source sizes agree on: suggested supplies
   # its full 30, fresh-uploads 19 of its 25, music 5. Growing `suggested` or
@@ -234,6 +236,46 @@ lanes:
         - {lane: music-discover, share: 0.10}
       # A source may name another account, which makes this the household feed:
       #   - {user: them@example.com, lane: suggested, share: 0.2}
+
+  # THE PUBLIC FEEDS: what popular_playlists and trending_playlists point at.
+  # One playlist each for the whole instance, compiled from every account's mix
+  # and weighted by how many of them hold a video, so agreement decides the top
+  # rather than any one person's taste. `privacy: public` because a logged-out
+  # visitor is the audience; no watch-history filter, because there is no one
+  # viewer whose history it could be. Zero fetches: both read lanes that are
+  # already in the database.
+  #
+  # Exactly one account holds a consensus lane and the engine decides which, so
+  # there is no way to spell a second copy: an override may not change a
+  # policy, and neither form of auto_enrol hands one out. A `users:` entry
+  # naming the lane claims it; otherwise it lands on IV_SUGGEST_ACCOUNT.
+  #
+  # Membership can lag one run for an account whose source mix is rebuilt later
+  # in the same night: the run order is least-recently-succeeded first, not the
+  # file's. It self-corrects the next night, and the hourly redraw is unaffected
+  # because that reads each source's stored order.
+  - id: popular
+    title: "Popular"
+    policy: consensus
+    privacy: public
+    # 54 is home-mix's own size, so the front page keeps the length it had when
+    # it was one person's home mix.
+    size: 54
+    min_watched: 0
+    consensus:
+      sources:
+        - {users: all, lane: home-mix}
+
+  # Music only, which is what this slot pointed at before it was compiled.
+  - id: trending
+    title: "Trending"
+    policy: consensus
+    privacy: public
+    size: 30
+    min_watched: 0
+    consensus:
+      sources:
+        - {users: all, lane: music-discover}
 
   # What a newly enrolled account opens onto, and a standing household feed for
   # everyone else. `users: all` names nobody, so it keeps working as accounts

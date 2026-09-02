@@ -521,15 +521,19 @@ class Fetcher:
         self.fetches += 1
         self.lane_used += 1
 
+    def _refuse_when_out_of_budget(self):
+        """Raise before a call starts, so a call already retrying is never cut in half."""
+        if self.fetches >= self.budget:
+            raise BudgetSpent("run budget %d spent" % self.budget)
+        if self.lane_cap and self.lane_used >= self.lane_cap:
+            raise BudgetSpent("lane fetch cap %d reached" % self.lane_cap)
+
     def video(self, vid):
         """Full API answer, or None when the video is gone or upstream cannot parse it."""
         if vid in self.dead:
             self.dead_hits += 1
             return None
-        if self.fetches >= self.budget:
-            raise BudgetSpent("run budget %d spent" % self.budget)
-        if self.lane_cap and self.lane_used >= self.lane_cap:
-            raise BudgetSpent("lane fetch cap %d reached" % self.lane_cap)
+        self._refuse_when_out_of_budget()
         delay = 5.0
         for attempt in range(3):
             self._pace()
@@ -548,7 +552,7 @@ class Fetcher:
                     self.fails = 0
                     self.bury(vid, 365, "http %d" % e.code)
                     return None
-                if self._is_a_parser_bug_not_an_outage(e):
+                if self._only_this_request_is_broken(e):
                     self.fails = 0
                     self.skipped_500 += 1
                     self.bury(vid, DAYS_BEFORE_RETRYING_A_BROKEN_VIDEO,
@@ -563,8 +567,8 @@ class Fetcher:
                 delay *= 2
         return None
 
-    def _is_a_parser_bug_not_an_outage(self, error):
-        """True when Invidious is healthy but fails on this one video."""
+    def _only_this_request_is_broken(self, error):
+        """True when upstream answered 5xx and Invidious itself is still healthy."""
         return error.code >= 500 and self._alive()
 
     def bury(self, vid, days, reason):
@@ -578,29 +582,30 @@ class Fetcher:
 
     def channel_latest(self, ucid):
         """Recent uploads of one channel: one fetch for about 60 videos."""
-        if self.fetches >= self.budget:
-            raise BudgetSpent("run budget %d spent" % self.budget)
-        if self.lane_cap and self.lane_used >= self.lane_cap:
-            raise BudgetSpent("lane fetch cap %d reached" % self.lane_cap)
-        self._pace()
-        try:
-            data = api("GET", "/api/v1/channels/%s/latest" % ucid)
-            self._spend_one_fetch()
-            self.fails = 0
-            return data
-        except urllib.error.HTTPError as e:
-            self._spend_one_fetch()
-            if e.code in (404, 410):
+        self._refuse_when_out_of_budget()
+        delay = 5.0
+        for attempt in range(3):
+            self._pace()
+            try:
+                data = api("GET", "/api/v1/channels/%s/latest" % ucid)
+                self._spend_one_fetch()
                 self.fails = 0
-                return None
-            if e.code >= 500 and self._alive():
-                self.fails = 0
-                log("  skipping channel %s (upstream %d)" % (ucid, e.code))
-                return None
-            self._trouble(e, 5.0)
-        except Exception as e:
-            self._spend_one_fetch()
-            self._trouble(e, 5.0)
+                return data
+            except urllib.error.HTTPError as e:
+                self._spend_one_fetch()
+                if e.code in (404, 410):
+                    self.fails = 0
+                    return None
+                if self._only_this_request_is_broken(e):
+                    self.fails = 0
+                    log("  skipping channel %s (upstream %d)" % (ucid, e.code))
+                    return None
+                self._trouble(e, delay)
+                delay *= 2
+            except Exception as e:
+                self._spend_one_fetch()
+                self._trouble(e, delay)
+                delay *= 2
         return None
 
     def _alive(self):
@@ -692,6 +697,9 @@ def log(msg):
 
 
 _CONFIG_CACHE = {}
+# A watch count moves only when somebody watches something, and every reader of
+# it compares against min_watched, so one answer per invocation is enough.
+_WATCH_COUNTS = {}
 MERGED_LANE_BLOCKS = ("shuffle", "subscription", "mix", "consensus")
 
 
@@ -748,15 +756,74 @@ def warn_ignored_keys(lanes):
                 % (lane["id"], lane["policy"], ", ".join(lane["ignored"])))
 
 
+def warn_about_lanes_nobody_asked_for(lanes):
+    """Name a lane id in `users:` or `auto_enrol.lanes` that no lane in the file has."""
+    known = {lane["id"] for lane in lanes}
+    asked = {"auto_enrol.lanes": auto_enrolled_lanes()}
+    asked.update({user["email"]: wanted_lanes(user) for user in load_users()
+                  if user.get("named")})
+    for who, want in sorted(asked.items()):
+        missing = want - known
+        if missing:
+            log("%s asks for lanes that do not exist: %s"
+                % (who, ", ".join(sorted(missing))))
+
+
+def warn_about_compiled_lanes(lanes):
+    """Say which compiled lanes reach nobody, and who asked for one another account holds."""
+    compiled = [lane["id"] for lane in lanes
+                if compiles_one_playlist_for_the_whole_instance(lane)]
+    if not compiled:
+        return
+    users = load_users()
+    given = {user["email"]: {lane["id"] for lane in enrolled_lanes(user, lanes)}
+             for user in users}
+    for lane_id in compiled:
+        holders = sorted(email for email in given if lane_id in given[email])
+        if not holders:
+            log("lane %s: no managed account is given it, so nothing will "
+                "rebuild it. Point IV_SUGGEST_ACCOUNT at a managed account, "
+                "name the lane in a users: entry, or lower its min_watched."
+                % lane_id)
+            continue
+        if lane_id in auto_enrolled_lanes():
+            log("lane %s: auto_enrol.lanes names it, but one account holds the "
+                "instance's only copy. %s has it; nobody else is given one."
+                % (lane_id, holders[0]))
+        refused = sorted(user["email"] for user in users
+                         if user["email"] not in holders
+                         and claims_the_lane(user, lane_id))
+        if refused:
+            log("lane %s: %s holds the instance's only copy, so %s asks for it "
+                "in vain" % (lane_id, holders[0], ", ".join(refused)))
+
+
 def instance_accounts():
     """Every account registered on the Invidious instance."""
     return [r[0] for r in query("SELECT email FROM users ORDER BY email;")]
 
 
 def watch_count(email):
-    """How many videos an account has watched."""
-    return int(one("SELECT coalesce(array_length(watched, 1), 0) "
-                   "FROM users WHERE email = %s;" % lit(email)) or 0)
+    """How many videos an account has watched, asked once per invocation."""
+    if email not in _WATCH_COUNTS:
+        _WATCH_COUNTS[email] = int(
+            one("SELECT coalesce(array_length(watched, 1), 0) "
+                "FROM users WHERE email = %s;" % lit(email)) or 0)
+    return _WATCH_COUNTS[email]
+
+
+def checked_overrides(email, overrides):
+    """One account's override block, refusing the two shapes that would not survive a merge."""
+    for lane_id, patch in (overrides or {}).items():
+        if not isinstance(patch, dict):
+            sys.exit("%s: override of lane %r in %s must be a block of keys"
+                     % (email, lane_id, CONFIG))
+        if "policy" in patch:
+            sys.exit("%s: override of lane %r in %s sets policy. A policy is "
+                     "what a lane IS, not a per-account setting: give the "
+                     "account a lane of its own instead."
+                     % (email, lane_id, CONFIG))
+    return overrides or {}
 
 
 def named_users(cfg):
@@ -766,9 +833,10 @@ def named_users(cfg):
         email = (entry.get("email") or "").strip()
         if not email:
             sys.exit("a users: entry in %s has no email" % CONFIG)
-        users.append({"email": email,
+        users.append({"email": email, "named": True,
                       "lanes": entry.get("lanes", "all"),
-                      "overrides": entry.get("overrides") or {}})
+                      "overrides": checked_overrides(
+                          email, entry.get("overrides"))})
     return users
 
 
@@ -783,13 +851,15 @@ def load_users():
         if not named:
             if not PRIMARY:
                 sys.exit("no users: block in %s and no IV_SUGGEST_ACCOUNT" % CONFIG)
-            named = [{"email": PRIMARY, "lanes": "all", "overrides": {}}]
+            named = [{"email": PRIMARY, "named": True, "lanes": "all",
+                      "overrides": {}}]
         _CONFIG_CACHE["users"] = named
         return named
     auto = auto if isinstance(auto, dict) else {}
     skip = {u["email"] for u in named} | set(auto.get("exclude") or [])
     lanes = auto.get("lanes", "all")
-    users = named + [{"email": email, "lanes": lanes, "overrides": {}}
+    users = named + [{"email": email, "named": False, "lanes": lanes,
+                      "overrides": {}}
                      for email in instance_accounts() if email not in skip]
     _CONFIG_CACHE["users"] = users
     return users
@@ -801,17 +871,59 @@ def enrolled_lanes(user, all_lanes):
     return lanes_for(user, all_lanes, watch_count(user["email"]))
 
 
+def compiles_one_playlist_for_the_whole_instance(lane):
+    """True for a lane whose content is the same for everybody, so one copy is all there is."""
+    return lane["policy"] == "consensus"
+
+
+def auto_enrolled_lanes():
+    """The lane ids `auto_enrol.lanes` names, empty when it names them all or is absent."""
+    auto = read_config().get("auto_enrol")
+    auto = auto if isinstance(auto, dict) else {}
+    asked_for = auto.get("lanes", "all")
+    return set() if asked_for == "all" else set(asked_for or [])
+
+
+def wanted_lanes(user):
+    """The lane ids this account's `lanes:` key names, empty when it names them all."""
+    asked_for = user.get("lanes", "all")
+    return set() if asked_for == "all" else set(asked_for or [])
+
+
+def claims_the_lane(user, lane_id):
+    """True when this account's own `users:` entry names the lane, rather than inheriting it."""
+    return bool(user.get("named")) and lane_id in wanted_lanes(user)
+
+
+def holds_the_instance_copy(user, lane_id):
+    """Whether this account holds the instance's one copy of a compiled lane.
+    A `users:` entry naming the lane claims it; PRIMARY holds any lane unclaimed."""
+    claimants = [u["email"] for u in load_users() if claims_the_lane(u, lane_id)]
+    if claimants:
+        return user["email"] == claimants[0]
+    return user["email"] == PRIMARY
+
+
+def lanes_asked_for(user, lanes):
+    """The lanes this account's own `lanes:` key selects. Silent: the config warnings name a typo."""
+    want = wanted_lanes(user)
+    if user.get("lanes", "all") == "all":
+        return lanes
+    return [lane for lane in lanes if lane["id"] in want]
+
+
+def without_the_compiled_lanes_somebody_else_holds(user, lanes):
+    """Drop the compiled lanes another account holds. Silent: warn_about_compiled_lanes names them."""
+    return [lane for lane in lanes
+            if not compiles_one_playlist_for_the_whole_instance(lane)
+            or holds_the_instance_copy(user, lane["id"])]
+
+
 def lanes_for(user, lanes, watched=None):
     """The lanes one account gets, in lanes.yml order, with its overrides applied.
     Pass `watched` to also drop the lanes it has too little history to fill."""
-    want = user.get("lanes", "all")
-    if want != "all":
-        want = set(want or [])
-        missing = want - {lane["id"] for lane in lanes}
-        if missing:
-            log("  %s asks for lanes that do not exist: %s"
-                % (user["email"], ", ".join(sorted(missing))))
-        lanes = [lane for lane in lanes if lane["id"] in want]
+    lanes = without_the_compiled_lanes_somebody_else_holds(
+        user, lanes_asked_for(user, lanes))
     overrides = user.get("overrides") or {}
     lanes = [overridden_lane(lane, overrides[lane["id"]])
              if lane["id"] in overrides else lane for lane in lanes]
@@ -1668,6 +1780,10 @@ def rebuild_playlist(lane, desired, run):
     Returns (removed, added, kept, fetches), and its fetches are always none."""
     plid, playlist = playlist_of(lane, run.dry)
     current = [v["videoId"] for v in (playlist.get("videos") or [])]
+    if not desired and current and lane["size"]:
+        raise Aborted("the rebuild came back empty; keeping the %d video%s "
+                      "this lane already holds rather than publishing nothing"
+                      % (len(current), "" if len(current) == 1 else "s"))
     if current == desired:
         log("  order unchanged, %d videos, nothing to do" % len(current))
         return 0, 0, len(current), 0
@@ -1769,6 +1885,8 @@ def cmd_run(args):
     """Fill every managed account's lanes in one paced run: one timer, one budget."""
     all_lanes = load_config()
     warn_ignored_keys(all_lanes)
+    warn_about_lanes_nobody_asked_for(all_lanes)
+    warn_about_compiled_lanes(all_lanes)
     users = accounts_wanted(args)
     fetcher = Fetcher(rate_per_min=args.rate, budget=args.budget)
     seed_override = args.seeds if args.seeds else (DRY_SEEDS if args.dry_run else None)
@@ -1814,6 +1932,11 @@ def log_account_header(lanes, run):
            run.fetcher.budget - run.fetcher.fetches))
 
 
+def costs_no_fetch(lane):
+    """True for a lane compiled from other lanes: it reads them over SQL and fetches nothing."""
+    return lane["policy"] in COMPILED_POLICIES
+
+
 def run_one_lane(lane, run):
     """One lane's (removed, added, kept, fetches), and its error if it had one.
     A lane that raises is recorded and never stops the account's other lanes."""
@@ -1853,7 +1976,10 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
     if run.blocked:
         log("blocked: %s" % ", ".join(sorted(run.blocked.values())))
     failed = 0
+    out_of_budget = False
     for lane in lanes:
+        if out_of_budget and not costs_no_fetch(lane):
+            continue
         (removed, added, kept, used), error = run_one_lane(lane, run)
         if error:
             failed += 1
@@ -1863,10 +1989,10 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
                     "VALUES (%s,%s,%s,%s,%s,%s,%s);"
                     % (acct(), lit(lane["id"]), added, removed, kept, used,
                        lit(error)))
-        this_accounts_budget_is_spent = bool(error) and "budget" in error
-        if this_accounts_budget_is_spent:
-            log("fetch budget spent, stopping before %s's other lanes" % ACCOUNT)
-            break
+        if not out_of_budget and error and "budget" in error:
+            out_of_budget = True
+            log("fetch budget spent, skipping %s's remaining lanes that would "
+                "spend one" % ACCOUNT)
     return failed
 
 
@@ -1884,10 +2010,15 @@ Upload = namedtuple("Upload", "song quality lane_rank title_len lane plid video"
 
 def dedupe_account(args):
     """One account's duplicates. The keeper wins on upload_quality first, lane order second."""
-    order = {lane["id"]: i for i, lane in enumerate(load_config())}
+    all_lanes = load_config()
+    order = {lane["id"]: i for i, lane in enumerate(all_lanes)}
+    compiled = {lane["id"] for lane in all_lanes if costs_no_fetch(lane)}
     entries = []
     for lane_id, plid in query("SELECT lane, plid FROM suggest.lanes "
                                "WHERE account=%s;" % acct()):
+        if lane_id in compiled:
+            log("lane %-16s compiled from other lanes, left alone" % lane_id)
+            continue
         playlist = api("GET", "/api/v1/auth/playlists/" + plid)
         videos = playlist.get("videos") or []
         log("lane %-16s %d videos" % (lane_id, len(videos)))
@@ -2223,6 +2354,8 @@ def cmd_init(args):
         u for u in load_users() if u["email"] == PRIMARY]
     all_lanes = load_config()
     warn_ignored_keys(all_lanes)
+    warn_about_lanes_nobody_asked_for(all_lanes)
+    warn_about_compiled_lanes(all_lanes)
     for user in users:
         log("account %s" % user["email"])
         serve_account(user["email"])

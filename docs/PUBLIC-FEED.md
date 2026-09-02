@@ -1,13 +1,14 @@
-# TODO: the public feed, and what a brand new account sees
+# The public feed, and what a brand new account sees
 
-Status: **section 2 built and live; section 1 built 2026-09-01 and not
-enabled** — no lane in `lanes.yml` sets `policy: consensus`, so nothing on the
-instance uses it yet. Written 2026-08-31.
+Why the two compiled feeds are shaped the way they are. The keys themselves are
+in [CONFIG.md](CONFIG.md#consensus), and whether an instance has them switched
+on is a question for its own `lanes.yml`, not for this file.
 
 Two gaps, one moment: somebody opens the instance and the engine has nothing
-personal to offer them. A logged-out visitor has no account at all; a new account
-has one but no history yet. Today both land on whatever `popular_playlists`
-points at, which is one specific person's Home mix.
+personal to offer them. A logged-out visitor has no account at all; a new
+account has one but no history yet. Without either section, both land on
+whatever `popular_playlists` points at, which is one specific person's Home
+mix.
 
 ## Decided: how public is public?
 
@@ -24,7 +25,7 @@ is what the scoring below already wants — not as an access control.
 This unblocks section 1: the compiled playlist can be `privacy: public` and can
 be what `popular_playlists` points at.
 
-## 1. A public mix, compiled from everybody's — BUILT, NOT ENABLED
+## 1. A public mix, compiled from everybody's
 
 Decided 2026-08-31 (Andre): **the public feed is every account's home mix,
 resampled at random every hour, with a video ranked up the more mixes hold it.**
@@ -86,8 +87,12 @@ cannot regress the status quo.
   blocklists — a channel any member blocked is a bad thing to greet a stranger
   with. Do *not* filter on watch history: there is no viewer whose history it
   could be.
-- **It lives on the bot's own account**, because nobody in particular owns it,
-  with `privacy: public`, and `popular_playlists` points at it.
+- **It lives on one account**, because nobody in particular owns it, with
+  `privacy: public`, and `popular_playlists` is pointed at it. Which account is
+  the engine's call rather than a setting: a `users:` entry naming the lane
+  claims it, and otherwise it lands on `IV_SUGGEST_ACCOUNT`. Pointing the feed
+  at its plid is a compose change on the instance, so it is deliberately not
+  something merging the lane does.
 
 ### Settled while building
 
@@ -127,9 +132,9 @@ Two things the spec left ambiguous, resolved the same way:
   allowed to skip a member silently, which is what makes an empty `home-mix`
   contribute nothing.
 
-## 2. Auto-enrol every account, and carry the ones with no history — BUILT
+## 2. Auto-enrol every account, and carry the ones with no history
 
-**Built 2026-08-31, not yet deployed.** `auto_enrol:` in `lanes.yml` takes in
+`auto_enrol:` in `lanes.yml` takes in
 every account on the instance including ones registered later; `min_watched`
 holds back a lane an account cannot fill yet; and a `mix` source of
 `{users: all, lane: X}` expands to one source per account, so the `household`
@@ -153,9 +158,10 @@ mix from part 1 as its home feed.**
 - **A fallback, not a phase.** Nothing to switch off later: the moment the
   account has history its own lanes fill and the fallback stops applying by
   itself. No "graduation" state to track.
-- Cheapest form: a `mix` lane whose only source is the compiled feed, given to
-  any account under a watch-count threshold. Zero fetches, since a mix reads its
-  sources over SQL.
+- The lane that carries it is `household`, a `mix` over `{users: all}` rather
+  than over the compiled feed: it filters per viewer, which the compiled feed
+  cannot do, and it costs no fetch either way because a mix reads its sources
+  over SQL.
 - **Enrolment is idempotent.** It is recomputed every run; `playlist_of()`
   creates only what is missing, and `min_watched` is a filter rather than stored
   state, so nothing has to be migrated when an account warms up.

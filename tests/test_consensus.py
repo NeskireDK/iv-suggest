@@ -302,6 +302,33 @@ class Rebuilding(unittest.TestCase):
                          self.calls[0])
         self.assertEqual({"POST"}, {m for m, _ in self.calls[1:]})
 
+    def test_a_rebuild_with_nothing_in_it_keeps_the_playlist_as_it_is(self):
+        """A public feed going blank is not an answer worth publishing."""
+        self.mixes = {"PL_" + ME: [], "PL_" + OTHER: []}
+        self.mod.playlist_of = lambda lane, dry: (
+            "PL_feed", {"videos": [{"videoId": "old1", "indexId": "ix1"}]})
+        with self.assertRaises(self.mod.Aborted) as caught:
+            self.mod.run_lane_consensus(self.lane(), self.context())
+        self.assertIn("keeping the 1 video this lane already holds",
+                      str(caught.exception))
+        self.assertEqual([], self.calls)
+
+    def test_a_lane_asked_to_hold_nothing_is_allowed_to_hold_nothing(self):
+        """size 0 means empty on purpose, so emptying it is not a failure."""
+        self.mixes = {"PL_" + ME: [], "PL_" + OTHER: []}
+        self.mod.playlist_of = lambda lane, dry: (
+            "PL_feed", {"videos": [{"videoId": "old1", "indexId": "ix1"}]})
+        removed, added, kept, used = self.mod.run_lane_consensus(
+            self.lane(size=0), self.context())
+        self.assertEqual((1, 0, 0, 0), (removed, added, kept, used))
+
+    def test_an_empty_draw_into_an_empty_playlist_is_not_an_error(self):
+        """Nothing to keep, so nothing to protect: the first run of a new lane."""
+        self.mixes = {"PL_" + ME: [], "PL_" + OTHER: []}
+        removed, added, kept, used = self.mod.run_lane_consensus(
+            self.lane(), self.context())
+        self.assertEqual((0, 0, 0, 0), (removed, added, kept, used))
+
     def test_a_dry_run_writes_nothing_at_all(self):
         self.mod.api = lambda *a, **k: self.fail("a dry run called the API")
         removed, added, kept, used = self.mod.run_lane_consensus(

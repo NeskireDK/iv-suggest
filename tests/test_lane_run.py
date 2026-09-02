@@ -6,13 +6,15 @@ the run row records -- rather than on how the pipeline is spelled, so the same
 tests hold however it is split into functions.
 """
 
+import ast
 import os
 import re
 import tempfile
+import time
 import unittest
 import urllib.error
 
-from support import load
+from support import load, source
 
 ME = "andre@example.com"
 
@@ -128,15 +130,22 @@ class Api:
 
 
 class Fetch:
-    """The pacing and caching layer, without a network."""
+    """The pacing and caching layer, without a network. Answers, never refuses.
+
+    A budget it cannot reach, because a lane test scripts what upstream returns
+    and never makes it fail; BudgetSpent is pinned in test_fetch_budget.py.
+    """
 
     def __init__(self, meta=None, recs=None, channels=None, dead=()):
         self.meta = dict(meta or {})
         self.recs = dict(recs or {})
         self.channels = dict(channels or {})
         self.dead = set(dead)
+        self.budget = 10 ** 6
         self.fetches = 0
         self.cache_hits = 0
+        self.dead_hits = 0
+        self.skipped_500 = 0
         self.lane_used = 0
         self.lane_cap = None
         self.buried = []
@@ -173,12 +182,79 @@ def entry(vid, title=None, author_id="UC-a", index=None):
             "authorId": author_id, "author": "A", "indexId": index or ("ix-" + vid)}
 
 
+def fetcher_attributes(text):
+    """Every attribute the engine reads off a fetcher, however the local is spelled."""
+    def held_by_a_fetcher(node):
+        return ((isinstance(node, ast.Name) and node.id in ("fetch", "fetcher"))
+                or (isinstance(node, ast.Attribute) and node.attr == "fetcher"))
+    return {node.attr for node in ast.walk(ast.parse(text))
+            if isinstance(node, ast.Attribute) and held_by_a_fetcher(node.value)}
+
+
+class Unhurried:
+    """The time module with the pacing sleep taken out."""
+
+    monotonic = staticmethod(time.monotonic)
+    time = staticmethod(time.time)
+
+    @staticmethod
+    def sleep(seconds):
+        pass
+
+
 def rec(vid, title=None, author_id="UC-r", seconds=600, published=None):
     out = {"videoId": vid, "title": title or vid.upper(), "author": "R",
            "authorId": author_id, "lengthSeconds": seconds}
     if published is not None:
         out["published"] = published
     return out
+
+
+class TheDoubleChargesWhatTheRealFetcherCharges(unittest.TestCase):
+    """`Fetch` against the class it stands in for, on the calls it models.
+
+    The double re-implements the counters rather than inheriting them, because
+    a real `Fetcher` reads the database to build its caches before it will
+    answer anything. Nothing else in the suite would notice the two drifting.
+    """
+
+    def setUp(self):
+        self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+        self.mod.query = lambda sql: []
+        self.mod.execute = lambda sql: None
+        self.mod.log = lambda line: None
+        self.mod.time = Unhurried
+
+    def spent(self, fetch, call):
+        fetch.begin_lane(5)
+        call(fetch)
+        return fetch.fetches, fetch.lane_used
+
+    def real(self, answer):
+        self.mod.api = lambda method, path, body=None: answer
+        return self.mod.Fetcher(budget=10)
+
+    def test_a_video_costs_the_same(self):
+        video = rec("ccccccccccc")
+        self.assertEqual(
+            self.spent(self.real(video), lambda f: f.video("ccccccccccc")),
+            self.spent(Fetch(recs={"ccccccccccc": video}),
+                       lambda f: f.video("ccccccccccc")))
+
+    def test_a_channel_listing_costs_the_same(self):
+        listing = {"videos": [rec("ccccccccccc")]}
+        self.assertEqual(
+            self.spent(self.real(listing), lambda f: f.channel_latest("UC-a")),
+            self.spent(Fetch(channels={"UC-a": listing}),
+                       lambda f: f.channel_latest("UC-a")))
+
+    def test_the_double_answers_everything_the_engine_reads_off_a_fetcher(self):
+        wanted = fetcher_attributes(source())
+        self.assertIn("channel_latest", wanted, "the scan found nothing")
+        self.assertEqual(set(), wanted - set(dir(Fetch())),
+                         "the engine reads something off a fetcher that the "
+                         "double does not answer, so a lane in these tests "
+                         "could reach past it to the network")
 
 
 class LaneCase(unittest.TestCase):
@@ -724,10 +800,15 @@ class LastPlayed(LaneCase):
 class Dedupe(LaneCase):
     """One upload per song per account, the artist's own copy preferred."""
 
+    COMPILED = {"public": "consensus", "home-mix": "mix"}
+
     def account(self, lanes=("music",)):
         fh = tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False)
         fh.write("lanes:\n" + "".join(
-            "  - id: %s\n    title: %s\n" % (l, l.title()) for l in lanes))
+            "  - id: %s\n    title: %s\n%s" % (
+                l, l.title(),
+                "    policy: %s\n" % self.COMPILED[l] if l in self.COMPILED else "")
+            for l in lanes))
         fh.close()
         self.addCleanup(os.unlink, fh.name)
         self.mod = load(IV_SUGGEST_CONFIG=fh.name, IV_SUGGEST_ACCOUNT=ME)
@@ -767,6 +848,24 @@ class Dedupe(LaneCase):
         self.assertEqual([], self.api.removed())
         self.assertTrue([sql for sql in self.db.flat()
                          if "UPDATE suggest.items SET song_key" in sql])
+
+    def test_a_lane_compiled_from_other_lanes_is_left_alone(self):
+        """It holds copies of its sources on purpose, so its copy is not a duplicate.
+
+        Dropping it took the song out of the visible feed while the source kept
+        it, which for a public lane is a hole in the page.
+        """
+        self.dedupe({"music": [entry("aaaaaaaaaaa", title="Artist - Song")],
+                     "public": [entry("aaaaaaaaaaa", title="Artist - Song")]})
+        self.assertEqual([], self.api.removed())
+        self.assertTrue(self.logged("compiled from other lanes, left alone"))
+
+    def test_it_is_not_even_read_over_the_api(self):
+        self.dedupe({"music": [entry("aaaaaaaaaaa", title="Artist - Song")],
+                     "home-mix": [entry("aaaaaaaaaaa", title="Artist - Song")]})
+        self.assertEqual(["/api/v1/auth/playlists/PL-music"],
+                         [path for method, path, _ in self.api.calls
+                          if method == "GET"])
 
     def test_a_dry_run_removes_nothing(self):
         self.dedupe({"music": [
