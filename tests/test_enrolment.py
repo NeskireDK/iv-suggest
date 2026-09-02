@@ -249,7 +249,7 @@ class OnePublicCopy(ConfigCase):
                           account="", instance=(ME, OTHER))
         said = []
         mod.log = said.append
-        mod.warn_orphaned_compiled_lanes(mod.load_config())
+        mod.warn_about_compiled_lanes(mod.load_config())
         self.assertEqual(1, len(said), said)
         self.assertIn("popular", said[0])
         self.assertIn("no managed account is given it", said[0])
@@ -281,10 +281,39 @@ class OnePublicCopy(ConfigCase):
         mod = self.enrolled("users:\n  - email: %s\n    lanes: [popular]\n" % OTHER)
         self.assertNotIn("popular", self.lane_ids(mod, ME))
 
+    def test_an_override_cannot_spell_a_second_copy(self):
+        """`overrides` may set `policy`, so the rule has to run after they merge."""
+        mod = self.loaded(WITH_A_PUBLIC_LANE + """
+auto_enrol: {}
+users:
+  - email: %s
+    lanes: [suggested]
+    overrides: {suggested: {policy: consensus}}
+  - email: %s
+    lanes: [suggested]
+    overrides: {suggested: {policy: consensus}}
+""" % (ME, OTHER), instance=(ME, OTHER))
+        holders = [email for email in (ME, OTHER)
+                   if "suggested" in self.lane_ids(mod, email)]
+        self.assertEqual(1, len(holders), holders)
+
+    def test_an_account_refused_the_lane_is_named_once(self):
+        mod = self.enrolled(
+            "users:\n  - email: %s\n    lanes: [popular]\n"
+            "  - email: %s\n    lanes: [popular]\n" % (OTHER, THIRD))
+        said = self.warnings(mod)
+        self.assertEqual(1, len(said), said)
+        self.assertIn(OTHER, said[0])
+        self.assertIn(THIRD, said[0])
+
+    def test_the_ordinary_config_says_nothing_about_who_missed_out(self):
+        """Every account inheriting `lanes: all` asked for nothing in particular."""
+        self.assertEqual([], self.warnings(self.enrolled()))
+
     def warnings(self, mod):
         said = []
         mod.log = said.append
-        mod.warn_orphaned_compiled_lanes(mod.load_config())
+        mod.warn_about_compiled_lanes(mod.load_config())
         return said
 
 

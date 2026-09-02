@@ -697,6 +697,9 @@ def log(msg):
 
 
 _CONFIG_CACHE = {}
+# A watch count moves only when somebody watches something, and every reader of
+# it compares against min_watched, so one answer per invocation is enough.
+_WATCH_COUNTS = {}
 MERGED_LANE_BLOCKS = ("shuffle", "subscription", "mix", "consensus")
 
 
@@ -753,20 +756,29 @@ def warn_ignored_keys(lanes):
                 % (lane["id"], lane["policy"], ", ".join(lane["ignored"])))
 
 
-def warn_orphaned_compiled_lanes(lanes):
-    """Say when a compiled lane reaches no account, since nothing else would and it never rebuilds."""
+def warn_about_compiled_lanes(lanes):
+    """Say which compiled lanes reach nobody, and which reach only one of the accounts asking."""
     compiled = [lane["id"] for lane in lanes
                 if compiles_one_playlist_for_the_whole_instance(lane)]
     if not compiled:
         return
-    reached = {lane["id"] for user in load_users()
-               for lane in enrolled_lanes(user, lanes)}
+    users = load_users()
+    given = {user["email"]: {lane["id"] for lane in enrolled_lanes(user, lanes)}
+             for user in users}
     for lane_id in compiled:
-        if lane_id not in reached:
+        holders = sorted(email for email in given if lane_id in given[email])
+        if not holders:
             log("lane %s: no managed account is given it, so nothing will "
                 "rebuild it. Point IV_SUGGEST_ACCOUNT at a managed account, "
                 "name the lane in a users: entry, or lower its min_watched."
                 % lane_id)
+            continue
+        refused = sorted(user["email"] for user in users
+                         if user["email"] not in holders
+                         and lane_id in wanted_lanes(user))
+        if refused:
+            log("lane %s: %s holds the instance's one copy, so %s get none"
+                % (lane_id, holders[0], ", ".join(refused)))
 
 
 def instance_accounts():
@@ -775,9 +787,12 @@ def instance_accounts():
 
 
 def watch_count(email):
-    """How many videos an account has watched."""
-    return int(one("SELECT coalesce(array_length(watched, 1), 0) "
-                   "FROM users WHERE email = %s;" % lit(email)) or 0)
+    """How many videos an account has watched, asked once per invocation."""
+    if email not in _WATCH_COUNTS:
+        _WATCH_COUNTS[email] = int(
+            one("SELECT coalesce(array_length(watched, 1), 0) "
+                "FROM users WHERE email = %s;" % lit(email)) or 0)
+    return _WATCH_COUNTS[email]
 
 
 def named_users(cfg):
@@ -829,10 +844,15 @@ def compiles_one_playlist_for_the_whole_instance(lane):
     return lane["policy"] == "consensus"
 
 
+def wanted_lanes(user):
+    """The lane ids this account's `lanes:` key names, empty when it names them all."""
+    asked_for = user.get("lanes", "all")
+    return set() if asked_for == "all" else set(asked_for or [])
+
+
 def claims_the_lane(user, lane_id):
     """True when this account's own `users:` entry names the lane, rather than inheriting it."""
-    asked_for = user.get("lanes", "all")
-    return bool(user.get("named")) and asked_for != "all" and lane_id in asked_for
+    return bool(user.get("named")) and lane_id in wanted_lanes(user)
 
 
 def holds_the_instance_copy(user, lane_id):
@@ -858,24 +878,20 @@ def lanes_asked_for(user, lanes):
 
 
 def without_the_compiled_lanes_somebody_else_holds(user, lanes):
-    """Drop a compiled lane another account holds, saying so when this one asked for it."""
-    theirs = [lane["id"] for lane in lanes
-              if compiles_one_playlist_for_the_whole_instance(lane)
-              and not holds_the_instance_copy(user, lane["id"])]
-    if theirs and user.get("lanes", "all") != "all":
-        log("  %s does not hold %s, so it is given no copy of it"
-            % (user["email"], ", ".join(theirs)))
-    return [lane for lane in lanes if lane["id"] not in set(theirs)]
+    """Drop the compiled lanes another account holds. Says nothing: warn_about_compiled_lanes does."""
+    return [lane for lane in lanes
+            if not compiles_one_playlist_for_the_whole_instance(lane)
+            or holds_the_instance_copy(user, lane["id"])]
 
 
 def lanes_for(user, lanes, watched=None):
     """The lanes one account gets, in lanes.yml order, with its overrides applied.
     Pass `watched` to also drop the lanes it has too little history to fill."""
-    lanes = without_the_compiled_lanes_somebody_else_holds(
-        user, lanes_asked_for(user, lanes))
+    lanes = lanes_asked_for(user, lanes)
     overrides = user.get("overrides") or {}
     lanes = [overridden_lane(lane, overrides[lane["id"]])
              if lane["id"] in overrides else lane for lane in lanes]
+    lanes = without_the_compiled_lanes_somebody_else_holds(user, lanes)
     if watched is None:
         return lanes
     return [lane for lane in lanes if watched >= lane["min_watched"]]
@@ -1730,8 +1746,8 @@ def rebuild_playlist(lane, desired, run):
     plid, playlist = playlist_of(lane, run.dry)
     current = [v["videoId"] for v in (playlist.get("videos") or [])]
     if not desired and current and lane["size"]:
-        raise Aborted("the rebuild came back empty; keeping the %d videos this "
-                      "lane already holds rather than publishing nothing"
+        raise Aborted("the rebuild came back empty; keeping the %d this lane "
+                      "already holds rather than publishing nothing"
                       % len(current))
     if current == desired:
         log("  order unchanged, %d videos, nothing to do" % len(current))
@@ -1834,7 +1850,7 @@ def cmd_run(args):
     """Fill every managed account's lanes in one paced run: one timer, one budget."""
     all_lanes = load_config()
     warn_ignored_keys(all_lanes)
-    warn_orphaned_compiled_lanes(all_lanes)
+    warn_about_compiled_lanes(all_lanes)
     users = accounts_wanted(args)
     fetcher = Fetcher(rate_per_min=args.rate, budget=args.budget)
     seed_override = args.seeds if args.seeds else (DRY_SEEDS if args.dry_run else None)
@@ -2302,7 +2318,7 @@ def cmd_init(args):
         u for u in load_users() if u["email"] == PRIMARY]
     all_lanes = load_config()
     warn_ignored_keys(all_lanes)
-    warn_orphaned_compiled_lanes(all_lanes)
+    warn_about_compiled_lanes(all_lanes)
     for user in users:
         log("account %s" % user["email"])
         serve_account(user["email"])

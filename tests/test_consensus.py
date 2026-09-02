@@ -309,7 +309,8 @@ class Rebuilding(unittest.TestCase):
             "PL_feed", {"videos": [{"videoId": "old1", "indexId": "ix1"}]})
         with self.assertRaises(self.mod.Aborted) as caught:
             self.mod.run_lane_consensus(self.lane(), self.context())
-        self.assertIn("keeping the 1 videos", str(caught.exception))
+        self.assertIn("keeping the 1 this lane already holds",
+                      str(caught.exception))
         self.assertEqual([], self.calls)
 
     def test_a_lane_asked_to_hold_nothing_is_allowed_to_hold_nothing(self):

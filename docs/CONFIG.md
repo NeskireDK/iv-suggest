@@ -169,7 +169,8 @@ from its sources every run and reads them over SQL, so it spends **nothing from
 the fetch budget**, never needs another account's session, and runs even after a
 run has spent its budget on the lanes that do. It is not free upstream, though:
 a rebuild is one DELETE and one POST per video, and Invidious resolves each
-added video server-side, outside the bot's pacing.
+added video server-side, outside the bot's pacing. See
+[Compiled lanes](#compiled-lanes) for the two rules it shares with `consensus`.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -229,16 +230,26 @@ account is not your job — see the note under [`auto_enrol`](#auto_enrol).
 Pointing `popular_playlists` at its plid is a compose change, not a setting
 here.
 
-Two things a compiled lane does differently from a `refill` lane, both because
-its content is derived rather than chosen:
+See [Compiled lanes](#compiled-lanes) for the two things `mix` and `consensus`
+both do differently from a `refill` lane.
 
-- **A rebuild that would empty it is refused.** It keeps what it holds and
-  records the reason on the run instead, because one source playlist going
-  missing should not blank a page. A lane with `size: 0` is exempt: that asks
-  for empty.
-- **`dedupe` leaves it alone.** It holds copies of its sources on purpose, so
-  its copy is not a duplicate; dropping it took the video out of the visible
-  feed while the source kept it.
+#### Compiled lanes
+
+`mix` and `consensus` both build their content out of other lanes rather than
+choosing it, and two rules follow from that.
+
+**A rebuild that would empty the lane is refused.** It keeps what it holds and
+records the reason on the run row instead, so the lane counts as failed and
+`run` exits non-zero. What reaches this point is a draw that came back empty
+from sources that exist: every source empty, or — for a `mix`, which does filter
+per viewer — every candidate already watched. A source lane with no playlist at
+all aborts earlier and by name. A lane with `size: 0` is exempt, because that
+asks for empty.
+
+**`dedupe` leaves them alone.** A compiled lane holds copies of its sources on
+purpose, so its copy is not a duplicate. Dropping it took the video out of the
+visible feed while the source kept it, and for a `public` lane that is a hole in
+the page.
 
 #### `shuffle`
 

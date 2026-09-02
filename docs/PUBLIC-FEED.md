@@ -87,10 +87,12 @@ cannot regress the status quo.
   blocklists — a channel any member blocked is a bad thing to greet a stranger
   with. Do *not* filter on watch history: there is no viewer whose history it
   could be.
-- **It lives on the bot's own account**, because nobody in particular owns it,
-  with `privacy: public`, and `popular_playlists` is pointed at it. That last
-  step is a compose change on the instance, so it is deliberately not something
-  merging the lane does.
+- **It lives on one account**, because nobody in particular owns it, with
+  `privacy: public`, and `popular_playlists` is pointed at it. Which account is
+  the engine's call rather than a setting: a `users:` entry naming the lane
+  claims it, and otherwise it lands on `IV_SUGGEST_ACCOUNT`. Pointing the feed
+  at its plid is a compose change on the instance, so it is deliberately not
+  something merging the lane does.
 
 ### Settled while building
 
