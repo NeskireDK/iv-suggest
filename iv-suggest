@@ -521,15 +521,19 @@ class Fetcher:
         self.fetches += 1
         self.lane_used += 1
 
+    def _refuse_when_out_of_budget(self):
+        """Raise before a call starts, so a call already retrying is never cut in half."""
+        if self.fetches >= self.budget:
+            raise BudgetSpent("run budget %d spent" % self.budget)
+        if self.lane_cap and self.lane_used >= self.lane_cap:
+            raise BudgetSpent("lane fetch cap %d reached" % self.lane_cap)
+
     def video(self, vid):
         """Full API answer, or None when the video is gone or upstream cannot parse it."""
         if vid in self.dead:
             self.dead_hits += 1
             return None
-        if self.fetches >= self.budget:
-            raise BudgetSpent("run budget %d spent" % self.budget)
-        if self.lane_cap and self.lane_used >= self.lane_cap:
-            raise BudgetSpent("lane fetch cap %d reached" % self.lane_cap)
+        self._refuse_when_out_of_budget()
         delay = 5.0
         for attempt in range(3):
             self._pace()
@@ -548,7 +552,7 @@ class Fetcher:
                     self.fails = 0
                     self.bury(vid, 365, "http %d" % e.code)
                     return None
-                if self._is_a_parser_bug_not_an_outage(e):
+                if self._only_this_request_is_broken(e):
                     self.fails = 0
                     self.skipped_500 += 1
                     self.bury(vid, DAYS_BEFORE_RETRYING_A_BROKEN_VIDEO,
@@ -563,8 +567,8 @@ class Fetcher:
                 delay *= 2
         return None
 
-    def _is_a_parser_bug_not_an_outage(self, error):
-        """True when Invidious is healthy but fails on this one video."""
+    def _only_this_request_is_broken(self, error):
+        """True when upstream answered 5xx and Invidious itself is still healthy."""
         return error.code >= 500 and self._alive()
 
     def bury(self, vid, days, reason):
@@ -578,29 +582,30 @@ class Fetcher:
 
     def channel_latest(self, ucid):
         """Recent uploads of one channel: one fetch for about 60 videos."""
-        if self.fetches >= self.budget:
-            raise BudgetSpent("run budget %d spent" % self.budget)
-        if self.lane_cap and self.lane_used >= self.lane_cap:
-            raise BudgetSpent("lane fetch cap %d reached" % self.lane_cap)
-        self._pace()
-        try:
-            data = api("GET", "/api/v1/channels/%s/latest" % ucid)
-            self._spend_one_fetch()
-            self.fails = 0
-            return data
-        except urllib.error.HTTPError as e:
-            self._spend_one_fetch()
-            if e.code in (404, 410):
+        self._refuse_when_out_of_budget()
+        delay = 5.0
+        for attempt in range(3):
+            self._pace()
+            try:
+                data = api("GET", "/api/v1/channels/%s/latest" % ucid)
+                self._spend_one_fetch()
                 self.fails = 0
-                return None
-            if e.code >= 500 and self._alive():
-                self.fails = 0
-                log("  skipping channel %s (upstream %d)" % (ucid, e.code))
-                return None
-            self._trouble(e, 5.0)
-        except Exception as e:
-            self._spend_one_fetch()
-            self._trouble(e, 5.0)
+                return data
+            except urllib.error.HTTPError as e:
+                self._spend_one_fetch()
+                if e.code in (404, 410):
+                    self.fails = 0
+                    return None
+                if self._only_this_request_is_broken(e):
+                    self.fails = 0
+                    log("  skipping channel %s (upstream %d)" % (ucid, e.code))
+                    return None
+                self._trouble(e, delay)
+                delay *= 2
+            except Exception as e:
+                self._spend_one_fetch()
+                self._trouble(e, delay)
+                delay *= 2
         return None
 
     def _alive(self):
