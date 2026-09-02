@@ -6,8 +6,8 @@ on is a question for its own `lanes.yml`, not for this file.
 
 Two gaps, one moment: somebody opens the instance and the engine has nothing
 personal to offer them. A logged-out visitor has no account at all; a new
-account has one but no history yet. Before either section, both landed on
-whatever `popular_playlists` pointed at, which was one specific person's Home
+account has one but no history yet. Without either section, both land on
+whatever `popular_playlists` points at, which is one specific person's Home
 mix.
 
 ## Decided: how public is public?

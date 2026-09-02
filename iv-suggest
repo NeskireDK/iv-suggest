@@ -754,17 +754,19 @@ def warn_ignored_keys(lanes):
 
 
 def warn_orphaned_compiled_lanes(lanes):
-    """Say when a compiled lane has no holder, since nothing else would and it never rebuilds."""
-    compiled = [lane for lane in lanes
+    """Say when a compiled lane reaches no account, since nothing else would and it never rebuilds."""
+    compiled = [lane["id"] for lane in lanes
                 if compiles_one_playlist_for_the_whole_instance(lane)]
     if not compiled:
         return
-    users = load_users()
-    for lane in compiled:
-        if not any(holds_the_instance_copy(user, lane["id"]) for user in users):
-            log("lane %s: no managed account holds it, so nothing will rebuild "
-                "it. Point IV_SUGGEST_ACCOUNT at a managed account, or name the "
-                "lane in a users: entry." % lane["id"])
+    reached = {lane["id"] for user in load_users()
+               for lane in enrolled_lanes(user, lanes)}
+    for lane_id in compiled:
+        if lane_id not in reached:
+            log("lane %s: no managed account is given it, so nothing will "
+                "rebuild it. Point IV_SUGGEST_ACCOUNT at a managed account, "
+                "name the lane in a users: entry, or lower its min_watched."
+                % lane_id)
 
 
 def instance_accounts():
@@ -827,29 +829,50 @@ def compiles_one_playlist_for_the_whole_instance(lane):
     return lane["policy"] == "consensus"
 
 
-def holds_the_instance_copy(user, lane_id):
-    """Whether this account is where the instance keeps its one copy of a compiled lane.
-    PRIMARY is; anybody else only by naming the lane in their own `users:` entry."""
-    if user["email"] == PRIMARY:
-        return True
+def claims_the_lane(user, lane_id):
+    """True when this account's own `users:` entry names the lane, rather than inheriting it."""
     asked_for = user.get("lanes", "all")
     return bool(user.get("named")) and asked_for != "all" and lane_id in asked_for
+
+
+def holds_the_instance_copy(user, lane_id):
+    """Whether this account holds the instance's one copy of a compiled lane.
+    A `users:` entry naming the lane claims it; PRIMARY holds any lane unclaimed."""
+    claimants = [u["email"] for u in load_users() if claims_the_lane(u, lane_id)]
+    if claimants:
+        return user["email"] == claimants[0]
+    return user["email"] == PRIMARY
+
+
+def lanes_asked_for(user, lanes):
+    """The lanes this account's own `lanes:` key selects, naming any that do not exist."""
+    want = user.get("lanes", "all")
+    if want == "all":
+        return lanes
+    want = set(want or [])
+    missing = want - {lane["id"] for lane in lanes}
+    if missing:
+        log("  %s asks for lanes that do not exist: %s"
+            % (user["email"], ", ".join(sorted(missing))))
+    return [lane for lane in lanes if lane["id"] in want]
+
+
+def without_the_compiled_lanes_somebody_else_holds(user, lanes):
+    """Drop a compiled lane another account holds, saying so when this one asked for it."""
+    theirs = [lane["id"] for lane in lanes
+              if compiles_one_playlist_for_the_whole_instance(lane)
+              and not holds_the_instance_copy(user, lane["id"])]
+    if theirs and user.get("lanes", "all") != "all":
+        log("  %s does not hold %s, so it is given no copy of it"
+            % (user["email"], ", ".join(theirs)))
+    return [lane for lane in lanes if lane["id"] not in set(theirs)]
 
 
 def lanes_for(user, lanes, watched=None):
     """The lanes one account gets, in lanes.yml order, with its overrides applied.
     Pass `watched` to also drop the lanes it has too little history to fill."""
-    want = user.get("lanes", "all")
-    if want != "all":
-        want = set(want or [])
-        missing = want - {lane["id"] for lane in lanes}
-        if missing:
-            log("  %s asks for lanes that do not exist: %s"
-                % (user["email"], ", ".join(sorted(missing))))
-        lanes = [lane for lane in lanes if lane["id"] in want]
-    lanes = [lane for lane in lanes
-             if not compiles_one_playlist_for_the_whole_instance(lane)
-             or holds_the_instance_copy(user, lane["id"])]
+    lanes = without_the_compiled_lanes_somebody_else_holds(
+        user, lanes_asked_for(user, lanes))
     overrides = user.get("overrides") or {}
     lanes = [overridden_lane(lane, overrides[lane["id"]])
              if lane["id"] in overrides else lane for lane in lanes]
@@ -1706,9 +1729,10 @@ def rebuild_playlist(lane, desired, run):
     Returns (removed, added, kept, fetches), and its fetches are always none."""
     plid, playlist = playlist_of(lane, run.dry)
     current = [v["videoId"] for v in (playlist.get("videos") or [])]
-    if not desired and current:
-        raise Aborted("every source came back empty; keeping the %d videos this "
-                      "lane already holds" % len(current))
+    if not desired and current and lane["size"]:
+        raise Aborted("the rebuild came back empty; keeping the %d videos this "
+                      "lane already holds rather than publishing nothing"
+                      % len(current))
     if current == desired:
         log("  order unchanged, %d videos, nothing to do" % len(current))
         return 0, 0, len(current), 0

@@ -54,10 +54,12 @@ held back rather than created empty, and appears on its own once the history is
 there. Give the account something in the meantime — a `mix` lane sourced from
 `users: all` costs nothing and needs no history.
 
-⚠️ **`lanes: all` never includes a `consensus` lane.** That policy compiles one
-playlist for the whole instance, so a copy per account would hold the same
-videos in every one of them. `IV_SUGGEST_ACCOUNT` holds it; another account gets
-it only by naming the lane id in its own `users:` entry.
+⚠️ **A `consensus` lane reaches exactly one account, whatever this block says.**
+That policy compiles one playlist for the whole instance, so a copy per account
+would hold the same videos in every one of them. Neither the `all` form nor the
+list form hands one out. A `users:` entry naming the lane id claims it; if none
+does, it lands on `IV_SUGGEST_ACCOUNT`. `run` and `init` say so when a compiled
+lane reaches nobody at all.
 
 ### `users`
 
@@ -117,7 +119,7 @@ only**. `init` and `run` name any inert key a lane sets:
 | `exclude_watched` | `true` | drop what this account already watched |
 | `exclude_subscribed` | `true` | drop channels this account subscribes to — their feed already shows them. `false` does not re-admit them under `channel_latest`, which skips subscribed channels when choosing whom to poll |
 | `dedupe_across_lanes` | `true` | a video sits in one lane at a time, per account |
-| `dedupe_songs` | `true` | one upload per song, across every lane. See [README](../README.md#song-identity) |
+| `dedupe_songs` | `true` | one upload per song, across every lane a person holds. A compiled lane is not one of them — `dedupe` skips those. See [README](../README.md#song-identity) |
 | `min_seconds` | `120` | drop anything shorter, **when the length is known** — a candidate reporting `0` seconds passes. `0` = off |
 | `max_seconds` | `0` | drop anything longer. `0` = no bound; use it against compilations |
 | `max_per_channel` | `2` | most entries one channel may hold. `0` = no limit |
@@ -164,9 +166,10 @@ filter on.
 
 `policy: mix` interleaves other lanes, under the lane's `mix:` key. It rebuilds
 from its sources every run and reads them over SQL, so it spends **nothing from
-the fetch budget** and never needs another account's session. It is not free
-upstream, though: a rebuild is one DELETE and one POST per video, and Invidious
-resolves each added video server-side, outside the bot's pacing.
+the fetch budget**, never needs another account's session, and runs even after a
+run has spent its budget on the lanes that do. It is not free upstream, though:
+a rebuild is one DELETE and one POST per video, and Invidious resolves each
+added video server-side, outside the bot's pacing.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -222,10 +225,20 @@ Three things follow from the feed having no viewer:
   run's call, exactly as for `mix`.
 
 Give the lane `privacy: public` if visitors are to see it. Scoping it to one
-account is not your job: `lanes: all` never hands out a consensus lane, so it
-lands on `IV_SUGGEST_ACCOUNT` and nowhere else unless another account names the
-lane id itself. Pointing `popular_playlists` at its plid is a compose change,
-not a setting here.
+account is not your job — see the note under [`auto_enrol`](#auto_enrol).
+Pointing `popular_playlists` at its plid is a compose change, not a setting
+here.
+
+Two things a compiled lane does differently from a `refill` lane, both because
+its content is derived rather than chosen:
+
+- **A rebuild that would empty it is refused.** It keeps what it holds and
+  records the reason on the run instead, because one source playlist going
+  missing should not blank a page. A lane with `size: 0` is exempt: that asks
+  for empty.
+- **`dedupe` leaves it alone.** It holds copies of its sources on purpose, so
+  its copy is not a duplicate; dropping it took the video out of the visible
+  feed while the source kept it.
 
 #### `shuffle`
 

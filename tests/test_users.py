@@ -210,6 +210,7 @@ class ASpentBudget(unittest.TestCase):
     def setUp(self):
         self.mod = load(IV_SUGGEST_ACCOUNT=ME)
         self.mod.log = lambda line: None
+        self.mod.load_users = lambda: [self.user()]
         self.mod.serve_account = lambda email: None
         self.mod.read_user = lambda: ([], set())
         self.mod.read_blocked = lambda: {}
@@ -225,9 +226,12 @@ class ASpentBudget(unittest.TestCase):
             return (0, 0, 0, 0), "BudgetSpent('run budget 320 spent')"
         return (0, 1, 0, 0), None
 
+    def user(self):
+        return {"email": ME, "named": True, "lanes": "all", "overrides": {}}
+
     def fill(self):
-        user = {"email": ME, "named": True, "lanes": "all", "overrides": {}}
-        return self.mod.run_account(user, self.LANES, Spent(), None, Args())
+        return self.mod.run_account(
+            self.user(), self.LANES, Spent(), None, Args())
 
     def test_a_lane_that_would_spend_a_fetch_is_skipped(self):
         self.fill()

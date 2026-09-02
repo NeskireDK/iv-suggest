@@ -56,6 +56,7 @@ class ConfigCase(unittest.TestCase):
         self.addCleanup(os.unlink, fh.name)
         mod = load(IV_SUGGEST_CONFIG=fh.name, IV_SUGGEST_ACCOUNT=account)
         mod.instance_accounts = lambda: list(instance)
+        mod.watch_count = lambda email: 900
         return mod
 
 
@@ -219,7 +220,7 @@ class OnePublicCopy(ConfigCase):
 
     def enrolled(self, extra=""):
         return self.loaded(WITH_A_PUBLIC_LANE + "auto_enrol: {}\n" + extra,
-                           instance=(ME, OTHER))
+                           instance=(ME, OTHER, THIRD))
 
     def test_the_primary_account_holds_the_compiled_lane(self):
         self.assertIn("popular", self.lane_ids(self.enrolled(), ME))
@@ -251,14 +252,40 @@ class OnePublicCopy(ConfigCase):
         mod.warn_orphaned_compiled_lanes(mod.load_config())
         self.assertEqual(1, len(said), said)
         self.assertIn("popular", said[0])
-        self.assertIn("no managed account holds it", said[0])
+        self.assertIn("no managed account is given it", said[0])
 
     def test_a_lane_with_a_holder_says_nothing(self):
         mod = self.enrolled()
+        self.assertEqual([], self.warnings(mod))
+
+    def test_a_holder_whose_own_lane_list_leaves_it_out_is_still_orphaned(self):
+        """PRIMARY being named is not the same as PRIMARY being given the lane."""
+        mod = self.enrolled("users:\n  - email: %s\n    lanes: [suggested]\n" % ME)
+        self.assertEqual(1, len(self.warnings(mod)))
+
+    def test_a_lane_held_back_by_min_watched_is_orphaned_too(self):
+        mod = self.loaded(WITH_A_PUBLIC_LANE.replace("    min_watched: 0\n", "")
+                          + "auto_enrol: {}\n", instance=(ME, OTHER))
+        mod.watch_count = lambda email: 3
+        self.assertEqual(1, len(self.warnings(mod)))
+
+    def test_two_named_claimants_still_leave_one_holder(self):
+        mod = self.enrolled(
+            "users:\n  - email: %s\n    lanes: [popular]\n"
+            "  - email: %s\n    lanes: [popular]\n" % (OTHER, THIRD))
+        holders = [email for email in (ME, OTHER, THIRD)
+                   if "popular" in self.lane_ids(mod, email)]
+        self.assertEqual([OTHER], holders)
+
+    def test_a_claim_takes_the_lane_off_the_primary_account(self):
+        mod = self.enrolled("users:\n  - email: %s\n    lanes: [popular]\n" % OTHER)
+        self.assertNotIn("popular", self.lane_ids(mod, ME))
+
+    def warnings(self, mod):
         said = []
         mod.log = said.append
         mod.warn_orphaned_compiled_lanes(mod.load_config())
-        self.assertEqual([], said)
+        return said
 
 
 class HistoryGate(ConfigCase):
