@@ -62,27 +62,56 @@ settings are documented.
 
 ## Install
 
+Beside Invidious, as one more compose service. It joins the compose network, so
+it reaches Postgres and the API by service name and needs **no Docker socket**.
+
+```sh
+cd /path/to/your/invidious/compose          # where docker-compose.yml lives
+cat /path/to/iv-suggest/compose.iv-suggest.yml   # paste the service in
+cp /path/to/iv-suggest/lanes.yml ./lanes.yml
+
+echo "IV_SUGGEST_ACCOUNT=you@example.com" >> .env   # the users.email value
+                                            # IV_PG_PASSWORD is already there
+
+docker compose run --rm iv-suggest init     # schema, session and playlists
+docker compose run --rm iv-suggest run --dry-run   # writes nothing
+docker compose run --rm iv-suggest run      # fill the lanes
+
+install -m 644 systemd/* /etc/systemd/system/
+$EDITOR /etc/systemd/system/iv-suggest.service     # WorkingDirectory, if not
+                                                   # /root/docker/youtube
+systemctl enable --now iv-suggest.timer iv-suggest-shuffle.timer
+```
+
+One config file, two variables, no unit for the engine itself. The timers run
+`docker compose run --rm`, so `systemctl list-timers` still shows the schedule
+and a bad night is debuggable the way any other unit is. The compose directory
+lives in the unit rather than in the engine — the engine is portable, the
+schedule is local.
+
+**Do not give the service a Watchtower label.** If your compose uses Watchtower
+with `--label-enable`, an update pulled mid-run would swap the image underneath
+a fill; the shipped fragment says so where it matters.
+
+<details><summary>Running the script directly instead</summary>
+
+It is one file with no dependency beyond PyYAML and the `psql` client, so it
+still runs as a plain script. It needs a host and port that resolve from
+wherever you put it — a compose service name will not, since Invidious does not
+publish 5432.
+
 ```sh
 install -m 700 iv-suggest /usr/local/bin/iv-suggest
 install -d -m 700 /etc/iv-suggest
 install -m 600 lanes.yml /etc/iv-suggest/lanes.yml
 cp env.example /etc/iv-suggest/env && chmod 600 /etc/iv-suggest/env
-$EDITOR /etc/iv-suggest/env          # IV_SUGGEST_ACCOUNT is the only required line
-
-iv-suggest init                      # schema, session and playlists
-iv-suggest run --dry-run             # writes nothing, caps seeds at 10
-iv-suggest run                       # fill the lanes
-
-install -m 644 systemd/* /etc/systemd/system/
-systemctl enable --now iv-suggest.timer iv-suggest-shuffle.timer
+$EDITOR /etc/iv-suggest/env    # account, password, and a reachable DB host
 ```
 
-That is the whole setup on a default install. Everything else in
-`/etc/iv-suggest/env` only exists because your paths might differ.
+`env` is read off disk as well as from the environment;
+[docs/CONFIG.md](docs/CONFIG.md) says why that matters when you test by hand.
 
-The units read `/etc/iv-suggest/env` off disk rather than through an
-`EnvironmentFile`; [docs/CONFIG.md](docs/CONFIG.md) says why that matters when
-you test a change by hand.
+</details>
 
 ## Commands
 
@@ -98,6 +127,8 @@ iv-suggest dedupe [--dry-run] [--account EMAIL]   one upload per song
 iv-suggest views [--rate N] [--budget N]          backfill missing view counts
            [--account EMAIL]
 iv-suggest metrics                                Prometheus text, database only
+iv-suggest sid-check                              did the logins survive the
+                                                  nightly restart
 ```
 
 `metrics` needs no session and makes no fetch, so it is safe to scrape often.

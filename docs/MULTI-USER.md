@@ -127,11 +127,14 @@ One timer, one hourly shuffle, both looping internally. No per-account units.
   force-recreates the `invidious` container only. `invidious-db` is never
   restarted and `session_ids` is never rewritten, so a recreate of the app
   container cannot invalidate a session that lives as a database row. Confirmed
-  empirically rather than argued: `iv-sid-check.timer` on LXC 109 runs at 05:34,
-  re-joins `suggest.accounts.sid` to `session_ids`, and compares `issued`
-  against `iv-nightly.service`'s real exit timestamp. Result lands in
-  `/var/lib/iv-suggest/sid-check.json`; a non-zero exit means a session was
-  actually lost.
+  empirically rather than argued, and the guard against a regression is
+  `iv-suggest sid-check`: it re-joins `suggest.accounts.sid` to `session_ids`
+  and compares `issued` against the nightly's recorded finish time, so a session
+  minted *after* the nightly reads as `untested` rather than as a pass. A
+  non-zero exit means a session was actually lost. It reads that finish time out
+  of `suggest.host_events`, written by the host's nightly script — which is what
+  lets the check run in the container with no Docker socket and no systemd to
+  ask.
 
 ## Checks that passed before the deploy
 

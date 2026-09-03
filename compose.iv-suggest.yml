@@ -1,0 +1,29 @@
+# The iv-suggest service, to paste into the Invidious compose file.
+#
+# It is `run --rm` from the host timers rather than a long-lived container: one
+# scheduler, `systemctl list-timers` still shows the schedule, and a bad night
+# is debuggable the way every other one has been.
+#
+# Two variables, both in the compose .env beside the file. IV_PG_PASSWORD is
+# the one Invidious's own service already uses, so the engine learns no secret
+# the compose file did not already hold.
+services:
+  iv-suggest:
+    image: ghcr.io/neskiredk/iv-suggest:latest
+    # NO com.centurylinklabs.watchtower.enable label. Watchtower runs 04:30
+    # with --label-enable and every other service here is labelled "true";
+    # this one must not be, or it pulls a new image inside the fill window.
+    restart: "no"
+    # A profile, so a bare `docker compose up -d` skips it rather than leaving
+    # an exited container behind. `docker compose run` activates it by itself.
+    profiles: ["tools"]
+    depends_on:
+      - invidious-db
+    environment:
+      IV_SUGGEST_ACCOUNT: ${IV_SUGGEST_ACCOUNT}
+      IV_SUGGEST_DB_PASSWORD: ${IV_PG_PASSWORD}
+      IV_SUGGEST_API: http://invidious:3000
+      # Settings come from this environment, not from a file on the host.
+      IV_SUGGEST_ENVFILE: /dev/null
+    volumes:
+      - ./lanes.yml:/etc/iv-suggest/lanes.yml:ro

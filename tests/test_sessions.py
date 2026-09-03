@@ -327,6 +327,7 @@ class WhoMints(unittest.TestCase):
         minters = callers_of(self.source, "open_session")
         self.assertIn("serve_account", minters)
         for reader in ("cmd_status", "cmd_metrics", "cmd_shuffle",
+                       "cmd_sid_check", "recorded_sessions",
                        "shuffle_account", "status_account", "use_account"):
             self.assertNotIn(reader, minters)
 
