@@ -1176,6 +1176,14 @@ def retire_item(lane_id, plid, video, cooldown_days=0, reason=""):
                lit(reason)))
 
 
+def song_key_to_store(lane, meta):
+    """The song key a lane's row should carry: none at all when the lane does not dedupe songs.
+    A stored key suppresses candidates in every OTHER lane, whatever this lane asked for."""
+    if not lane["dedupe_songs"]:
+        return ""
+    return song_key(meta.get("title"), meta.get("author"))
+
+
 def add_to_lane(lane_id, plid, vid, score, song, fetcher):
     """Add one video to a lane and track it. False when Invidious refused the add.
     Invidious resolves the video as it writes the row, so a bad candidate fails only here."""
@@ -1579,7 +1587,7 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
         if cap and author and per_channel.get(author, 0) >= cap:
             rejected["channel_cap"] += 1
             continue
-        skey = song_key(meta.get("title"), meta.get("author")) if lane["dedupe_songs"] else ""
+        skey = song_key_to_store(lane, meta)
         if skey and skey in songs:
             rejected["same_song"] += 1
             continue
@@ -1722,7 +1730,7 @@ def run_lane_last_played(lane, run):
             continue
         if not add_to_lane(lane_id, plid, vid,
                            played_score(decay, desired.index(vid)),
-                           song_key(meta.get("title"), meta.get("author")),
+                           song_key_to_store(lane, meta),
                            run.fetcher):
             refused += 1
     kept = len(current) - len(to_drop)
@@ -2051,17 +2059,19 @@ def run_one_lane(lane, run):
 
 
 def record_the_lane_run(lane_id, counts, error):
-    """Write one lane's row in suggest.runs, saying so loudly rather than raising if it cannot.
-    Bookkeeping is not worth the account's remaining lanes, the public feeds among them."""
+    """Write one lane's row in suggest.runs. False when it could not be written.
+    The row is what the metrics and the account order read, so a lost one is a failed run."""
     removed, added, kept, used = counts
     try:
         execute("INSERT INTO suggest.runs"
                 "(account,lane,added,removed,kept,fetches,error) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s);"
                 % (acct(), lit(lane_id), added, removed, kept, used, lit(error)))
+        return True
     except Exception as e:
         log("  WARNING: lane %s ran but its run row was not written: %r"
             % (lane_id, e))
+        return False
 
 
 def run_account(user, all_lanes, fetcher, seed_override, args):
@@ -2070,7 +2080,11 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
     watched, subs = read_user()
     lanes = lanes_for(user, all_lanes, len(watched))
     if not args.dry_run:
-        forget_the_song_keys_of_the_opted_out_lanes(lanes)
+        try:
+            forget_the_song_keys_of_the_opted_out_lanes(lanes)
+        except Exception as e:
+            log("  WARNING: could not clear the stale song keys, so an "
+                "opted-out lane may still suppress candidates tonight: %r" % e)
     held_back = [l["id"] for l in lanes_for(user, all_lanes)
                  if l["id"] not in {k["id"] for k in lanes}]
     if args.lane:
@@ -2088,10 +2102,10 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
     failed = 0
     for lane in lanes:
         counts, error = run_one_lane(lane, run)
+        if not args.dry_run and not record_the_lane_run(lane["id"], counts, error):
+            error = error or "the lane ran, but its run row was not written"
         if error:
             failed += 1
-        if not args.dry_run:
-            record_the_lane_run(lane["id"], counts, error)
     return failed
 
 

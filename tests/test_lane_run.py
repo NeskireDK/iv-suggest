@@ -789,6 +789,28 @@ class LastPlayed(LaneCase):
         self.assertEqual((0, 0, 0), (removed, added, kept))
         self.assertEqual([("h0000000001", 30, "playlist add 500")], fetch.buried)
 
+    def test_a_lane_that_opted_out_of_song_dedupe_stores_no_song_key(self):
+        """It used to stamp one unconditionally, so the opt-out never took effect.
+
+        A stored key suppresses candidates in every OTHER lane, so
+        `music-watched` opting out still blocked the songs it holds from the
+        lanes after it -- and re-stamped them right after the account-wide
+        clear had wiped them.
+        """
+        fetch = Fetch(meta={"h0000000000": {
+            "title": "Queen - Bohemian Rhapsody", "author": "Queen"}})
+        self.play(self.lane(policy="last_played", size=1, dedupe_songs=False),
+                  ["h0000000000"], fetch=fetch)
+        self.assertEqual([""], [key for _, _, key in self.db.item_rows()])
+
+    def test_a_lane_that_dedupes_songs_still_stores_the_key(self):
+        fetch = Fetch(meta={"h0000000000": {
+            "title": "Queen - Bohemian Rhapsody", "author": "Queen"}})
+        self.play(self.lane(policy="last_played", size=1, dedupe_songs=True),
+                  ["h0000000000"], fetch=fetch)
+        self.assertEqual(["bohemianrhapsody"],
+                         [key for _, _, key in self.db.item_rows()])
+
     def test_the_returned_counts_are_removed_added_kept_and_fetches(self):
         api = Api(videos=[entry("h0000000000"), entry("h0000000009")])
         removed, added, kept, used = self.play(
@@ -1038,9 +1060,20 @@ class ARunRowThatCannotBeWritten(unittest.TestCase):
                   if "run row was not written" in line]
         self.assertEqual(len(self.LANES), len(warned))
 
-    def test_a_lane_whose_row_was_lost_is_not_counted_as_a_failure(self):
-        """The lane did its work; only the record of it is missing."""
-        self.assertEqual(0, self.fill())
+    def test_a_lost_row_is_counted_as_a_failure_so_the_unit_is_not_green(self):
+        """The row is what the metrics and the account order read, so losing it is a failed run.
+
+        Swallowing it silently exited 0 with a green unit while every row for
+        the night was gone: `last_run_by_lane` keeps yesterday's values, so a
+        lane that failed reports no error, and `account_order` finds nothing and
+        serves the same account first every night.
+        """
+        self.assertEqual(len(self.LANES), self.fill())
+
+    def test_the_lost_row_is_named_as_the_lane_s_error(self):
+        self.fill()
+        self.assertTrue([line for line in self.said
+                         if "run row was not written" in line])
 
     def test_a_dry_run_never_reaches_the_write_at_all(self):
         self.mod.run_account(self.user(), self.LANES, Fetch(), None,
@@ -1050,10 +1083,78 @@ class ARunRowThatCannotBeWritten(unittest.TestCase):
                               if "run row was not written" in line])
 
 
+class TheClearRunsForTheWholeAccount(unittest.TestCase):
+    """Once per account, before the first lane, and before --lane narrows anything."""
+
+    LANES = [{"id": "suggested", "policy": "refill", "min_watched": 0,
+              "dedupe_songs": True},
+             {"id": "subs-top48", "policy": "refill", "min_watched": 0,
+              "dedupe_songs": False},
+             {"id": "subs-live", "policy": "refill", "min_watched": 0,
+              "dedupe_songs": False}]
+
+    def setUp(self):
+        self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+        self.mod.log = lambda line: None
+        self.written = []
+        self.mod.execute = self.written.append
+        self.mod.query = lambda sql: []
+        self.mod.serve_account = lambda email: None
+        self.mod.read_user = lambda: ([], set())
+        self.mod.read_blocked = lambda: {}
+        self.mod.watch_count = lambda email: 900
+        self.mod.run_one_lane = self.run_one_lane
+
+    def run_one_lane(self, lane, run):
+        self.written.append("-- lane %s did its work" % lane["id"])
+        return (0, 1, 0, 0), None
+
+    def user(self):
+        return {"email": ME, "named": True, "lanes": "all", "overrides": {}}
+
+    def fill(self, **over):
+        self.mod.run_account(self.user(), self.LANES, Fetch(), None,
+                             Args(**over))
+        return self.written
+
+    def clearings(self, written):
+        return [sql for sql in written if "SET song_key=NULL" in sql]
+
+    def first(self, written, mark):
+        return next(i for i, sql in enumerate(written) if mark in sql)
+
+    def test_it_lands_before_any_lane_does_its_work(self):
+        written = self.fill()
+        self.assertLess(self.first(written, "SET song_key=NULL"),
+                        self.first(written, "did its work"))
+
+    def test_one_lane_asked_for_still_clears_every_opted_out_lane(self):
+        """`run --lane suggested` would otherwise never reach the lanes holding the stale keys."""
+        cleared = self.clearings(self.fill(lane="suggested"))
+        self.assertEqual(1, len(cleared))
+        self.assertIn("'subs-top48'", cleared[0])
+        self.assertIn("'subs-live'", cleared[0])
+
+    def test_a_dry_run_clears_nothing(self):
+        self.assertEqual([], self.clearings(self.fill(dry_run=True)))
+
+    def test_a_failure_clearing_them_costs_the_account_no_lane_at_all(self):
+        """The payoff is one more night of stale keys; the account's 15 lanes are not worth it."""
+        def raise_on_the_clear(sql):
+            if "SET song_key=NULL" in sql:
+                raise RuntimeError("psql failed: deadlock detected")
+            self.written.append(sql)
+        self.mod.execute = raise_on_the_clear
+        self.mod.run_account(self.user(), self.LANES, Fetch(), None, Args())
+        self.assertEqual([lane["id"] for lane in self.LANES],
+                         [sql.split()[2] for sql in self.written
+                          if "did its work" in sql])
+
+
 class Args:
-    def __init__(self, dry_run=False):
+    def __init__(self, dry_run=False, lane=None):
         self.dry_run = dry_run
-        self.lane = None
+        self.lane = lane
 
 
 if __name__ == "__main__":
