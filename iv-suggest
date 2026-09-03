@@ -80,6 +80,10 @@ CONFIG = setting("IV_SUGGEST_CONFIG", "/etc/iv-suggest/lanes.yml")
 # difference is which one guarantees a session, and a reader must not mint one.
 # PRIMARY is the one from the environment, which is also what the schema
 # migration backfills every pre-multi-user row to.
+# Set by the image build. The deploy check reads the image label, but nothing
+# in the journal used to say which code produced a given night's fill -- the
+# md5-the-binary check answered that and there is no binary to hash any more.
+REVISION = setting("IV_SUGGEST_REVISION", "unknown")
 PRIMARY = setting("IV_SUGGEST_ACCOUNT")
 ACCOUNT = PRIMARY
 
@@ -357,23 +361,42 @@ class BudgetSpent(Aborted):
     pass
 
 
+# What psql inherits. An allowlist rather than the whole environment, because
+# libpq reads a dozen PG* variables and two of them redirect a connection
+# without failing: PGOPTIONS can set a search_path, so unqualified reads resolve
+# to another schema and return the wrong rows with exit 0.
+PSQL_KEEPS_FROM_THE_ENVIRONMENT = ("PATH", "LANG", "LC_ALL", "TZ")
+
+
 def _db_environment():
-    """What psql needs to authenticate. The password goes here, never on a command line.
+    """The whole environment psql gets. The password goes here, never on a command line.
     A command line is readable by every process on the box; an environment is not."""
-    env = dict(os.environ)
+    env = {key: os.environ[key] for key in PSQL_KEEPS_FROM_THE_ENVIRONMENT
+           if key in os.environ}
+    env["PGCONNECT_TIMEOUT"] = setting("IV_SUGGEST_DB_CONNECT_TIMEOUT", "10")
+    env["PGOPTIONS"] = "-c statement_timeout=%s" % setting(
+        "IV_SUGGEST_DB_STATEMENT_TIMEOUT_MS", "300000")
     password = setting("IV_SUGGEST_DB_PASSWORD")
     if password:
         env["PGPASSWORD"] = password
     return env
 
 
+def psql_complaint(stderr):
+    """psql's first line of complaint, and only the first.
+    The lines after it echo the statement, values and any session id in it."""
+    first = (stderr or "").strip().split("\n")[0].strip()
+    return first or "psql failed and said nothing"
+
+
 def _psql(flags, sql):
+    """One psql invocation. `-X` is load-bearing: test_transport.py says why."""
     cmd = ["psql", "-h", DB_HOST, "-p", DB_PORT, "-U", DB_USER, "-d", DB_NAME,
-           "-w", "-v", "ON_ERROR_STOP=1"] + flags + ["-c", sql]
+           "-w", "-X", "-v", "ON_ERROR_STOP=1"] + flags + ["-c", sql]
     r = subprocess.run(cmd, capture_output=True, text=True,
                        env=_db_environment())
     if r.returncode:
-        raise RuntimeError("psql failed: " + r.stderr.strip())
+        raise RuntimeError("psql failed: " + psql_complaint(r.stderr))
     return r.stdout
 
 
@@ -1989,8 +2012,14 @@ def run_lane_consensus(lane, run):
     return rebuild_playlist(lane, consensus_draw(weights, lane["size"]), run)
 
 
+def announce_the_build():
+    """Say which code this is, so the journal line and the image label can be compared."""
+    log("iv-suggest %s" % REVISION)
+
+
 def cmd_run(args):
     """Fill every managed account's lanes in one paced run: one timer, one budget."""
+    announce_the_build()
     all_lanes = load_config()
     warn_ignored_keys(all_lanes)
     warn_about_lanes_nobody_asked_for(all_lanes)
@@ -2448,6 +2477,7 @@ def shuffle_lane(lane, orders, dry):
 
 def cmd_shuffle(args):
     """Reorder every lane. Database only: no API call, no YouTube fetch."""
+    announce_the_build()
     all_lanes = load_config()
     failed = 0
     for user in accounts_wanted(args):
@@ -2510,15 +2540,25 @@ def cmd_init(args):
 
 
 NIGHTLY_RECREATE = "nightly-recreate"
+# A boundary older than this cannot be evidence of anything: every session
+# predates it, so the check would pass every account while watching nothing.
+NIGHTLY_STALE_AFTER_HOURS = 26
 LOST = "LOST -- the recorded sid no longer resolves to a session"
 UNTESTED = "untested -- issued after the nightly, so it has not faced one yet"
 SURVIVED = "survived the nightly"
 
 
-def nightly_finished_at():
-    """When the host's nightly ops last recorded a finish, or an empty string if never."""
-    return one("SELECT at FROM suggest.host_events WHERE event = %s;"
-               % lit(NIGHTLY_RECREATE))
+def nightly_finish():
+    """(when the host last recorded a nightly finish, hours since), or ("", None) if never.
+    A table that does not exist yet is `never`, not an error: `init` creates it."""
+    if one("SELECT to_regclass('suggest.host_events') IS NOT NULL;") != "t":
+        return "", None
+    row = query("SELECT at, extract(epoch FROM now() - at) / 3600 "
+                "FROM suggest.host_events WHERE event = %s;"
+                % lit(NIGHTLY_RECREATE))
+    if not row:
+        return "", None
+    return row[0][0], float(row[0][1])
 
 
 def session_verdict(joins_session_ids, issued_after_the_nightly):
@@ -2532,7 +2572,7 @@ def session_verdict(joins_session_ids, issued_after_the_nightly):
 
 def recorded_sessions():
     """(account, sid fingerprint, verdict) per managed account. Never the sid itself.
-    The fingerprint tells yesterday's session from a fresh one without exposing either."""
+    The fingerprint tells yesterday's session from a fresh one without printing either."""
     return [(account, fingerprint,
              session_verdict(joins == "t", issued_after == "t"))
             for account, fingerprint, joins, issued_after in query(
@@ -2546,20 +2586,27 @@ def recorded_sessions():
 
 def cmd_sid_check(args):
     """Say whether each managed account's login survived the nightly recreate."""
-    finished = nightly_finished_at()
+    finished, hours_ago = nightly_finish()
     if not finished:
         log("the host has never recorded a nightly finish, so no session can "
             "be said to have survived one yet. Have the nightly script write "
             "suggest.host_events(%r)." % NIGHTLY_RECREATE)
         return 2
-    log("nightly last finished %s" % finished)
+    if hours_ago > NIGHTLY_STALE_AFTER_HOURS:
+        log("the last recorded nightly finish is %.0f hours old. Every session "
+            "predates it, so this check would call them all survivors while "
+            "noticing nothing. The nightly is failing before it records, or it "
+            "has stopped recording." % hours_ago)
+        return 2
+    log("nightly last finished %s (%.0f hours ago)" % (finished, hours_ago))
     sessions = recorded_sessions()
     for account, fingerprint, verdict in sessions:
         log("  %-28s sid#%s  %s" % (account, fingerprint, verdict))
     lost = [account for account, _, verdict in sessions if verdict == LOST]
     if lost:
-        log("\n%d session(s) did not survive: %s. Run `iv-suggest init` to "
-            "mint replacements." % (len(lost), ", ".join(lost)))
+        log("\n%d session(s) did not survive: %s. Run `iv-suggest init "
+            "--all-users` to mint replacements: plain `init` only touches "
+            "IV_SUGGEST_ACCOUNT." % (len(lost), ", ".join(lost)))
         return 1
     if not sessions:
         log("no managed account has a recorded session yet")

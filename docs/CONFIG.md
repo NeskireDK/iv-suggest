@@ -24,6 +24,9 @@ in your shell is missing from a run started by a timer — test with `env -i`.
 | `IV_SUGGEST_DB_USER` | `kemal` | Postgres role |
 | `IV_SUGGEST_DB_NAME` | `invidious` | Postgres database |
 | `IV_SUGGEST_DB_PASSWORD` | — | **Required.** Reuse the one Invidious's own compose already holds. It travels in the environment and never on a command line, which every process on the box can read |
+| `IV_SUGGEST_DB_CONNECT_TIMEOUT` | `10` | seconds before giving up on the connection, so a dead database fails the run instead of holding it open |
+| `IV_SUGGEST_DB_STATEMENT_TIMEOUT_MS` | `300000` | milliseconds any one statement may take. The engine sets this itself rather than inheriting `PGOPTIONS`, because that variable can also redirect a connection |
+| `IV_SUGGEST_REVISION` | `unknown` | set by the image build. `run` and `shuffle` print it, so the journal says which code produced a night's fill |
 | `IV_SUGGEST_CONFIG` | `/etc/iv-suggest/lanes.yml` | lane config path |
 | `IV_SUGGEST_ENVFILE` | `/etc/iv-suggest/env` | file the above are also read from |
 | `IV_SUGGEST_DB_CONTAINER` | `youtube-invidious-db-1` | `kickstart.py` only, which talks to the container directly and reads the environment alone — not this file |

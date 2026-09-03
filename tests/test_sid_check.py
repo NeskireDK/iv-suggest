@@ -22,11 +22,17 @@ AFTER = "2026-09-04 05:33:00+02"
 
 
 class Recorded:
-    """suggest.accounts joined to session_ids, as the check reads it."""
+    """suggest.accounts joined to session_ids, as the check reads it.
 
-    def __init__(self, rows=(), nightly=NIGHTLY):
+    `table` false stands for the state before `init` has run, where the
+    relation does not exist at all rather than holding no row.
+    """
+
+    def __init__(self, rows=(), nightly=NIGHTLY, hours_ago=2.0, table=True):
         self.rows = list(rows)
         self.nightly = nightly
+        self.hours_ago = hours_ago
+        self.table = table
 
     def install(self, mod):
         mod.one = self.one
@@ -35,14 +41,18 @@ class Recorded:
         return self
 
     def one(self, sql):
-        return self.nightly if "suggest.host_events" in sql else ""
+        if "to_regclass" in sql:
+            return "t" if self.table else "f"
+        return ""
 
     def query(self, sql):
-        if "suggest.accounts" not in sql:
-            return []
-        return [[account, fingerprint, "t" if joins else "f",
-                 "t" if issued and issued > self.nightly else "f"]
-                for account, fingerprint, joins, issued in self.rows]
+        if "suggest.accounts" in sql:
+            return [[account, fingerprint, "t" if joins else "f",
+                     "t" if issued and issued > self.nightly else "f"]
+                    for account, fingerprint, joins, issued in self.rows]
+        if "suggest.host_events" in sql:
+            return [[self.nightly, str(self.hours_ago)]] if self.nightly else []
+        return []
 
 
 class Args:
@@ -56,8 +66,8 @@ class SidCheck(unittest.TestCase):
         self.mod = load(IV_SUGGEST_ACCOUNT=ME)
         self.mod.log = self.said.append
 
-    def check(self, rows=(), nightly=NIGHTLY):
-        Recorded(rows, nightly).install(self.mod)
+    def check(self, rows=(), nightly=NIGHTLY, hours_ago=2.0, table=True):
+        Recorded(rows, nightly, hours_ago, table).install(self.mod)
         return self.mod.cmd_sid_check(Args())
 
     def logged(self, text):
@@ -105,14 +115,48 @@ class SidCheck(unittest.TestCase):
         self.assertNotIn("SELECT", printed)
 
     def test_it_asks_postgres_for_the_fingerprint_rather_than_the_sid(self):
-        """The sid must not cross the process boundary at all, not even to be hashed here."""
-        rows = []
-        self.mod.query = lambda sql: rows.append(sql) or []
-        self.mod.one = lambda sql: NIGHTLY
+        """It is a hash so the log can tell one session from another without holding either."""
+        asked = []
+
+        def record(sql):
+            asked.append(sql)
+            if "suggest.accounts" in sql:
+                return []
+            return [[NIGHTLY, "2.0"]] if "host_events" in sql else []
+
+        self.mod.query = record
+        self.mod.one = lambda sql: "t"
         self.mod.cmd_sid_check(Args())
-        joined = " ".join(rows)
+        joined = " ".join(asked)
         self.assertIn("left(md5(a.sid),8)", joined)
         self.assertNotIn("a.sid,", joined)
+
+    def test_a_boundary_older_than_a_day_is_no_evidence_at_all(self):
+        """Fail open, and every account passes while the check watches nothing.
+
+        The row only updates if the nightly's last command succeeds. A nightly
+        that has been failing for a week leaves last week's timestamp, every
+        session predates it, and all of them read as survivors.
+        """
+        self.assertEqual(2, self.check([(ME, "a1b2c3d4", True, BEFORE)],
+                                       hours_ago=170.0))
+        self.assertTrue(self.logged("170 hours old"))
+        self.assertEqual([], self.logged("sid#"))
+
+    def test_a_boundary_from_last_night_is_evidence(self):
+        self.assertEqual(0, self.check([(ME, "a1b2c3d4", True, BEFORE)],
+                                       hours_ago=25.0))
+        self.assertTrue(self.logged("survived the nightly"))
+
+    def test_the_table_not_existing_yet_is_never_not_an_error(self):
+        """Before `init` runs there is no relation, and psql would raise on the read."""
+        self.assertEqual(2, self.check([(ME, "a1b2c3d4", True, BEFORE)],
+                                       table=False))
+        self.assertTrue(self.logged("never recorded a nightly finish"))
+
+    def test_it_says_how_old_the_boundary_it_trusted_was(self):
+        self.check([(ME, "a1b2c3d4", True, BEFORE)], hours_ago=3.0)
+        self.assertTrue(self.logged("3 hours ago"))
 
     def test_an_account_with_no_recorded_session_says_so(self):
         self.assertEqual(0, self.check([]))

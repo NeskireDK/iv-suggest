@@ -9,16 +9,28 @@
 # the compose file did not already hold.
 services:
   iv-suggest:
-    image: ghcr.io/neskiredk/iv-suggest:latest
+    # An immutable tag, set by a deploy and recorded in the compose .env. A
+    # floating `:latest` would make every merge to main a latent production
+    # deploy of the one component that holds the database password.
+    image: ghcr.io/neskiredk/iv-suggest:${IV_SUGGEST_IMAGE_TAG}
     # NO com.centurylinklabs.watchtower.enable label. Watchtower runs 04:30
     # with --label-enable and every other service here is labelled "true";
     # this one must not be, or it pulls a new image inside the fill window.
+    #
+    # For the same reason there is no `pull_policy: always`. The image changes
+    # when a deploy says so, never between one nightly run and the next.
     restart: "no"
     # A profile, so a bare `docker compose up -d` skips it rather than leaving
     # an exited container behind. `docker compose run` activates it by itself.
     profiles: ["tools"]
+    # Documents the dependency, and applies if you `up` this service by hand.
+    # It does NOT apply to the timers: they pass --no-deps, because `compose
+    # run` treats depends_on with `up` semantics and will RECREATE the database
+    # under a live instance when a .env value changes or an image moves behind
+    # its tag. The units wait for pg_isready themselves instead.
     depends_on:
-      - invidious-db
+      invidious-db:
+        condition: service_healthy
     environment:
       IV_SUGGEST_ACCOUNT: ${IV_SUGGEST_ACCOUNT}
       IV_SUGGEST_DB_PASSWORD: ${IV_PG_PASSWORD}
@@ -26,4 +38,15 @@ services:
       # Settings come from this environment, not from a file on the host.
       IV_SUGGEST_ENVFILE: /dev/null
     volumes:
+      # World-readable on purpose: the container runs as uid 10001, and this
+      # file holds no secret -- it is in the public repo.
       - ./lanes.yml:/etc/iv-suggest/lanes.yml:ro
+    # The engine reads two files and talks to two sockets. Nothing enforced
+    # that before; these do.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

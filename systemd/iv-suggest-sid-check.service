@@ -1,0 +1,15 @@
+[Unit]
+Description=Did the bot's logins survive the nightly restart
+After=docker.service
+Wants=docker.service
+
+# --no-deps for the same reason as the other two: `compose run` would otherwise
+# treat depends_on with `up` semantics and could recreate the database.
+# Exit 2 means it could not judge, which is not a lost session -- see
+# `iv-suggest sid-check` and docs/CONTAINER.md.
+[Service]
+Type=oneshot
+WorkingDirectory=/root/docker/youtube
+ExecStart=/usr/bin/docker compose run --rm --no-deps --name iv-suggest-sid-check iv-suggest sid-check
+ExecStopPost=-/usr/bin/docker rm -f iv-suggest-sid-check
+TimeoutStartSec=300

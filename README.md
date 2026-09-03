@@ -108,6 +108,9 @@ cp env.example /etc/iv-suggest/env && chmod 600 /etc/iv-suggest/env
 $EDITOR /etc/iv-suggest/env    # account, password, and a reachable DB host
 ```
 
+Note what that costs: a second plaintext copy of the Invidious database password
+on the host, in a file the container path does not need and does not create.
+
 `env` is read off disk as well as from the environment;
 [docs/CONFIG.md](docs/CONFIG.md) says why that matters when you test by hand.
 
@@ -130,6 +133,11 @@ iv-suggest metrics                                Prometheus text, database only
 iv-suggest sid-check                              did the logins survive the
                                                   nightly restart
 ```
+
+`sid-check` exits 0 when every login survived, 1 when one did not, and **2 when
+it cannot tell** — no recorded nightly, or one too old to be evidence. Two is
+not a pass and not a loss; it means the check is not watching anything, which is
+the state worth knowing about.
 
 `metrics` needs no session and makes no fetch, so it is safe to scrape often.
 

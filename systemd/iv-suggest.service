@@ -3,8 +3,19 @@ Description=Fill the Invidious suggestion lanes
 After=docker.service
 Wants=docker.service
 
+# The container is not in this unit's cgroup, and the compose client does not
+# forward a kill to it. So a fixed --name is what keeps one run at a time: a
+# second start refuses with a name conflict and exits 1, which is the
+# guarantee the unit itself used to give. ExecStopPost clears the container a
+# timeout left behind, since --rm is client side and never fires.
 [Service]
 Type=oneshot
 WorkingDirectory=/root/docker/youtube
-ExecStart=/usr/bin/docker compose run --rm iv-suggest run
+# --no-deps, or compose applies `up` semantics to depends_on and can RECREATE
+# invidious-db under a live instance -- it does whenever a .env value it
+# interpolates changes, or the image moves behind its tag. So the readiness
+# that depends_on would have given has to be waited for here instead.
+ExecStartPre=/usr/bin/timeout 120 sh -c 'until docker compose exec -T invidious-db pg_isready -U kemal -d invidious >/dev/null 2>&1; do sleep 2; done'
+ExecStart=/usr/bin/docker compose run --rm --no-deps --name iv-suggest-run iv-suggest run
+ExecStopPost=-/usr/bin/docker rm -f iv-suggest-run
 TimeoutStartSec=2700

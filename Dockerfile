@@ -15,9 +15,16 @@ LABEL org.opencontainers.image.revision=$REVISION \
       org.opencontainers.image.source=https://github.com/NeskireDK/iv-suggest \
       org.opencontainers.image.description="Lane based suggestion playlists for Invidious"
 
-# It reads lanes.yml and talks to Postgres and the Invidious API. It writes
-# nothing to disk, so it needs no home, no shell and no write access anywhere.
+# It reads two files and talks to two sockets, and writes nothing to disk.
+# nologin is not a security property -- /bin/sh is still in the image and
+# `docker exec` ignores a login shell. What enforces this is `read_only`,
+# `cap_drop` and `no-new-privileges` in compose.iv-suggest.yml.
 RUN adduser -D -H -s /sbin/nologin -u 10001 iv-suggest
 USER 10001
+
+# So a run says which code produced it. The image label is the deploy check;
+# this is what puts the same answer in the journal, which is what the old
+# md5-the-binary check used to give and a label alone does not.
+ENV IV_SUGGEST_REVISION=$REVISION
 
 ENTRYPOINT ["/usr/local/bin/iv-suggest"]
