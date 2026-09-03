@@ -148,15 +148,11 @@ class Fetch:
         self.skipped_500 = 0
         self.lane_used = 0
         self.lane_cap = None
-        self.aborts = 0
         self.buried = []
         self.remembered = []
 
     def begin_lane(self, cap):
         self.lane_cap, self.lane_used = cap, 0
-
-    def stopped_spending(self):
-        return ""
 
     def video(self, vid):
         self.fetches += 1
@@ -947,19 +943,49 @@ class StaleSongKeys(unittest.TestCase):
         self.mod = load(IV_SUGGEST_ACCOUNT=ME)
         self.mod.log = lambda line: None
         self.written = []
+        self.cleared_before_the_fill = None
         self.mod.execute = self.written.append
         self.mod.query = lambda sql: []
-        self.mod.run_lane = lambda lane, run: (0, 0, 0, 0)
+        self.mod.run_lane = self.fill
+
+    def fill(self, lane, run):
+        self.cleared_before_the_fill = bool(self.clearings())
+        return (0, 0, 0, 0)
+
+    def clearings(self):
+        return [sql for sql in self.written if "SET song_key=NULL" in sql]
 
     def clears(self, dedupe_songs, dry=False):
         lane = {"id": "subs-live", "policy": "refill",
                 "dedupe_songs": dedupe_songs}
         run = self.mod.LaneRun([], set(), set(), {}, Fetch(), dry, None)
         self.mod.run_one_lane(lane, run)
-        return [sql for sql in self.written if "SET song_key=NULL" in sql]
+        return self.clearings()
 
     def test_an_opted_out_lane_clears_the_keys_dedupe_stamped_on_it(self):
         self.assertEqual(1, len(self.clears(False)))
+
+    def test_it_clears_them_before_the_fill_reads_them_not_after(self):
+        """`choose_candidates` reads other lanes' keys as it picks, so after is too late."""
+        self.clears(False)
+        self.assertIs(True, self.cleared_before_the_fill)
+
+    def test_a_failure_clearing_them_costs_this_lane_and_no_other(self):
+        """It runs inside run_one_lane's try: one psql hiccup must not end the account.
+
+        Outside it, a blip on `subs-top48` -- lane 5 of 15 -- took `home-mix`
+        and both public feeds down with it for the night.
+        """
+        def raise_on_the_clear(sql):
+            if "SET song_key=NULL" in sql:
+                raise RuntimeError("psql failed: connection closed")
+            self.written.append(sql)
+        self.mod.execute = raise_on_the_clear
+        lane = {"id": "subs-live", "policy": "refill", "dedupe_songs": False}
+        run = self.mod.LaneRun([], set(), set(), {}, Fetch(), False, None)
+        counts, error = self.mod.run_one_lane(lane, run)
+        self.assertEqual((0, 0, 0, 0), counts)
+        self.assertIn("psql failed", error)
 
     def test_it_clears_its_own_rows_and_nobody_elses(self):
         sql = self.clears(False)[0]

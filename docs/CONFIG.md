@@ -166,8 +166,8 @@ filter on.
 
 `policy: mix` interleaves other lanes, under the lane's `mix:` key. It rebuilds
 from its sources every run and reads them over SQL, so it spends **nothing from
-the fetch budget**, never needs another account's session, and runs even after a
-run has spent its budget on the lanes that do. It is not free upstream, though:
+the fetch budget** and never needs another account's session. It is not free
+upstream, though:
 a rebuild is one DELETE and one POST per video, and Invidious resolves each
 added video server-side, outside the bot's pacing. See
 [the shared rules](#rules-the-two-compiled-policies-share) for the two it

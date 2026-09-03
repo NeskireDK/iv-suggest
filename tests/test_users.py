@@ -214,9 +214,6 @@ class Spent:
     budget = 320
     fetches = 320
 
-    def stopped_spending(self):
-        return "run budget 320 spent"
-
 
 class Args:
 
@@ -227,21 +224,20 @@ class Args:
 
 
 class ASpentBudget(unittest.TestCase):
-    """What a run still does for an account whose fetch budget is gone.
+    """Every lane still runs for an account whose fetch budget is gone.
 
-    It used to stop at the lane that overspent. The lanes after it that cost
-    nothing -- a mix, and now the public feeds -- were skipped with it, so a
-    heavy night left what visitors see un-rebuilt and nothing looked wrong.
+    A lane that cannot fetch is not a lane that cannot work: every fetcher call
+    site inside a lane catches BudgetSpent and carries on with what it found, so
+    the lane still rebuilds from the metadata cache. `run_account` used to try
+    to be clever about which lanes to skip, and it could only get that wrong --
+    `subs-top48` and its two siblings spend no fetches at all, and a skip took
+    their whole night with the public feeds' biggest source.
     """
 
-    LANES = [{"id": "suggested", "policy": "refill", "min_watched": 0,
-              "dedupe_songs": True},
-             {"id": "fresh-uploads", "policy": "refill", "min_watched": 0,
-              "dedupe_songs": True},
-             {"id": "popular", "policy": "consensus", "min_watched": 0,
-              "dedupe_songs": True},
-             {"id": "home-mix", "policy": "mix", "min_watched": 0,
-              "dedupe_songs": True}]
+    LANES = [{"id": "suggested", "policy": "refill", "min_watched": 0},
+             {"id": "subs-top48", "policy": "refill", "min_watched": 0},
+             {"id": "popular", "policy": "consensus", "min_watched": 0},
+             {"id": "home-mix", "policy": "mix", "min_watched": 0}]
 
     def setUp(self):
         self.mod = load(IV_SUGGEST_ACCOUNT=ME)
@@ -269,18 +265,14 @@ class ASpentBudget(unittest.TestCase):
         return self.mod.run_account(
             self.user(), self.LANES, Spent(), None, Args())
 
-    def test_a_lane_that_would_spend_a_fetch_is_skipped(self):
+    def test_the_lanes_after_the_overspending_one_still_run(self):
         self.fill()
-        self.assertNotIn("fresh-uploads", self.ran)
+        self.assertEqual([lane["id"] for lane in self.LANES], self.ran)
 
-    def test_a_lane_compiled_from_other_lanes_still_runs(self):
-        self.fill()
-        self.assertEqual(["suggested", "popular", "home-mix"], self.ran)
-
-    def test_only_the_lanes_that_ran_record_a_run_row(self):
+    def test_every_lane_records_a_run_row(self):
         self.fill()
         rows = [sql for sql in self.written if "INSERT INTO suggest.runs" in sql]
-        self.assertEqual(3, len(rows))
+        self.assertEqual(len(self.LANES), len(rows))
 
     def test_the_overspending_lane_is_still_counted_as_a_failure(self):
         self.assertEqual(1, self.fill())
@@ -360,6 +352,22 @@ users:
         self.assertIn(ME, message)
 
 
+def switch_settings(defaults, path=()):
+    """Every true/false setting in a defaults tree, as the key path that reaches it."""
+    for key, default in sorted(defaults.items()):
+        if isinstance(default, bool):
+            yield path + (key,)
+        elif isinstance(default, dict):
+            for found in switch_settings(default, path + (key,)):
+                yield found
+
+
+def blank_setting(path):
+    """A lane block spelling one nested setting with nothing after its colon."""
+    return "\n".join("%s%s:" % ("    " + "  " * depth, key)
+                      for depth, key in enumerate(path))
+
+
 class Switches(ConfigCase):
     """A true/false lane key with nothing after it is a config error, not a false.
 
@@ -382,11 +390,32 @@ lanes:
         self.assertIn("dedupe_songs must be true or false",
                       self.refused("    dedupe_songs:"))
 
-    def test_every_switch_key_is_covered_not_just_the_one_that_bit(self):
-        mod = self.loaded("lanes: []\n")
-        self.assertEqual(
-            ["dedupe_across_lanes", "dedupe_songs", "exclude_subscribed",
-             "exclude_watched"], list(mod.SWITCH_KEYS))
+    def test_every_switch_setting_is_refused_when_blank_not_just_the_one_that_bit(self):
+        """Derived from SWITCH_DEFAULTS, so a new true/false setting is covered by adding it."""
+        for path in switch_settings(self.loaded("lanes: []\n").SWITCH_DEFAULTS):
+            self.assertIn("%s must be true or false" % path[-1],
+                          self.refused(blank_setting(path)))
+
+    def test_a_blank_shuffle_switch_is_refused_inside_its_block(self):
+        """The one that was still open: a blank `enabled:` stopped a lane reordering, silently."""
+        self.assertIn("enabled must be true or false",
+                      self.refused("    shuffle:\n      enabled:"))
+
+    def test_a_block_given_a_bare_value_is_refused(self):
+        self.assertIn("shuffle must be a block of keys",
+                      self.refused("    shuffle: false"))
+
+    def test_a_switch_inherited_from_the_defaults_block_is_checked_too(self):
+        mod = self.loaded("""
+defaults:
+  dedupe_songs:
+lanes:
+  - id: suggested
+    title: Suggested
+""")
+        with self.assertRaises(SystemExit) as caught:
+            mod.load_config()
+        self.assertIn("dedupe_songs must be true or false", str(caught.exception))
 
     def test_a_switch_set_to_a_word_is_refused(self):
         self.assertIn("exclude_watched must be true or false",
@@ -427,7 +456,7 @@ class OneBadAccount(unittest.TestCase):
     """
 
     LANES = [{"id": "suggested", "title": "Suggested", "policy": "refill",
-              "size": 30, "min_watched": 0, "dedupe_songs": True}]
+              "size": 30, "min_watched": 0}]
     TYPO = "andr@example.com"
 
     def setUp(self):
