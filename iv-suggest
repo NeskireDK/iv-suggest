@@ -746,6 +746,7 @@ def load_config():
     lanes = []
     for raw in cfg.get("lanes") or []:
         lane = merge_lane(defaults, raw)
+        checked_size("lane %r in %s" % (lane.get("id"), CONFIG), lane["size"])
         lane["ignored"] = ignored_keys(lane["policy"], raw)
         lanes.append(lane)
     _CONFIG_CACHE["lanes"] = lanes
@@ -816,8 +817,18 @@ def watch_count(email):
     return _WATCH_COUNTS[email]
 
 
+def checked_size(where, size):
+    """A lane's `size`, refusing the values that would publish an unbounded playlist."""
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        sys.exit("%s: size must be a whole number of videos, not %r. A `size:` "
+                 "with nothing after it reads as no value at all, which would "
+                 "publish every candidate rather than a lane's worth."
+                 % (where, size))
+    return size
+
+
 def checked_overrides(email, overrides):
-    """One account's override block, refusing the two shapes that would not survive a merge."""
+    """One account's override block, refusing the shapes that would not survive a merge."""
     for lane_id, patch in (overrides or {}).items():
         if not isinstance(patch, dict):
             sys.exit("%s: override of lane %r in %s must be a block of keys"
@@ -827,6 +838,9 @@ def checked_overrides(email, overrides):
                      "what a lane IS, not a per-account setting: give the "
                      "account a lane of its own instead."
                      % (email, lane_id, CONFIG))
+        if "size" in patch:
+            checked_size("%s: override of lane %r in %s"
+                         % (email, lane_id, CONFIG), patch["size"])
     return overrides or {}
 
 

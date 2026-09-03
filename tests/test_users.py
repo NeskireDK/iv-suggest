@@ -279,6 +279,80 @@ class ASpentBudget(unittest.TestCase):
         self.assertEqual(1, self.fill())
 
 
+class Size(ConfigCase):
+    """`size` is what caps a lane, so a value that is not a number is a config error.
+
+    A `size:` with nothing after it parses as None. The consensus draw sliced
+    `[:None]`, which is the whole weighted union rather than a lane's worth, and
+    the guard that refuses to publish an empty rebuild read None as "asked for
+    empty" and stopped guarding. Both were reachable on a public playlist.
+    """
+
+    LANES = """
+lanes:
+  - id: popular
+    title: Popular
+    policy: consensus
+    size:%s
+"""
+
+    def refused(self, size, account=ME):
+        mod = self.loaded(self.LANES % size, account=account)
+        with self.assertRaises(SystemExit) as caught:
+            mod.load_config()
+        return str(caught.exception)
+
+    def test_a_size_with_no_value_is_refused(self):
+        self.assertIn("size must be a whole number", self.refused(""))
+
+    def test_the_message_names_the_lane(self):
+        self.assertIn("popular", self.refused(""))
+
+    def test_a_negative_size_is_refused(self):
+        self.assertIn("size must be a whole number", self.refused(" -1"))
+
+    def test_a_size_that_is_not_a_number_is_refused(self):
+        self.assertIn("size must be a whole number", self.refused(" lots"))
+
+    def test_true_is_not_a_size_however_much_python_thinks_it_is_one(self):
+        self.assertIn("size must be a whole number", self.refused(" true"))
+
+    def test_a_lane_asked_to_hold_nothing_is_still_allowed(self):
+        mod = self.loaded(self.LANES % " 0")
+        self.assertEqual(0, mod.load_config()[0]["size"])
+
+    def test_a_size_inherited_from_the_defaults_block_is_checked_too(self):
+        mod = self.loaded("""
+defaults:
+  size:
+lanes:
+  - id: suggested
+    title: Suggested
+""")
+        with self.assertRaises(SystemExit) as caught:
+            mod.load_config()
+        self.assertIn("size must be a whole number", str(caught.exception))
+
+    def test_an_override_with_no_value_is_refused_at_config_load(self):
+        mod = self.loaded("""
+lanes:
+  - id: suggested
+    title: Suggested
+    size: 30
+users:
+  - email: %s
+    overrides:
+      suggested:
+        size:
+""" % ME)
+        with self.assertRaises(SystemExit) as caught:
+            mod.load_users()
+        message = str(caught.exception)
+        self.assertIn("size must be a whole number", message)
+        self.assertIn("suggested", message)
+        self.assertIn(ME, message)
+
+
 class OneBadAccount(unittest.TestCase):
     """A `users:` entry Invidious does not know must cost only itself.
 
