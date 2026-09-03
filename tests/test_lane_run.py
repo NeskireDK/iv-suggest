@@ -801,14 +801,19 @@ class Dedupe(LaneCase):
     """One upload per song per account, the artist's own copy preferred."""
 
     COMPILED = {"public": "consensus", "home-mix": "mix"}
+    OPTED_OUT = ("subs-live",)
+
+    def lane_block(self, lane_id):
+        block = "  - id: %s\n    title: %s\n" % (lane_id, lane_id.title())
+        if lane_id in self.COMPILED:
+            block += "    policy: %s\n" % self.COMPILED[lane_id]
+        if lane_id in self.OPTED_OUT:
+            block += "    dedupe_songs: false\n"
+        return block
 
     def account(self, lanes=("music",)):
         fh = tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False)
-        fh.write("lanes:\n" + "".join(
-            "  - id: %s\n    title: %s\n%s" % (
-                l, l.title(),
-                "    policy: %s\n" % self.COMPILED[l] if l in self.COMPILED else "")
-            for l in lanes))
+        fh.write("lanes:\n" + "".join(self.lane_block(l) for l in lanes))
         fh.close()
         self.addCleanup(os.unlink, fh.name)
         self.mod = load(IV_SUGGEST_CONFIG=fh.name, IV_SUGGEST_ACCOUNT=ME)
@@ -863,6 +868,30 @@ class Dedupe(LaneCase):
     def test_it_is_not_even_read_over_the_api(self):
         self.dedupe({"music": [entry("aaaaaaaaaaa", title="Artist - Song")],
                      "home-mix": [entry("aaaaaaaaaaa", title="Artist - Song")]})
+        self.assertEqual(["/api/v1/auth/playlists/PL-music"],
+                         [path for method, path, _ in self.api.calls
+                          if method == "GET"])
+
+    def test_a_lane_that_says_dedupe_songs_false_is_left_alone(self):
+        """`dedupe` never read the key, so it chewed the three lanes that set it false.
+
+        A re-stream and a Short of the same song are not duplicates in a
+        window-bounded lane, which is the whole reason they set it.
+        """
+        self.dedupe({"music": [entry("aaaaaaaaaaa", title="Artist - Song")],
+                     "subs-live": [entry("bbbbbbbbbbb", title="Artist - Song")]})
+        self.assertEqual([], self.api.removed())
+        self.assertTrue(self.logged("dedupe_songs: false, left alone"))
+
+    def test_an_opted_out_lane_cannot_take_the_song_off_a_lane_that_opted_in(self):
+        """Earlier in the file used to win, so an opted-out lane emptied the one after it."""
+        self.dedupe({"subs-live": [entry("aaaaaaaaaaa", title="Artist - Song")],
+                     "music": [entry("bbbbbbbbbbb", title="Artist - Song")]})
+        self.assertEqual([], self.api.removed())
+
+    def test_an_opted_out_lane_is_not_even_read_over_the_api(self):
+        self.dedupe({"music": [entry("aaaaaaaaaaa", title="Artist - Song")],
+                     "subs-live": [entry("bbbbbbbbbbb", title="Artist - Song")]})
         self.assertEqual(["/api/v1/auth/playlists/PL-music"],
                          [path for method, path, _ in self.api.calls
                           if method == "GET"])

@@ -2026,16 +2026,29 @@ def cmd_dedupe(args):
 Upload = namedtuple("Upload", "song quality lane_rank title_len lane plid video")
 
 
+def why_dedupe_leaves_a_lane_alone(lane):
+    """Why `dedupe` must not touch this lane, or an empty string when it may."""
+    if costs_no_fetch(lane):
+        return "compiled from other lanes"
+    if not lane["dedupe_songs"]:
+        return "dedupe_songs: false"
+    return ""
+
+
 def dedupe_account(args):
     """One account's duplicates. The keeper wins on upload_quality first, lane order second."""
     all_lanes = load_config()
     order = {lane["id"]: i for i, lane in enumerate(all_lanes)}
-    compiled = {lane["id"] for lane in all_lanes if costs_no_fetch(lane)}
+    left_alone = {}
+    for lane in all_lanes:
+        why = why_dedupe_leaves_a_lane_alone(lane)
+        if why:
+            left_alone[lane["id"]] = why
     entries = []
     for lane_id, plid in query("SELECT lane, plid FROM suggest.lanes "
                                "WHERE account=%s;" % acct()):
-        if lane_id in compiled:
-            log("lane %-16s compiled from other lanes, left alone" % lane_id)
+        if lane_id in left_alone:
+            log("lane %-16s %s, left alone" % (lane_id, left_alone[lane_id]))
             continue
         playlist = api("GET", "/api/v1/auth/playlists/" + plid)
         videos = playlist.get("videos") or []
