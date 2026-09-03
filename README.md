@@ -247,7 +247,8 @@ Invidious.
 |---|---|
 | [docs/CONFIG.md](docs/CONFIG.md) | every setting, once |
 | [docs/MULTI-USER.md](docs/MULTI-USER.md) | why per-account lanes are shaped the way they are |
-| [docs/PUBLIC-FEED.md](docs/PUBLIC-FEED.md) | TODO: a feed for logged-out visitors and brand new accounts |
+| [docs/PUBLIC-FEED.md](docs/PUBLIC-FEED.md) | why the compiled feeds for logged-out visitors and new accounts are shaped the way they are |
+| [docs/SYNTHETIC-HARNESS.md](docs/SYNTHETIC-HARNESS.md) | the throwaway-Postgres harness, and why the fast suite keeps its own doubles |
 | [patches/README.md](patches/README.md) | the Invidious patch `subscription_feed` needs |
 
 ## Licence
