@@ -616,10 +616,13 @@ class Fetcher:
             return False
 
     def _trouble(self, err, delay):
+        """Back off after a failed fetch, giving up on the lane once they stop being isolated.
+        The counter clears as the abort is raised: it counts one lane's run of bad luck, not the run's."""
         self.fails += 1
         log("  fetch problem (%s), backing off %.0fs" % (err, delay))
         if self.fails >= MAX_CONSECUTIVE_FAILS:
-            raise Aborted("%d consecutive fetch failures" % self.fails)
+            self.fails = 0
+            raise Aborted("%d consecutive fetch failures" % MAX_CONSECUTIVE_FAILS)
         time.sleep(min(delay, 120))
 
     def _remember(self, vid, data):

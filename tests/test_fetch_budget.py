@@ -210,5 +210,46 @@ class ChannelListingRetries(BudgetCase):
                 fetch.channel_latest(ucid)
 
 
+class AbortsAreCountedPerLane(BudgetCase):
+    """An abort must not leave the counter primed for whatever runs next.
+
+    `fails` lives on the Fetcher, and the Fetcher lives for the whole run. It
+    stayed at MAX_CONSECUTIVE_FAILS after an abort, so the next lane's first
+    single failure aborted that lane too, and so on to the end of the night: a
+    two-minute wobble in one lane cost every lane after it.
+    """
+
+    def abort(self, fetch):
+        with self.assertRaises(self.mod.Aborted):
+            for ucid in ("UC-a", "UC-b"):
+                fetch.channel_latest(ucid)
+
+    def test_the_counter_is_clear_once_the_abort_is_raised(self):
+        fetch = self.fetcher(Upstream(*([RATE_LIMITED] * 5)), budget=20)
+        self.abort(fetch)
+        self.assertEqual(0, fetch.fails)
+
+    def test_the_next_lane_survives_one_failure_of_its_own(self):
+        fetch = self.fetcher(
+            Upstream(*([RATE_LIMITED] * 6 + [LISTING])), budget=20)
+        self.abort(fetch)
+        fetch.begin_lane(None)
+        self.assertEqual(LISTING, fetch.channel_latest("UC-c"))
+
+    def test_a_video_fetch_after_an_abort_survives_one_failure_too(self):
+        fetch = self.fetcher(
+            Upstream(*([RATE_LIMITED] * 5 + [OUTAGE, VIDEO])), budget=20)
+        self.abort(fetch)
+        self.assertEqual(VIDEO, fetch.video("v0000000000"))
+
+    def test_a_second_run_of_bad_luck_still_aborts(self):
+        fetch = self.fetcher(Upstream(*([RATE_LIMITED] * 10)), budget=30)
+        self.abort(fetch)
+        fetch.begin_lane(None)
+        with self.assertRaises(self.mod.Aborted):
+            for ucid in ("UC-c", "UC-d"):
+                fetch.channel_latest(ucid)
+
+
 if __name__ == "__main__":
     unittest.main()
