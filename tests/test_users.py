@@ -7,6 +7,7 @@ dozen playlists the bot made in your account is a bad first impression.
 
 import os
 import re
+import sys
 import tempfile
 import unittest
 
@@ -276,6 +277,69 @@ class ASpentBudget(unittest.TestCase):
 
     def test_the_overspending_lane_is_still_counted_as_a_failure(self):
         self.assertEqual(1, self.fill())
+
+
+class OneBadAccount(unittest.TestCase):
+    """A `users:` entry Invidious does not know must cost only itself.
+
+    `open_session` used to sys.exit, so one typo'd email took down every
+    account ordered after it, and the run said nothing about the ones it never
+    reached.
+    """
+
+    LANES = [{"id": "suggested", "policy": "refill", "min_watched": 0}]
+    TYPO = "andr@example.com"
+
+    def setUp(self):
+        self.lines = []
+        self.filled = []
+        self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+        self.mod.log = self.lines.append
+        self.mod.load_config = lambda: self.LANES
+        self.mod.read_config = lambda: {"lanes": self.LANES}
+        self.mod.load_users = lambda: [self.user(self.TYPO), self.user(ME)]
+        self.mod.account_order = lambda users: users
+        self.mod.session_of = lambda email: ""
+        self.mod.one = lambda sql: "" if self.mod.lit(self.TYPO) in sql else "1"
+        self.mod.query = lambda sql: []
+        self.mod.execute = lambda sql: None
+        self.mod.read_user = lambda: ([], set())
+        self.mod.read_blocked = lambda: {}
+        self.mod.watch_count = lambda email: 900
+        self.mod.run_one_lane = self.run_one_lane
+
+    def run_one_lane(self, lane, run):
+        self.filled.append(self.mod.ACCOUNT)
+        return (0, 1, 0, 0), None
+
+    def user(self, email):
+        return {"email": email, "named": True, "lanes": "all", "overrides": {}}
+
+    def fill(self):
+        return self.mod.cmd_run(Args(account=None, seeds=0, rate=600,
+                                     budget=320))
+
+    def test_the_accounts_after_the_bad_one_are_still_filled(self):
+        self.fill()
+        self.assertEqual([ME], self.filled)
+
+    def test_the_run_names_the_account_it_could_not_serve(self):
+        self.fill()
+        named = [line for line in self.lines if self.TYPO in line]
+        self.assertTrue(named, "the skipped account has to be named: %r" % self.lines)
+
+    def test_the_run_still_reports_failure(self):
+        self.assertEqual(1, self.fill())
+
+    def test_a_command_without_a_per_account_handler_exits_rather_than_traces(self):
+        """Only `run` recovers per account; main() turns the rest into a clean exit."""
+        self.mod.accounts_wanted = lambda args: [self.user(self.TYPO)]
+        argv = sys.argv
+        sys.argv = ["iv-suggest", "dedupe"]
+        self.addCleanup(lambda: setattr(sys, "argv", argv))
+        with self.assertRaises(SystemExit) as caught:
+            self.mod.main()
+        self.assertIn(self.TYPO, str(caught.exception))
 
 
 class Budget(unittest.TestCase):

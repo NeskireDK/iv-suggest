@@ -180,10 +180,12 @@ class Sessions(unittest.TestCase):
         self.assertNotEqual(sid, self.mod.open_session(OTHER))
 
     def test_a_second_account_is_never_enrolled_by_accident(self):
-        """An account Invidious does not know must not get a login."""
-        Fake(users=(ME,)).install(self.mod)
-        with self.assertRaises(SystemExit):
+        """An account Invidious does not know must not get a login.
+        It raises rather than exits: the run loop skips that account and keeps going."""
+        fake = Fake(users=(ME,)).install(self.mod)
+        with self.assertRaises(self.mod.Aborted):
             self.mod.open_session("stranger@example.com")
+        self.assertEqual([], fake.written)
 
     def test_a_signed_out_session_is_replaced_not_reused(self):
         """session_of() joins session_ids, so a wiped row reads as absent."""

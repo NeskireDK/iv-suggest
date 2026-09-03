@@ -441,12 +441,13 @@ def session_of(email):
 
 
 def open_session(email):
-    """Give the bot a login for an account, once, and return the session id."""
+    """Give the bot a login for an account, once, and return the session id.
+    An unregistered email raises rather than exits, so one bad `users:` entry costs only itself."""
     sid = session_of(email)
     if sid:
         return sid
     if not one("SELECT 1 FROM users WHERE email=%s;" % lit(email)):
-        sys.exit("no Invidious account %s (the value in users.email)" % email)
+        raise Aborted("no Invidious account %s (the value in users.email)" % email)
     sid = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode()
     execute("INSERT INTO session_ids(id,email,issued) VALUES (%s,%s,now()); "
             "INSERT INTO suggest.accounts(account,sid) VALUES (%s,%s) "
@@ -2614,9 +2615,13 @@ def main():
     s.add_argument("--lane")
     s.add_argument("--account", help="reorder only this account")
     args = p.parse_args()
-    return {"init": cmd_init, "run": cmd_run, "status": cmd_status,
-            "metrics": cmd_metrics, "dedupe": cmd_dedupe,
-            "views": cmd_views, "shuffle": cmd_shuffle}[args.cmd](args)
+    command = {"init": cmd_init, "run": cmd_run, "status": cmd_status,
+               "metrics": cmd_metrics, "dedupe": cmd_dedupe,
+               "views": cmd_views, "shuffle": cmd_shuffle}[args.cmd]
+    try:
+        return command(args)
+    except Aborted as e:
+        sys.exit(str(e))
 
 
 if __name__ == "__main__":
