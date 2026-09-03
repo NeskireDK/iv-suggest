@@ -615,14 +615,17 @@ class Fetcher:
         except Exception:
             return False
 
+    def _give_up_on_the_lane(self):
+        """Abort the lane, and hand the next one a clean run of bad luck to spend."""
+        self.fails = 0
+        raise Aborted("%d consecutive fetch failures" % MAX_CONSECUTIVE_FAILS)
+
     def _trouble(self, err, delay):
-        """Back off after a failed fetch, giving up on the lane once they stop being isolated.
-        The counter clears as the abort is raised: it counts one lane's run of bad luck, not the run's."""
+        """Back off after a failed fetch, giving up on the lane once they stop being isolated."""
         self.fails += 1
         log("  fetch problem (%s), backing off %.0fs" % (err, delay))
         if self.fails >= MAX_CONSECUTIVE_FAILS:
-            self.fails = 0
-            raise Aborted("%d consecutive fetch failures" % MAX_CONSECUTIVE_FAILS)
+            self._give_up_on_the_lane()
         time.sleep(min(delay, 120))
 
     def _remember(self, vid, data):
@@ -746,7 +749,8 @@ def load_config():
     lanes = []
     for raw in cfg.get("lanes") or []:
         lane = merge_lane(defaults, raw)
-        checked_size("lane %r in %s" % (lane.get("id"), CONFIG), lane["size"])
+        refuse_a_size_that_is_not_a_cap(
+            "lane %r in %s" % (lane.get("id"), CONFIG), lane["size"])
         lane["ignored"] = ignored_keys(lane["policy"], raw)
         lanes.append(lane)
     _CONFIG_CACHE["lanes"] = lanes
@@ -817,14 +821,13 @@ def watch_count(email):
     return _WATCH_COUNTS[email]
 
 
-def checked_size(where, size):
-    """A lane's `size`, refusing the values that would publish an unbounded playlist."""
+def refuse_a_size_that_is_not_a_cap(where, size):
+    """Exit on a `size` that would publish an unbounded playlist rather than a lane's worth."""
     if isinstance(size, bool) or not isinstance(size, int) or size < 0:
         sys.exit("%s: size must be a whole number of videos, not %r. A `size:` "
                  "with nothing after it reads as no value at all, which would "
                  "publish every candidate rather than a lane's worth."
                  % (where, size))
-    return size
 
 
 def checked_overrides(email, overrides):
@@ -839,8 +842,9 @@ def checked_overrides(email, overrides):
                      "account a lane of its own instead."
                      % (email, lane_id, CONFIG))
         if "size" in patch:
-            checked_size("%s: override of lane %r in %s"
-                         % (email, lane_id, CONFIG), patch["size"])
+            refuse_a_size_that_is_not_a_cap(
+                "%s: override of lane %r in %s" % (email, lane_id, CONFIG),
+                patch["size"])
     return overrides or {}
 
 

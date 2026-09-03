@@ -220,14 +220,22 @@ class AbortsAreCountedPerLane(BudgetCase):
     """
 
     def abort(self, fetch):
-        with self.assertRaises(self.mod.Aborted):
+        with self.assertRaises(self.mod.Aborted) as caught:
             for ucid in ("UC-a", "UC-b"):
                 fetch.channel_latest(ucid)
+        return caught.exception
 
     def test_the_counter_is_clear_once_the_abort_is_raised(self):
         fetch = self.fetcher(Upstream(*([RATE_LIMITED] * 5)), budget=20)
         self.abort(fetch)
         self.assertEqual(0, fetch.fails)
+
+    def test_the_abort_still_says_how_many_failures_it_took(self):
+        """The clear runs first, so the count has to come from the constant, not the counter."""
+        fetch = self.fetcher(Upstream(*([RATE_LIMITED] * 5)), budget=20)
+        self.assertEqual("%d consecutive fetch failures"
+                         % self.mod.MAX_CONSECUTIVE_FAILS,
+                         str(self.abort(fetch)))
 
     def test_the_next_lane_survives_one_failure_of_its_own(self):
         fetch = self.fetcher(
@@ -242,13 +250,16 @@ class AbortsAreCountedPerLane(BudgetCase):
         self.abort(fetch)
         self.assertEqual(VIDEO, fetch.video("v0000000000"))
 
-    def test_a_second_run_of_bad_luck_still_aborts(self):
-        fetch = self.fetcher(Upstream(*([RATE_LIMITED] * 10)), budget=30)
+    def test_a_second_abort_needs_a_fresh_run_of_failures(self):
+        upstream = Upstream(*([RATE_LIMITED] * 10))
+        fetch = self.fetcher(upstream, budget=30)
         self.abort(fetch)
         fetch.begin_lane(None)
+        self.assertIsNone(fetch.channel_latest("UC-c"))
         with self.assertRaises(self.mod.Aborted):
-            for ucid in ("UC-c", "UC-d"):
-                fetch.channel_latest(ucid)
+            fetch.channel_latest("UC-d")
+        self.assertEqual(10, len(upstream.asked),
+                         "5 failures to the first abort, then a whole fresh 5")
 
 
 if __name__ == "__main__":

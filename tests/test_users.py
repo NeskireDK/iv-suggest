@@ -296,8 +296,8 @@ lanes:
     size:%s
 """
 
-    def refused(self, size, account=ME):
-        mod = self.loaded(self.LANES % size, account=account)
+    def refused(self, size):
+        mod = self.loaded(self.LANES % size)
         with self.assertRaises(SystemExit) as caught:
             mod.load_config()
         return str(caught.exception)
@@ -361,7 +361,8 @@ class OneBadAccount(unittest.TestCase):
     reached.
     """
 
-    LANES = [{"id": "suggested", "policy": "refill", "min_watched": 0}]
+    LANES = [{"id": "suggested", "title": "Suggested", "policy": "refill",
+              "size": 30, "min_watched": 0}]
     TYPO = "andr@example.com"
 
     def setUp(self):
@@ -410,7 +411,7 @@ class OneBadAccount(unittest.TestCase):
         self.mod.accounts_wanted = lambda args: [self.user(self.TYPO)]
         argv = sys.argv
         sys.argv = ["iv-suggest", "dedupe"]
-        self.addCleanup(lambda: setattr(sys, "argv", argv))
+        self.addCleanup(setattr, sys, "argv", argv)
         with self.assertRaises(SystemExit) as caught:
             self.mod.main()
         self.assertIn(self.TYPO, str(caught.exception))
