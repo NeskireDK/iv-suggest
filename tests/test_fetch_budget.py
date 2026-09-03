@@ -262,5 +262,65 @@ class AbortsAreCountedPerLane(BudgetCase):
                          "5 failures to the first abort, then a whole fresh 5")
 
 
+class ADeadUpstreamStopsTheRun(BudgetCase):
+    """Clearing `fails` per lane must not cost the run its brake against a dead upstream.
+
+    With the clear and nothing else, every lane paid a fresh run of failures
+    before giving up: measured at 110 dead calls and 20 minutes of backoff over
+    a night, against 26 calls and 2 minutes before. `aborts` counts the lanes
+    that gave up with nothing answering in between, and the run stops paying for
+    fetches once enough have.
+    """
+
+    def lanes_that_give_up(self, fetch, how_many):
+        for lane in range(how_many):
+            fetch.begin_lane(None)
+            with self.assertRaises(self.mod.Aborted):
+                for ucid in ("UC-a", "UC-b"):
+                    fetch.channel_latest(ucid)
+
+    def dead(self, budget=400):
+        return self.fetcher(Upstream(*([RATE_LIMITED] * 200)), budget=budget)
+
+    def test_the_run_stops_paying_for_fetches_after_enough_lanes_give_up(self):
+        fetch = self.dead()
+        self.lanes_that_give_up(fetch, self.mod.MAX_LANE_ABORTS)
+        with self.assertRaises(self.mod.BudgetSpent):
+            fetch.channel_latest("UC-c")
+
+    def test_a_dead_night_costs_what_it_used_to_rather_than_four_times_it(self):
+        fetch = self.dead()
+        self.lanes_that_give_up(fetch, self.mod.MAX_LANE_ABORTS)
+        for lane in range(20):
+            fetch.begin_lane(None)
+            with self.assertRaises(self.mod.BudgetSpent):
+                fetch.channel_latest("UC-c")
+        self.assertEqual(self.mod.MAX_LANE_ABORTS * self.mod.MAX_CONSECUTIVE_FAILS,
+                         fetch.fetches,
+                         "the lanes after the brake must cost nothing at all")
+
+    def test_a_lane_that_answers_gives_the_run_its_credit_back(self):
+        fetch = self.fetcher(
+            Upstream(*([RATE_LIMITED] * 10 + [LISTING] + [RATE_LIMITED] * 20)),
+            budget=400)
+        self.lanes_that_give_up(fetch, 2)
+        fetch.begin_lane(None)
+        self.assertEqual(LISTING, fetch.channel_latest("UC-ok"))
+        self.assertEqual(0, fetch.aborts)
+        self.lanes_that_give_up(fetch, self.mod.MAX_LANE_ABORTS)
+        with self.assertRaises(self.mod.BudgetSpent):
+            fetch.channel_latest("UC-c")
+
+    def test_the_brake_says_upstream_rather_than_budget(self):
+        fetch = self.dead()
+        self.lanes_that_give_up(fetch, self.mod.MAX_LANE_ABORTS)
+        self.assertIn("upstream looks down", fetch.stopped_spending())
+
+    def test_nothing_is_braked_while_upstream_is_answering(self):
+        fetch = self.fetcher(Upstream(LISTING), budget=10)
+        fetch.channel_latest("UC-a")
+        self.assertEqual("", fetch.stopped_spending())
+
+
 if __name__ == "__main__":
     unittest.main()

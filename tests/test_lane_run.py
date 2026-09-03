@@ -148,11 +148,15 @@ class Fetch:
         self.skipped_500 = 0
         self.lane_used = 0
         self.lane_cap = None
+        self.aborts = 0
         self.buried = []
         self.remembered = []
 
     def begin_lane(self, cap):
         self.lane_cap, self.lane_used = cap, 0
+
+    def stopped_spending(self):
+        return ""
 
     def video(self, vid):
         self.fetches += 1
@@ -820,8 +824,10 @@ class Dedupe(LaneCase):
         self.said = []
         self.mod.log = self.said.append
 
-    def dedupe(self, lane_videos, dry=False):
+    def dedupe(self, lane_videos, dry=False, overrides=None):
         self.account(tuple(lane_videos))
+        self.user = {"email": ME, "named": True, "lanes": "all",
+                     "overrides": overrides or {}}
         self.db = Db()
         self.db.query = lambda sql: (
             [[lane, "PL-" + lane] for lane in lane_videos]
@@ -835,7 +841,7 @@ class Dedupe(LaneCase):
             if method == "GET" else
             self.api.calls.append((method, path, body)) or {})
         self.mod.api = self.api.call
-        return self.mod.dedupe_account(Args(dry))
+        return self.mod.dedupe_account(self.user, Args(dry))
 
     def test_the_artists_own_upload_is_kept_over_a_re_upload(self):
         self.dedupe({"music": [
@@ -896,6 +902,29 @@ class Dedupe(LaneCase):
                          [path for method, path, _ in self.api.calls
                           if method == "GET"])
 
+    def test_an_override_can_opt_a_lane_out_for_one_account(self):
+        """`dedupe_songs` is a key an override may move, so the skip list has to see it.
+
+        It read the global lane block, so an account that opted out in
+        `overrides:` still had videos deleted -- and a 365-day cooldown row
+        written -- while the nightly run honoured the same override.
+        """
+        self.dedupe({"music": [
+            entry("aaaaaaaaaaa", title="Artist - Song"),
+            entry("bbbbbbbbbbb", title="Artist - Song (Official Video)")]},
+            overrides={"music": {"dedupe_songs": False}})
+        self.assertEqual([], self.api.removed())
+        self.assertTrue(self.logged("dedupe_songs: false, left alone"))
+
+    def test_an_override_can_opt_a_lane_back_in(self):
+        """The mirror case: a lane the file opted out of, deduped for one account."""
+        self.dedupe({"subs-live": [
+            entry("aaaaaaaaaaa", title="Artist - Song"),
+            entry("bbbbbbbbbbb", title="Artist - Song (Official Video)")]},
+            overrides={"subs-live": {"dedupe_songs": True}})
+        self.assertEqual(1, len(self.api.removed()))
+        self.assertFalse(self.logged("dedupe_songs: false, left alone"))
+
     def test_a_dry_run_removes_nothing(self):
         self.dedupe({"music": [
             entry("aaaaaaaaaaa", title="Artist - Song"),
@@ -903,6 +932,45 @@ class Dedupe(LaneCase):
             dry=True)
         self.assertEqual([], self.api.removed())
         self.assertEqual([], self.db.written)
+
+
+class StaleSongKeys(unittest.TestCase):
+    """An opted-out lane must stop suppressing candidates through rows `dedupe` left.
+
+    The fill never writes a song key for a lane with `dedupe_songs: false`, but
+    `dedupe` used to stamp one on every keeper it saw, and the cross-lane
+    suppression in `choose_candidates` reads any non-empty key regardless of the
+    lane it came from. Not writing new ones does not clear the old ones.
+    """
+
+    def setUp(self):
+        self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+        self.mod.log = lambda line: None
+        self.written = []
+        self.mod.execute = self.written.append
+        self.mod.query = lambda sql: []
+        self.mod.run_lane = lambda lane, run: (0, 0, 0, 0)
+
+    def clears(self, dedupe_songs, dry=False):
+        lane = {"id": "subs-live", "policy": "refill",
+                "dedupe_songs": dedupe_songs}
+        run = self.mod.LaneRun([], set(), set(), {}, Fetch(), dry, None)
+        self.mod.run_one_lane(lane, run)
+        return [sql for sql in self.written if "SET song_key=NULL" in sql]
+
+    def test_an_opted_out_lane_clears_the_keys_dedupe_stamped_on_it(self):
+        self.assertEqual(1, len(self.clears(False)))
+
+    def test_it_clears_its_own_rows_and_nobody_elses(self):
+        sql = self.clears(False)[0]
+        self.assertIn("lane='subs-live'", sql)
+        self.assertIn("account='%s'" % ME, sql)
+
+    def test_a_lane_that_dedupes_songs_is_left_alone(self):
+        self.assertEqual([], self.clears(True))
+
+    def test_a_dry_run_writes_nothing(self):
+        self.assertEqual([], self.clears(False, dry=True))
 
 
 class Args:

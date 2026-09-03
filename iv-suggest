@@ -92,10 +92,11 @@ def use_account(email):
 
 
 def serve_account(email):
-    """Point at this account and guarantee the session its API calls need."""
+    """Point at this account and guarantee the session its API calls need.
+    The session comes first: a failure must not leave the pair mismatched."""
     global ACCOUNT, SESSION
-    ACCOUNT = email
-    SESSION = open_session(email)
+    session = open_session(email)
+    ACCOUNT, SESSION = email, session
 
 
 def acct():
@@ -150,6 +151,9 @@ RATE_PER_MIN = 20
 MAX_FETCHES = 320
 DAYS_BEFORE_RETRYING_A_BROKEN_VIDEO = 30
 MAX_CONSECUTIVE_FAILS = 5
+# Lanes that gave up in a row with nothing answering in between. Past this the
+# run stops paying for fetches: upstream is down, not the lane's bad luck.
+MAX_LANE_ABORTS = 3
 STORED_SCORE_DECIMALS = 4   # suggest.items.score is rounded to this before it is written
 DRY_SEEDS = 10          # a dry run uses few seeds; the nightly run uses the config
 
@@ -501,6 +505,7 @@ class Fetcher:
         self.cache_hits = 0
         self.last = 0.0
         self.fails = 0
+        self.aborts = 0
         self.skipped_500 = 0
         self.dead_hits = 0
         self.lane_cap = None
@@ -522,10 +527,20 @@ class Fetcher:
         self.fetches += 1
         self.lane_used += 1
 
+    def stopped_spending(self):
+        """Why the run will refuse the next fetch, or an empty string while it still pays."""
+        if self.aborts >= MAX_LANE_ABORTS:
+            return ("%d lanes gave up in a row with nothing answering in "
+                    "between; upstream looks down" % self.aborts)
+        if self.fetches >= self.budget:
+            return "run budget %d spent" % self.budget
+        return ""
+
     def _refuse_when_out_of_budget(self):
         """Raise before a call starts, so a call already retrying is never cut in half."""
-        if self.fetches >= self.budget:
-            raise BudgetSpent("run budget %d spent" % self.budget)
+        stopped = self.stopped_spending()
+        if stopped:
+            raise BudgetSpent(stopped)
         if self.lane_cap and self.lane_used >= self.lane_cap:
             raise BudgetSpent("lane fetch cap %d reached" % self.lane_cap)
 
@@ -541,7 +556,7 @@ class Fetcher:
             try:
                 data = api("GET", "/api/v1/videos/" + vid)
                 self._spend_one_fetch()
-                self.fails = 0
+                self._upstream_answered()
                 if data and not data.get("error"):
                     self._remember(vid, data)
                     return data
@@ -550,11 +565,11 @@ class Fetcher:
             except urllib.error.HTTPError as e:
                 self._spend_one_fetch()
                 if e.code in (404, 410):
-                    self.fails = 0
+                    self._upstream_answered()
                     self.bury(vid, 365, "http %d" % e.code)
                     return None
                 if self._only_this_request_is_broken(e):
-                    self.fails = 0
+                    self._upstream_answered()
                     self.skipped_500 += 1
                     self.bury(vid, DAYS_BEFORE_RETRYING_A_BROKEN_VIDEO,
                               "upstream 500")
@@ -590,15 +605,15 @@ class Fetcher:
             try:
                 data = api("GET", "/api/v1/channels/%s/latest" % ucid)
                 self._spend_one_fetch()
-                self.fails = 0
+                self._upstream_answered()
                 return data
             except urllib.error.HTTPError as e:
                 self._spend_one_fetch()
                 if e.code in (404, 410):
-                    self.fails = 0
+                    self._upstream_answered()
                     return None
                 if self._only_this_request_is_broken(e):
-                    self.fails = 0
+                    self._upstream_answered()
                     log("  skipping channel %s (upstream %d)" % (ucid, e.code))
                     return None
                 self._trouble(e, delay)
@@ -618,7 +633,13 @@ class Fetcher:
     def _give_up_on_the_lane(self):
         """Abort the lane, and hand the next one a clean run of bad luck to spend."""
         self.fails = 0
+        self.aborts += 1
         raise Aborted("%d consecutive fetch failures" % MAX_CONSECUTIVE_FAILS)
+
+    def _upstream_answered(self):
+        """Note a coherent answer, which is what makes the give-up counters start over."""
+        self.fails = 0
+        self.aborts = 0
 
     def _trouble(self, err, delay):
         """Back off after a failed fetch, giving up on the lane once they stop being isolated."""
@@ -749,8 +770,8 @@ def load_config():
     lanes = []
     for raw in cfg.get("lanes") or []:
         lane = merge_lane(defaults, raw)
-        refuse_a_size_that_is_not_a_cap(
-            "lane %r in %s" % (lane.get("id"), CONFIG), lane["size"])
+        refuse_the_values_yaml_read_as_nothing(
+            "lane %r in %s" % (lane.get("id"), CONFIG), lane)
         lane["ignored"] = ignored_keys(lane["policy"], raw)
         lanes.append(lane)
     _CONFIG_CACHE["lanes"] = lanes
@@ -821,13 +842,36 @@ def watch_count(email):
     return _WATCH_COUNTS[email]
 
 
-def refuse_a_size_that_is_not_a_cap(where, size):
+SWITCH_KEYS = tuple(sorted(key for key, default in DEFAULTS.items()
+                           if isinstance(default, bool)))
+
+
+def refuse_a_size_that_is_not_a_cap(where, block):
     """Exit on a `size` that would publish an unbounded playlist rather than a lane's worth."""
+    if "size" not in block:
+        return
+    size = block["size"]
     if isinstance(size, bool) or not isinstance(size, int) or size < 0:
         sys.exit("%s: size must be a whole number of videos, not %r. A `size:` "
                  "with nothing after it reads as no value at all, which would "
                  "publish every candidate rather than a lane's worth."
                  % (where, size))
+
+
+def refuse_a_switch_that_is_not_on_or_off(where, block):
+    """Exit on a true/false lane key holding something else, which a blank `key:` does."""
+    for key in SWITCH_KEYS:
+        if key in block and not isinstance(block[key], bool):
+            sys.exit("%s: %s must be true or false, not %r. A `%s:` with "
+                     "nothing after it reads as no value at all, and every "
+                     "reader of it takes that for false."
+                     % (where, key, block[key], key))
+
+
+def refuse_the_values_yaml_read_as_nothing(where, block):
+    """Exit on a lane or override key holding None where a number or a switch belongs."""
+    refuse_a_size_that_is_not_a_cap(where, block)
+    refuse_a_switch_that_is_not_on_or_off(where, block)
 
 
 def checked_overrides(email, overrides):
@@ -841,10 +885,8 @@ def checked_overrides(email, overrides):
                      "what a lane IS, not a per-account setting: give the "
                      "account a lane of its own instead."
                      % (email, lane_id, CONFIG))
-        if "size" in patch:
-            refuse_a_size_that_is_not_a_cap(
-                "%s: override of lane %r in %s" % (email, lane_id, CONFIG),
-                patch["size"])
+        refuse_the_values_yaml_read_as_nothing(
+            "%s: override of lane %r in %s" % (email, lane_id, CONFIG), patch)
     return overrides or {}
 
 
@@ -941,14 +983,19 @@ def without_the_compiled_lanes_somebody_else_holds(user, lanes):
             or holds_the_instance_copy(user, lane["id"])]
 
 
+def with_this_accounts_overrides(user, lanes):
+    """Each lane as this account has it, its `overrides:` block applied."""
+    overrides = user.get("overrides") or {}
+    return [overridden_lane(lane, overrides[lane["id"]])
+            if lane["id"] in overrides else lane for lane in lanes]
+
+
 def lanes_for(user, lanes, watched=None):
     """The lanes one account gets, in lanes.yml order, with its overrides applied.
     Pass `watched` to also drop the lanes it has too little history to fill."""
-    lanes = without_the_compiled_lanes_somebody_else_holds(
-        user, lanes_asked_for(user, lanes))
-    overrides = user.get("overrides") or {}
-    lanes = [overridden_lane(lane, overrides[lane["id"]])
-             if lane["id"] in overrides else lane for lane in lanes]
+    lanes = with_this_accounts_overrides(
+        user, without_the_compiled_lanes_somebody_else_holds(
+            user, lanes_asked_for(user, lanes)))
     if watched is None:
         return lanes
     return [lane for lane in lanes if watched >= lane["min_watched"]]
@@ -1959,9 +2006,21 @@ def costs_no_fetch(lane):
     return lane["policy"] in COMPILED_POLICIES
 
 
+def forget_the_song_keys_of_a_lane_that_does_not_dedupe(lane):
+    """Clear keys an earlier `dedupe` stamped on an opted-out lane, so no other lane reads them.
+    The fill stopped writing them, but the rows already there still suppress candidates."""
+    if lane["dedupe_songs"]:
+        return
+    execute("UPDATE suggest.items SET song_key=NULL "
+            "WHERE account=%s AND lane=%s AND coalesce(song_key,'') <> '';"
+            % (acct(), lit(lane["id"])))
+
+
 def run_one_lane(lane, run):
     """One lane's (removed, added, kept, fetches), and its error if it had one.
     A lane that raises is recorded and never stops the account's other lanes."""
+    if not run.dry:
+        forget_the_song_keys_of_a_lane_that_does_not_dedupe(lane)
     try:
         if lane["policy"] == "last_played":
             return run_lane_last_played(lane, run), None
@@ -2011,10 +2070,11 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
                     "VALUES (%s,%s,%s,%s,%s,%s,%s);"
                     % (acct(), lit(lane["id"]), added, removed, kept, used,
                        lit(error)))
-        if not out_of_budget and error and "budget" in error:
+        stopped = fetcher.stopped_spending()
+        if not out_of_budget and stopped:
             out_of_budget = True
-            log("fetch budget spent, skipping %s's remaining lanes that would "
-                "spend one" % ACCOUNT)
+            log("no more fetches this run (%s), skipping %s's remaining lanes "
+                "that would spend one" % (stopped, ACCOUNT))
     return failed
 
 
@@ -2023,7 +2083,7 @@ def cmd_dedupe(args):
     for user in accounts_wanted(args):
         serve_account(user["email"])
         log("account %s" % user["email"])
-        dedupe_account(args)
+        dedupe_account(user, args)
     return 0
 
 
@@ -2039,9 +2099,10 @@ def why_dedupe_leaves_a_lane_alone(lane):
     return ""
 
 
-def dedupe_account(args):
-    """One account's duplicates. The keeper wins on upload_quality first, lane order second."""
-    all_lanes = load_config()
+def dedupe_account(user, args):
+    """One account's duplicates. The keeper wins on upload_quality first, lane order second.
+    Reads the lanes as this account has them: `dedupe_songs` is a key an override may move."""
+    all_lanes = with_this_accounts_overrides(user, load_config())
     order = {lane["id"]: i for i, lane in enumerate(all_lanes)}
     left_alone = {}
     for lane in all_lanes:

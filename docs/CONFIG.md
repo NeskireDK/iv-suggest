@@ -119,7 +119,7 @@ only**. `init` and `run` name any inert key a lane sets:
 | `exclude_watched` | `true` | drop what this account already watched |
 | `exclude_subscribed` | `true` | drop channels this account subscribes to — their feed already shows them. `false` does not re-admit them under `channel_latest`, which skips subscribed channels when choosing whom to poll |
 | `dedupe_across_lanes` | `true` | a video sits in one lane at a time, per account |
-| `dedupe_songs` | `true` | one upload per song, across every lane a person holds. A compiled lane is not one of them — `dedupe` skips those. See [README](../README.md#song-identity) |
+| `dedupe_songs` | `true` | one upload per song, across every lane a person holds. `dedupe` skips a lane that sets it `false`, and skips a compiled lane whatever it says. See [README](../README.md#song-identity) |
 | `min_seconds` | `120` | drop anything shorter, **when the length is known** — a candidate reporting `0` seconds passes. `0` = off |
 | `max_seconds` | `0` | drop anything longer. `0` = no bound; use it against compilations |
 | `max_per_channel` | `2` | most entries one channel may hold. `0` = no limit |

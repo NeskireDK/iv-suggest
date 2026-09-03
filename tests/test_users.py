@@ -214,6 +214,9 @@ class Spent:
     budget = 320
     fetches = 320
 
+    def stopped_spending(self):
+        return "run budget 320 spent"
+
 
 class Args:
 
@@ -231,10 +234,14 @@ class ASpentBudget(unittest.TestCase):
     heavy night left what visitors see un-rebuilt and nothing looked wrong.
     """
 
-    LANES = [{"id": "suggested", "policy": "refill", "min_watched": 0},
-             {"id": "fresh-uploads", "policy": "refill", "min_watched": 0},
-             {"id": "popular", "policy": "consensus", "min_watched": 0},
-             {"id": "home-mix", "policy": "mix", "min_watched": 0}]
+    LANES = [{"id": "suggested", "policy": "refill", "min_watched": 0,
+              "dedupe_songs": True},
+             {"id": "fresh-uploads", "policy": "refill", "min_watched": 0,
+              "dedupe_songs": True},
+             {"id": "popular", "policy": "consensus", "min_watched": 0,
+              "dedupe_songs": True},
+             {"id": "home-mix", "policy": "mix", "min_watched": 0,
+              "dedupe_songs": True}]
 
     def setUp(self):
         self.mod = load(IV_SUGGEST_ACCOUNT=ME)
@@ -353,6 +360,64 @@ users:
         self.assertIn(ME, message)
 
 
+class Switches(ConfigCase):
+    """A true/false lane key with nothing after it is a config error, not a false.
+
+    Same family as `size`: `dedupe_songs:` parsed as None, every reader took
+    that for false, and `dedupe` quietly became a no-op for every lane.
+    """
+
+    def refused(self, block):
+        mod = self.loaded("""
+lanes:
+  - id: suggested
+    title: Suggested
+%s
+""" % block)
+        with self.assertRaises(SystemExit) as caught:
+            mod.load_config()
+        return str(caught.exception)
+
+    def test_a_switch_with_no_value_is_refused(self):
+        self.assertIn("dedupe_songs must be true or false",
+                      self.refused("    dedupe_songs:"))
+
+    def test_every_switch_key_is_covered_not_just_the_one_that_bit(self):
+        mod = self.loaded("lanes: []\n")
+        self.assertEqual(
+            ["dedupe_across_lanes", "dedupe_songs", "exclude_subscribed",
+             "exclude_watched"], list(mod.SWITCH_KEYS))
+
+    def test_a_switch_set_to_a_word_is_refused(self):
+        self.assertIn("exclude_watched must be true or false",
+                      self.refused("    exclude_watched: yes please"))
+
+    def test_off_is_still_off(self):
+        mod = self.loaded("""
+lanes:
+  - id: suggested
+    title: Suggested
+    dedupe_songs: false
+""")
+        self.assertIs(False, mod.load_config()[0]["dedupe_songs"])
+
+    def test_an_override_with_no_value_is_refused_too(self):
+        mod = self.loaded("""
+lanes:
+  - id: suggested
+    title: Suggested
+users:
+  - email: %s
+    overrides:
+      suggested:
+        dedupe_songs:
+""" % ME)
+        with self.assertRaises(SystemExit) as caught:
+            mod.load_users()
+        self.assertIn("dedupe_songs must be true or false",
+                      str(caught.exception))
+
+
 class OneBadAccount(unittest.TestCase):
     """A `users:` entry Invidious does not know must cost only itself.
 
@@ -362,7 +427,7 @@ class OneBadAccount(unittest.TestCase):
     """
 
     LANES = [{"id": "suggested", "title": "Suggested", "policy": "refill",
-              "size": 30, "min_watched": 0}]
+              "size": 30, "min_watched": 0, "dedupe_songs": True}]
     TYPO = "andr@example.com"
 
     def setUp(self):
