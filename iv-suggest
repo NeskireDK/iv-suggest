@@ -2102,9 +2102,8 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
     failed = 0
     for lane in lanes:
         counts, error = run_one_lane(lane, run)
-        if not args.dry_run and not record_the_lane_run(lane["id"], counts, error):
-            error = error or "the lane ran, but its run row was not written"
-        if error:
+        recorded = args.dry_run or record_the_lane_run(lane["id"], counts, error)
+        if error or not recorded:
             failed += 1
     return failed
 

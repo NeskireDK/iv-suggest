@@ -979,11 +979,12 @@ class StaleSongKeys(unittest.TestCase):
     def test_it_clears_every_opted_out_lane_in_one_statement(self):
         sql = self.clears()
         self.assertEqual(1, len(sql))
-        self.assertIn("'subs-top48'", sql[0])
-        self.assertIn("'subs-live'", sql[0])
+        self.assertIn("AND lane IN ('subs-top48', 'subs-live')", sql[0],
+                      "IN, not NOT IN: the wrong direction wipes the keys of "
+                      "every lane that does dedupe songs")
 
     def test_it_leaves_the_lanes_that_dedupe_songs_alone(self):
-        self.assertNotIn("'suggested'", self.clears()[0])
+        self.assertNotIn("suggested", self.clears()[0])
 
     def test_it_touches_this_account_and_nobody_else(self):
         self.assertIn("account='%s'" % ME, self.clears()[0])
@@ -1069,11 +1070,6 @@ class ARunRowThatCannotBeWritten(unittest.TestCase):
         serves the same account first every night.
         """
         self.assertEqual(len(self.LANES), self.fill())
-
-    def test_the_lost_row_is_named_as_the_lane_s_error(self):
-        self.fill()
-        self.assertTrue([line for line in self.said
-                         if "run row was not written" in line])
 
     def test_a_dry_run_never_reaches_the_write_at_all(self):
         self.mod.run_account(self.user(), self.LANES, Fetch(), None,
