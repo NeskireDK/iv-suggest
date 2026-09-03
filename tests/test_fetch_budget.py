@@ -264,6 +264,47 @@ class AbortsAreCountedPerLane(BudgetCase):
                          "5 failures to the first abort, then a whole fresh 5")
 
 
+class FailuresAreCountedPerLane(BudgetCase):
+    """A lane that ends WITHOUT aborting must not hand its unspent failures on.
+
+    Only the abort cleared the counter, and `begin_lane` cleared the fetch cap
+    and nothing else. So the ordinary case leaked: `fresh-uploads` meets a few
+    dud channel listings, returns None for each without ever aborting, and the
+    next fetching lane aborted on its first or second failure of its own --
+    after its sweep had already issued the playlist DELETEs. A cache hit does
+    not clear it either, so a zero-fetch lane in between changes nothing.
+    """
+
+    def dud_listings(self, fetch, how_many):
+        for attempt in range(how_many):
+            fetch.channel_latest("UC-dud")
+
+    def test_a_lane_that_never_aborted_leaves_no_failures_behind(self):
+        fetch = self.fetcher(Upstream(*([RATE_LIMITED] * 20)), budget=100)
+        self.dud_listings(fetch, 1)
+        self.assertEqual(3, fetch.fails, "three attempts, no abort")
+        fetch.begin_lane(None)
+        self.assertEqual(0, fetch.fails)
+
+    def test_the_next_lane_gets_its_own_five_failures_not_what_was_left(self):
+        fetch = self.fetcher(Upstream(*([RATE_LIMITED] * 6 + [LISTING])),
+                             budget=100)
+        self.dud_listings(fetch, 1)
+        fetch.begin_lane(None)
+        self.assertIsNone(fetch.channel_latest("UC-a"),
+                          "three failures of its own are not five")
+        self.assertEqual(3, fetch.fails)
+        self.assertEqual(LISTING, fetch.channel_latest("UC-b"))
+
+    def test_a_borrowed_failure_cannot_count_towards_the_outage_brake(self):
+        """Otherwise three lanes losing other lanes' bad luck put the run on one strike."""
+        fetch = self.fetcher(Upstream(*([RATE_LIMITED] * 40)), budget=200)
+        for lane in range(4):
+            fetch.begin_lane(None)
+            self.dud_listings(fetch, 1)
+        self.assertEqual(0, fetch.aborts)
+
+
 class ADeadUpstreamGetsCheap(BudgetCase):
     """Clearing `fails` per lane must not cost the run its brake against a dead upstream.
 

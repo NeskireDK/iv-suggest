@@ -521,7 +521,8 @@ class Fetcher:
         self.last = time.monotonic()
 
     def begin_lane(self, cap):
-        self.lane_cap, self.lane_used = cap, 0
+        """Start a lane's share of the run: its own fetch cap, and its own run of bad luck."""
+        self.lane_cap, self.lane_used, self.fails = cap, 0, 0
 
     def _spend_one_fetch(self):
         """Charge one call upstream to the run budget and to the lane's share of it."""
@@ -2019,22 +2020,21 @@ def costs_no_fetch(lane):
     return lane["policy"] in COMPILED_POLICIES
 
 
-def forget_the_song_keys_of_an_opted_out_lane(lane):
-    """Clear keys an earlier `dedupe` stamped on an opted-out lane, so no other lane reads them.
-    The fill stopped writing them, but the rows already there still suppress candidates."""
-    if lane["dedupe_songs"]:
+def forget_the_song_keys_of_the_opted_out_lanes(lanes):
+    """Clear keys an earlier `dedupe` stamped on lanes that opted out, so no lane reads them.
+    Every lane's fill reads every other lane's keys, so this has to precede the first of them."""
+    opted_out = [lane["id"] for lane in lanes if not lane["dedupe_songs"]]
+    if not opted_out:
         return
-    execute("UPDATE suggest.items SET song_key=NULL "
-            "WHERE account=%s AND lane=%s AND coalesce(song_key,'') <> '';"
-            % (acct(), lit(lane["id"])))
+    execute("UPDATE suggest.items SET song_key=NULL WHERE account=%s "
+            "AND lane IN (%s) AND coalesce(song_key,'') <> '';"
+            % (acct(), ", ".join(lit(lane_id) for lane_id in opted_out)))
 
 
 def run_one_lane(lane, run):
     """One lane's (removed, added, kept, fetches), and its error if it had one.
     A lane that raises is recorded and never stops the account's other lanes."""
     try:
-        if not run.dry:
-            forget_the_song_keys_of_an_opted_out_lane(lane)
         if lane["policy"] == "last_played":
             return run_lane_last_played(lane, run), None
         if lane["policy"] == "mix":
@@ -2050,11 +2050,27 @@ def run_one_lane(lane, run):
         return (0, 0, 0, 0), repr(e)
 
 
+def record_the_lane_run(lane_id, counts, error):
+    """Write one lane's row in suggest.runs, saying so loudly rather than raising if it cannot.
+    Bookkeeping is not worth the account's remaining lanes, the public feeds among them."""
+    removed, added, kept, used = counts
+    try:
+        execute("INSERT INTO suggest.runs"
+                "(account,lane,added,removed,kept,fetches,error) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s);"
+                % (acct(), lit(lane_id), added, removed, kept, used, lit(error)))
+    except Exception as e:
+        log("  WARNING: lane %s ran but its run row was not written: %r"
+            % (lane_id, e))
+
+
 def run_account(user, all_lanes, fetcher, seed_override, args):
     """One account's lanes. Returns how many of them failed."""
     serve_account(user["email"])
     watched, subs = read_user()
     lanes = lanes_for(user, all_lanes, len(watched))
+    if not args.dry_run:
+        forget_the_song_keys_of_the_opted_out_lanes(lanes)
     held_back = [l["id"] for l in lanes_for(user, all_lanes)
                  if l["id"] not in {k["id"] for k in lanes}]
     if args.lane:
@@ -2071,15 +2087,11 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
         log("blocked: %s" % ", ".join(sorted(run.blocked.values())))
     failed = 0
     for lane in lanes:
-        (removed, added, kept, used), error = run_one_lane(lane, run)
+        counts, error = run_one_lane(lane, run)
         if error:
             failed += 1
         if not args.dry_run:
-            execute("INSERT INTO suggest.runs"
-                    "(account,lane,added,removed,kept,fetches,error) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s);"
-                    % (acct(), lit(lane["id"]), added, removed, kept, used,
-                       lit(error)))
+            record_the_lane_run(lane["id"], counts, error)
     return failed
 
 

@@ -234,10 +234,14 @@ class ASpentBudget(unittest.TestCase):
     their whole night with the public feeds' biggest source.
     """
 
-    LANES = [{"id": "suggested", "policy": "refill", "min_watched": 0},
-             {"id": "subs-top48", "policy": "refill", "min_watched": 0},
-             {"id": "popular", "policy": "consensus", "min_watched": 0},
-             {"id": "home-mix", "policy": "mix", "min_watched": 0}]
+    LANES = [{"id": "suggested", "policy": "refill", "min_watched": 0,
+              "dedupe_songs": True},
+             {"id": "subs-top48", "policy": "refill", "min_watched": 0,
+              "dedupe_songs": False},
+             {"id": "popular", "policy": "consensus", "min_watched": 0,
+              "dedupe_songs": True},
+             {"id": "home-mix", "policy": "mix", "min_watched": 0,
+              "dedupe_songs": True}]
 
     def setUp(self):
         self.mod = load(IV_SUGGEST_ACCOUNT=ME)
@@ -456,7 +460,7 @@ class OneBadAccount(unittest.TestCase):
     """
 
     LANES = [{"id": "suggested", "title": "Suggested", "policy": "refill",
-              "size": 30, "min_watched": 0}]
+              "size": 30, "min_watched": 0, "dedupe_songs": True}]
     TYPO = "andr@example.com"
 
     def setUp(self):

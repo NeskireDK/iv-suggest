@@ -939,69 +939,121 @@ class StaleSongKeys(unittest.TestCase):
     lane it came from. Not writing new ones does not clear the old ones.
     """
 
+    LANES = [{"id": "suggested", "dedupe_songs": True},
+             {"id": "subs-top48", "dedupe_songs": False},
+             {"id": "subs-live", "dedupe_songs": False}]
+
     def setUp(self):
         self.mod = load(IV_SUGGEST_ACCOUNT=ME)
         self.mod.log = lambda line: None
         self.written = []
-        self.cleared_before_the_fill = None
         self.mod.execute = self.written.append
-        self.mod.query = lambda sql: []
-        self.mod.run_lane = self.fill
 
-    def fill(self, lane, run):
-        self.cleared_before_the_fill = bool(self.clearings())
-        return (0, 0, 0, 0)
-
-    def clearings(self):
+    def clears(self, lanes=None):
+        self.mod.forget_the_song_keys_of_the_opted_out_lanes(
+            self.LANES if lanes is None else lanes)
         return [sql for sql in self.written if "SET song_key=NULL" in sql]
 
-    def clears(self, dedupe_songs, dry=False):
-        lane = {"id": "subs-live", "policy": "refill",
-                "dedupe_songs": dedupe_songs}
-        run = self.mod.LaneRun([], set(), set(), {}, Fetch(), dry, None)
-        self.mod.run_one_lane(lane, run)
-        return self.clearings()
+    def test_it_clears_every_opted_out_lane_in_one_statement(self):
+        sql = self.clears()
+        self.assertEqual(1, len(sql))
+        self.assertIn("'subs-top48'", sql[0])
+        self.assertIn("'subs-live'", sql[0])
 
-    def test_an_opted_out_lane_clears_the_keys_dedupe_stamped_on_it(self):
-        self.assertEqual(1, len(self.clears(False)))
+    def test_it_leaves_the_lanes_that_dedupe_songs_alone(self):
+        self.assertNotIn("'suggested'", self.clears()[0])
 
-    def test_it_clears_them_before_the_fill_reads_them_not_after(self):
-        """`choose_candidates` reads other lanes' keys as it picks, so after is too late."""
-        self.clears(False)
-        self.assertIs(True, self.cleared_before_the_fill)
+    def test_it_touches_this_account_and_nobody_else(self):
+        self.assertIn("account='%s'" % ME, self.clears()[0])
 
-    def test_a_failure_clearing_them_costs_this_lane_and_no_other(self):
-        """It runs inside run_one_lane's try: one psql hiccup must not end the account.
+    def test_an_account_with_no_opted_out_lane_writes_nothing(self):
+        self.assertEqual([], self.clears(lanes=[self.LANES[0]]))
 
-        Outside it, a blip on `subs-top48` -- lane 5 of 15 -- took `home-mix`
-        and both public feeds down with it for the night.
+    def test_it_runs_once_before_the_first_lane_not_at_each_lane_s_turn(self):
+        """A lane's fill reads every OTHER lane's keys, so clearing at each turn is a night late.
+
+        The opted-out lanes sit at 5, 7 and 8 in lanes.yml, behind four lanes
+        that read cross-lane song keys -- and `run --lane suggested` would never
+        have reached them at all.
         """
-        def raise_on_the_clear(sql):
-            if "SET song_key=NULL" in sql:
-                raise RuntimeError("psql failed: connection closed")
-            self.written.append(sql)
-        self.mod.execute = raise_on_the_clear
-        lane = {"id": "subs-live", "policy": "refill", "dedupe_songs": False}
-        run = self.mod.LaneRun([], set(), set(), {}, Fetch(), False, None)
-        counts, error = self.mod.run_one_lane(lane, run)
-        self.assertEqual((0, 0, 0, 0), counts)
-        self.assertIn("psql failed", error)
+        text = source()
+        account = text.split("def run_account(")[1].split("\ndef ")[0]
+        self.assertIn("forget_the_song_keys_of_the_opted_out_lanes(lanes)",
+                      account)
+        self.assertNotIn("forget_the_song_keys",
+                         text.split("def run_one_lane(")[1].split("\ndef ")[0])
 
-    def test_it_clears_its_own_rows_and_nobody_elses(self):
-        sql = self.clears(False)[0]
-        self.assertIn("lane='subs-live'", sql)
-        self.assertIn("account='%s'" % ME, sql)
 
-    def test_a_lane_that_dedupes_songs_is_left_alone(self):
-        self.assertEqual([], self.clears(True))
+class ARunRowThatCannotBeWritten(unittest.TestCase):
+    """A lane that ran must not lose the account its remaining lanes over bookkeeping.
 
-    def test_a_dry_run_writes_nothing(self):
-        self.assertEqual([], self.clears(False, dry=True))
+    `run_account`'s INSERT into suggest.runs sat outside every handler, so one
+    psql failure ended the account right there -- with `home-mix` and both
+    public feeds still to rebuild, and nothing in the log to say why they had
+    not been.
+    """
+
+    LANES = [{"id": "subs-top48", "policy": "refill", "min_watched": 0,
+              "dedupe_songs": True},
+             {"id": "home-mix", "policy": "mix", "min_watched": 0,
+              "dedupe_songs": True},
+             {"id": "popular", "policy": "consensus", "min_watched": 0,
+              "dedupe_songs": True}]
+
+    def setUp(self):
+        self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+        self.said = []
+        self.ran = []
+        self.mod.log = self.said.append
+        self.mod.load_users = lambda: [self.user()]
+        self.mod.serve_account = lambda email: None
+        self.mod.read_user = lambda: ([], set())
+        self.mod.read_blocked = lambda: {}
+        self.mod.watch_count = lambda email: 900
+        self.mod.query = lambda sql: []
+        self.mod.execute = self.refuse_to_write
+        self.mod.run_one_lane = self.run_one_lane
+
+    def run_one_lane(self, lane, run):
+        self.ran.append(lane["id"])
+        return (0, 1, 0, 0), None
+
+    def refuse_to_write(self, sql):
+        raise RuntimeError("psql failed: connection closed")
+
+    def user(self):
+        return {"email": ME, "named": True, "lanes": "all", "overrides": {}}
+
+    def fill(self):
+        return self.mod.run_account(self.user(), self.LANES, Fetch(), None,
+                                    Args())
+
+    def test_every_lane_still_runs(self):
+        self.fill()
+        self.assertEqual([lane["id"] for lane in self.LANES], self.ran)
+
+    def test_the_lost_row_is_said_out_loud_for_each_lane(self):
+        self.fill()
+        warned = [line for line in self.said
+                  if "run row was not written" in line]
+        self.assertEqual(len(self.LANES), len(warned))
+
+    def test_a_lane_whose_row_was_lost_is_not_counted_as_a_failure(self):
+        """The lane did its work; only the record of it is missing."""
+        self.assertEqual(0, self.fill())
+
+    def test_a_dry_run_never_reaches_the_write_at_all(self):
+        self.mod.run_account(self.user(), self.LANES, Fetch(), None,
+                             Args(dry_run=True))
+        self.assertEqual([lane["id"] for lane in self.LANES], self.ran)
+        self.assertEqual([], [line for line in self.said
+                              if "run row was not written" in line])
 
 
 class Args:
     def __init__(self, dry_run=False):
         self.dry_run = dry_run
+        self.lane = None
 
 
 if __name__ == "__main__":
