@@ -789,6 +789,28 @@ class LastPlayed(LaneCase):
         self.assertEqual((0, 0, 0), (removed, added, kept))
         self.assertEqual([("h0000000001", 30, "playlist add 500")], fetch.buried)
 
+    def test_a_lane_that_opted_out_of_song_dedupe_stores_no_song_key(self):
+        """It used to stamp one unconditionally, so the opt-out never took effect.
+
+        A stored key suppresses candidates in every OTHER lane, so
+        `music-watched` opting out still blocked the songs it holds from the
+        lanes after it -- and re-stamped them right after the account-wide
+        clear had wiped them.
+        """
+        fetch = Fetch(meta={"h0000000000": {
+            "title": "Queen - Bohemian Rhapsody", "author": "Queen"}})
+        self.play(self.lane(policy="last_played", size=1, dedupe_songs=False),
+                  ["h0000000000"], fetch=fetch)
+        self.assertEqual([""], [key for _, _, key in self.db.item_rows()])
+
+    def test_a_lane_that_dedupes_songs_still_stores_the_key(self):
+        fetch = Fetch(meta={"h0000000000": {
+            "title": "Queen - Bohemian Rhapsody", "author": "Queen"}})
+        self.play(self.lane(policy="last_played", size=1, dedupe_songs=True),
+                  ["h0000000000"], fetch=fetch)
+        self.assertEqual(["bohemianrhapsody"],
+                         [key for _, _, key in self.db.item_rows()])
+
     def test_the_returned_counts_are_removed_added_kept_and_fetches(self):
         api = Api(videos=[entry("h0000000000"), entry("h0000000009")])
         removed, added, kept, used = self.play(
@@ -801,22 +823,29 @@ class Dedupe(LaneCase):
     """One upload per song per account, the artist's own copy preferred."""
 
     COMPILED = {"public": "consensus", "home-mix": "mix"}
+    OPTED_OUT = ("subs-live",)
+
+    def lane_block(self, lane_id):
+        block = "  - id: %s\n    title: %s\n" % (lane_id, lane_id.title())
+        if lane_id in self.COMPILED:
+            block += "    policy: %s\n" % self.COMPILED[lane_id]
+        if lane_id in self.OPTED_OUT:
+            block += "    dedupe_songs: false\n"
+        return block
 
     def account(self, lanes=("music",)):
         fh = tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False)
-        fh.write("lanes:\n" + "".join(
-            "  - id: %s\n    title: %s\n%s" % (
-                l, l.title(),
-                "    policy: %s\n" % self.COMPILED[l] if l in self.COMPILED else "")
-            for l in lanes))
+        fh.write("lanes:\n" + "".join(self.lane_block(l) for l in lanes))
         fh.close()
         self.addCleanup(os.unlink, fh.name)
         self.mod = load(IV_SUGGEST_CONFIG=fh.name, IV_SUGGEST_ACCOUNT=ME)
         self.said = []
         self.mod.log = self.said.append
 
-    def dedupe(self, lane_videos, dry=False):
+    def dedupe(self, lane_videos, dry=False, overrides=None):
         self.account(tuple(lane_videos))
+        self.user = {"email": ME, "named": True, "lanes": "all",
+                     "overrides": overrides or {}}
         self.db = Db()
         self.db.query = lambda sql: (
             [[lane, "PL-" + lane] for lane in lane_videos]
@@ -830,7 +859,7 @@ class Dedupe(LaneCase):
             if method == "GET" else
             self.api.calls.append((method, path, body)) or {})
         self.mod.api = self.api.call
-        return self.mod.dedupe_account(Args(dry))
+        return self.mod.dedupe_account(self.user, Args(dry))
 
     def test_the_artists_own_upload_is_kept_over_a_re_upload(self):
         self.dedupe({"music": [
@@ -867,6 +896,53 @@ class Dedupe(LaneCase):
                          [path for method, path, _ in self.api.calls
                           if method == "GET"])
 
+    def test_a_lane_that_says_dedupe_songs_false_is_left_alone(self):
+        """`dedupe` never read the key, so it chewed the three lanes that set it false.
+
+        A re-stream and a Short of the same song are not duplicates in a
+        window-bounded lane, which is the whole reason they set it.
+        """
+        self.dedupe({"music": [entry("aaaaaaaaaaa", title="Artist - Song")],
+                     "subs-live": [entry("bbbbbbbbbbb", title="Artist - Song")]})
+        self.assertEqual([], self.api.removed())
+        self.assertTrue(self.logged("dedupe_songs: false, left alone"))
+
+    def test_an_opted_out_lane_cannot_take_the_song_off_a_lane_that_opted_in(self):
+        """Earlier in the file used to win, so an opted-out lane emptied the one after it."""
+        self.dedupe({"subs-live": [entry("aaaaaaaaaaa", title="Artist - Song")],
+                     "music": [entry("bbbbbbbbbbb", title="Artist - Song")]})
+        self.assertEqual([], self.api.removed())
+
+    def test_an_opted_out_lane_is_not_even_read_over_the_api(self):
+        self.dedupe({"music": [entry("aaaaaaaaaaa", title="Artist - Song")],
+                     "subs-live": [entry("bbbbbbbbbbb", title="Artist - Song")]})
+        self.assertEqual(["/api/v1/auth/playlists/PL-music"],
+                         [path for method, path, _ in self.api.calls
+                          if method == "GET"])
+
+    def test_an_override_can_opt_a_lane_out_for_one_account(self):
+        """`dedupe_songs` is a key an override may move, so the skip list has to see it.
+
+        It read the global lane block, so an account that opted out in
+        `overrides:` still had videos deleted -- and a 365-day cooldown row
+        written -- while the nightly run honoured the same override.
+        """
+        self.dedupe({"music": [
+            entry("aaaaaaaaaaa", title="Artist - Song"),
+            entry("bbbbbbbbbbb", title="Artist - Song (Official Video)")]},
+            overrides={"music": {"dedupe_songs": False}})
+        self.assertEqual([], self.api.removed())
+        self.assertTrue(self.logged("dedupe_songs: false, left alone"))
+
+    def test_an_override_can_opt_a_lane_back_in(self):
+        """The mirror case: a lane the file opted out of, deduped for one account."""
+        self.dedupe({"subs-live": [
+            entry("aaaaaaaaaaa", title="Artist - Song"),
+            entry("bbbbbbbbbbb", title="Artist - Song (Official Video)")]},
+            overrides={"subs-live": {"dedupe_songs": True}})
+        self.assertEqual(1, len(self.api.removed()))
+        self.assertFalse(self.logged("dedupe_songs: false, left alone"))
+
     def test_a_dry_run_removes_nothing(self):
         self.dedupe({"music": [
             entry("aaaaaaaaaaa", title="Artist - Song"),
@@ -876,9 +952,205 @@ class Dedupe(LaneCase):
         self.assertEqual([], self.db.written)
 
 
+class StaleSongKeys(unittest.TestCase):
+    """An opted-out lane must stop suppressing candidates through rows `dedupe` left.
+
+    The fill never writes a song key for a lane with `dedupe_songs: false`, but
+    `dedupe` used to stamp one on every keeper it saw, and the cross-lane
+    suppression in `choose_candidates` reads any non-empty key regardless of the
+    lane it came from. Not writing new ones does not clear the old ones.
+    """
+
+    LANES = [{"id": "suggested", "dedupe_songs": True},
+             {"id": "subs-top48", "dedupe_songs": False},
+             {"id": "subs-live", "dedupe_songs": False}]
+
+    def setUp(self):
+        self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+        self.mod.log = lambda line: None
+        self.written = []
+        self.mod.execute = self.written.append
+
+    def clears(self, lanes=None):
+        self.mod.forget_the_song_keys_of_the_opted_out_lanes(
+            self.LANES if lanes is None else lanes)
+        return [sql for sql in self.written if "SET song_key=NULL" in sql]
+
+    def test_it_clears_every_opted_out_lane_in_one_statement(self):
+        sql = self.clears()
+        self.assertEqual(1, len(sql))
+        self.assertIn("AND lane IN ('subs-top48', 'subs-live')", sql[0],
+                      "IN, not NOT IN: the wrong direction wipes the keys of "
+                      "every lane that does dedupe songs")
+
+    def test_it_leaves_the_lanes_that_dedupe_songs_alone(self):
+        self.assertNotIn("suggested", self.clears()[0])
+
+    def test_it_touches_this_account_and_nobody_else(self):
+        self.assertIn("account='%s'" % ME, self.clears()[0])
+
+    def test_an_account_with_no_opted_out_lane_writes_nothing(self):
+        self.assertEqual([], self.clears(lanes=[self.LANES[0]]))
+
+    def test_it_runs_once_before_the_first_lane_not_at_each_lane_s_turn(self):
+        """A lane's fill reads every OTHER lane's keys, so clearing at each turn is a night late.
+
+        The opted-out lanes sit at 5, 7 and 8 in lanes.yml, behind four lanes
+        that read cross-lane song keys -- and `run --lane suggested` would never
+        have reached them at all.
+        """
+        text = source()
+        account = text.split("def run_account(")[1].split("\ndef ")[0]
+        self.assertIn("forget_the_song_keys_of_the_opted_out_lanes(lanes)",
+                      account)
+        self.assertNotIn("forget_the_song_keys",
+                         text.split("def run_one_lane(")[1].split("\ndef ")[0])
+
+
+class ARunRowThatCannotBeWritten(unittest.TestCase):
+    """A lane that ran must not lose the account its remaining lanes over bookkeeping.
+
+    `run_account`'s INSERT into suggest.runs sat outside every handler, so one
+    psql failure ended the account right there -- with `home-mix` and both
+    public feeds still to rebuild, and nothing in the log to say why they had
+    not been.
+    """
+
+    LANES = [{"id": "subs-top48", "policy": "refill", "min_watched": 0,
+              "dedupe_songs": True},
+             {"id": "home-mix", "policy": "mix", "min_watched": 0,
+              "dedupe_songs": True},
+             {"id": "popular", "policy": "consensus", "min_watched": 0,
+              "dedupe_songs": True}]
+
+    def setUp(self):
+        self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+        self.said = []
+        self.ran = []
+        self.mod.log = self.said.append
+        self.mod.load_users = lambda: [self.user()]
+        self.mod.serve_account = lambda email: None
+        self.mod.read_user = lambda: ([], set())
+        self.mod.read_blocked = lambda: {}
+        self.mod.watch_count = lambda email: 900
+        self.mod.query = lambda sql: []
+        self.mod.execute = self.refuse_to_write
+        self.mod.run_one_lane = self.run_one_lane
+
+    def run_one_lane(self, lane, run):
+        self.ran.append(lane["id"])
+        return (0, 1, 0, 0), None
+
+    def refuse_to_write(self, sql):
+        raise RuntimeError("psql failed: connection closed")
+
+    def user(self):
+        return {"email": ME, "named": True, "lanes": "all", "overrides": {}}
+
+    def fill(self):
+        return self.mod.run_account(self.user(), self.LANES, Fetch(), None,
+                                    Args())
+
+    def test_every_lane_still_runs(self):
+        self.fill()
+        self.assertEqual([lane["id"] for lane in self.LANES], self.ran)
+
+    def test_the_lost_row_is_said_out_loud_for_each_lane(self):
+        self.fill()
+        warned = [line for line in self.said
+                  if "run row was not written" in line]
+        self.assertEqual(len(self.LANES), len(warned))
+
+    def test_a_lost_row_is_counted_as_a_failure_so_the_unit_is_not_green(self):
+        """The row is what the metrics and the account order read, so losing it is a failed run.
+
+        Swallowing it silently exited 0 with a green unit while every row for
+        the night was gone: `last_run_by_lane` keeps yesterday's values, so a
+        lane that failed reports no error, and `account_order` finds nothing and
+        serves the same account first every night.
+        """
+        self.assertEqual(len(self.LANES), self.fill())
+
+    def test_a_dry_run_never_reaches_the_write_at_all(self):
+        self.mod.run_account(self.user(), self.LANES, Fetch(), None,
+                             Args(dry_run=True))
+        self.assertEqual([lane["id"] for lane in self.LANES], self.ran)
+        self.assertEqual([], [line for line in self.said
+                              if "run row was not written" in line])
+
+
+class TheClearRunsForTheWholeAccount(unittest.TestCase):
+    """Once per account, before the first lane, and before --lane narrows anything."""
+
+    LANES = [{"id": "suggested", "policy": "refill", "min_watched": 0,
+              "dedupe_songs": True},
+             {"id": "subs-top48", "policy": "refill", "min_watched": 0,
+              "dedupe_songs": False},
+             {"id": "subs-live", "policy": "refill", "min_watched": 0,
+              "dedupe_songs": False}]
+
+    def setUp(self):
+        self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+        self.mod.log = lambda line: None
+        self.written = []
+        self.mod.execute = self.written.append
+        self.mod.query = lambda sql: []
+        self.mod.serve_account = lambda email: None
+        self.mod.read_user = lambda: ([], set())
+        self.mod.read_blocked = lambda: {}
+        self.mod.watch_count = lambda email: 900
+        self.mod.run_one_lane = self.run_one_lane
+
+    def run_one_lane(self, lane, run):
+        self.written.append("-- lane %s did its work" % lane["id"])
+        return (0, 1, 0, 0), None
+
+    def user(self):
+        return {"email": ME, "named": True, "lanes": "all", "overrides": {}}
+
+    def fill(self, **over):
+        self.mod.run_account(self.user(), self.LANES, Fetch(), None,
+                             Args(**over))
+        return self.written
+
+    def clearings(self, written):
+        return [sql for sql in written if "SET song_key=NULL" in sql]
+
+    def first(self, written, mark):
+        return next(i for i, sql in enumerate(written) if mark in sql)
+
+    def test_it_lands_before_any_lane_does_its_work(self):
+        written = self.fill()
+        self.assertLess(self.first(written, "SET song_key=NULL"),
+                        self.first(written, "did its work"))
+
+    def test_one_lane_asked_for_still_clears_every_opted_out_lane(self):
+        """`run --lane suggested` would otherwise never reach the lanes holding the stale keys."""
+        cleared = self.clearings(self.fill(lane="suggested"))
+        self.assertEqual(1, len(cleared))
+        self.assertIn("'subs-top48'", cleared[0])
+        self.assertIn("'subs-live'", cleared[0])
+
+    def test_a_dry_run_clears_nothing(self):
+        self.assertEqual([], self.clearings(self.fill(dry_run=True)))
+
+    def test_a_failure_clearing_them_costs_the_account_no_lane_at_all(self):
+        """The payoff is one more night of stale keys; the account's 15 lanes are not worth it."""
+        def raise_on_the_clear(sql):
+            if "SET song_key=NULL" in sql:
+                raise RuntimeError("psql failed: deadlock detected")
+            self.written.append(sql)
+        self.mod.execute = raise_on_the_clear
+        self.mod.run_account(self.user(), self.LANES, Fetch(), None, Args())
+        self.assertEqual([lane["id"] for lane in self.LANES],
+                         [sql.split()[2] for sql in self.written
+                          if "did its work" in sql])
+
+
 class Args:
-    def __init__(self, dry_run=False):
+    def __init__(self, dry_run=False, lane=None):
         self.dry_run = dry_run
+        self.lane = lane
 
 
 if __name__ == "__main__":

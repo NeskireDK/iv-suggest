@@ -127,9 +127,9 @@ sourced from `users: all` is the household feed. All three are in
 - **One timer, one budget.** The accounts are a loop inside one run, the fetch
   budget is divided rather than multiplied, and whoever succeeded least recently
   is served first, so an exhausted budget starves a different person each night.
-  A lane that spends nothing — `mix` and `consensus` read their sources over
-  SQL — runs whatever the budget did, so a heavy night still rebuilds the
-  compiled feeds.
+  Every lane still runs whatever the budget did — `mix` and `consensus` read
+  their sources over SQL and never wanted a fetch, so a heavy night still
+  rebuilds the feeds.
   The metadata cache is shared, so overlapping taste is nearly free.
 
 ## Blocking a channel

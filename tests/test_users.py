@@ -7,6 +7,7 @@ dozen playlists the bot made in your account is a bad first impression.
 
 import os
 import re
+import sys
 import tempfile
 import unittest
 
@@ -223,17 +224,24 @@ class Args:
 
 
 class ASpentBudget(unittest.TestCase):
-    """What a run still does for an account whose fetch budget is gone.
+    """Every lane still runs for an account whose fetch budget is gone.
 
-    It used to stop at the lane that overspent. The lanes after it that cost
-    nothing -- a mix, and now the public feeds -- were skipped with it, so a
-    heavy night left what visitors see un-rebuilt and nothing looked wrong.
+    A lane that cannot fetch is not a lane that cannot work: every fetcher call
+    site inside a lane catches BudgetSpent and carries on with what it found, so
+    the lane still rebuilds from the metadata cache. `run_account` used to try
+    to be clever about which lanes to skip, and it could only get that wrong --
+    `subs-top48` and its two siblings spend no fetches at all, and a skip took
+    their whole night with the public feeds' biggest source.
     """
 
-    LANES = [{"id": "suggested", "policy": "refill", "min_watched": 0},
-             {"id": "fresh-uploads", "policy": "refill", "min_watched": 0},
-             {"id": "popular", "policy": "consensus", "min_watched": 0},
-             {"id": "home-mix", "policy": "mix", "min_watched": 0}]
+    LANES = [{"id": "suggested", "policy": "refill", "min_watched": 0,
+              "dedupe_songs": True},
+             {"id": "subs-top48", "policy": "refill", "min_watched": 0,
+              "dedupe_songs": False},
+             {"id": "popular", "policy": "consensus", "min_watched": 0,
+              "dedupe_songs": True},
+             {"id": "home-mix", "policy": "mix", "min_watched": 0,
+              "dedupe_songs": True}]
 
     def setUp(self):
         self.mod = load(IV_SUGGEST_ACCOUNT=ME)
@@ -261,21 +269,250 @@ class ASpentBudget(unittest.TestCase):
         return self.mod.run_account(
             self.user(), self.LANES, Spent(), None, Args())
 
-    def test_a_lane_that_would_spend_a_fetch_is_skipped(self):
+    def test_the_lanes_after_the_overspending_one_still_run(self):
         self.fill()
-        self.assertNotIn("fresh-uploads", self.ran)
+        self.assertEqual([lane["id"] for lane in self.LANES], self.ran)
 
-    def test_a_lane_compiled_from_other_lanes_still_runs(self):
-        self.fill()
-        self.assertEqual(["suggested", "popular", "home-mix"], self.ran)
-
-    def test_only_the_lanes_that_ran_record_a_run_row(self):
+    def test_every_lane_records_a_run_row(self):
         self.fill()
         rows = [sql for sql in self.written if "INSERT INTO suggest.runs" in sql]
-        self.assertEqual(3, len(rows))
+        self.assertEqual(len(self.LANES), len(rows))
 
     def test_the_overspending_lane_is_still_counted_as_a_failure(self):
         self.assertEqual(1, self.fill())
+
+
+class Size(ConfigCase):
+    """`size` is what caps a lane, so a value that is not a number is a config error.
+
+    A `size:` with nothing after it parses as None. The consensus draw sliced
+    `[:None]`, which is the whole weighted union rather than a lane's worth, and
+    the guard that refuses to publish an empty rebuild read None as "asked for
+    empty" and stopped guarding. Both were reachable on a public playlist.
+    """
+
+    LANES = """
+lanes:
+  - id: popular
+    title: Popular
+    policy: consensus
+    size:%s
+"""
+
+    def refused(self, size):
+        mod = self.loaded(self.LANES % size)
+        with self.assertRaises(SystemExit) as caught:
+            mod.load_config()
+        return str(caught.exception)
+
+    def test_a_size_with_no_value_is_refused(self):
+        self.assertIn("size must be a whole number", self.refused(""))
+
+    def test_the_message_names_the_lane(self):
+        self.assertIn("popular", self.refused(""))
+
+    def test_a_negative_size_is_refused(self):
+        self.assertIn("size must be a whole number", self.refused(" -1"))
+
+    def test_a_size_that_is_not_a_number_is_refused(self):
+        self.assertIn("size must be a whole number", self.refused(" lots"))
+
+    def test_true_is_not_a_size_however_much_python_thinks_it_is_one(self):
+        self.assertIn("size must be a whole number", self.refused(" true"))
+
+    def test_a_lane_asked_to_hold_nothing_is_still_allowed(self):
+        mod = self.loaded(self.LANES % " 0")
+        self.assertEqual(0, mod.load_config()[0]["size"])
+
+    def test_a_size_inherited_from_the_defaults_block_is_checked_too(self):
+        mod = self.loaded("""
+defaults:
+  size:
+lanes:
+  - id: suggested
+    title: Suggested
+""")
+        with self.assertRaises(SystemExit) as caught:
+            mod.load_config()
+        self.assertIn("size must be a whole number", str(caught.exception))
+
+    def test_an_override_with_no_value_is_refused_at_config_load(self):
+        mod = self.loaded("""
+lanes:
+  - id: suggested
+    title: Suggested
+    size: 30
+users:
+  - email: %s
+    overrides:
+      suggested:
+        size:
+""" % ME)
+        with self.assertRaises(SystemExit) as caught:
+            mod.load_users()
+        message = str(caught.exception)
+        self.assertIn("size must be a whole number", message)
+        self.assertIn("suggested", message)
+        self.assertIn(ME, message)
+
+
+def switch_settings(defaults, path=()):
+    """Every true/false setting in a defaults tree, as the key path that reaches it."""
+    for key, default in sorted(defaults.items()):
+        if isinstance(default, bool):
+            yield path + (key,)
+        elif isinstance(default, dict):
+            for found in switch_settings(default, path + (key,)):
+                yield found
+
+
+def blank_setting(path):
+    """A lane block spelling one nested setting with nothing after its colon."""
+    return "\n".join("%s%s:" % ("    " + "  " * depth, key)
+                      for depth, key in enumerate(path))
+
+
+class Switches(ConfigCase):
+    """A true/false lane key with nothing after it is a config error, not a false.
+
+    Same family as `size`: `dedupe_songs:` parsed as None, every reader took
+    that for false, and `dedupe` quietly became a no-op for every lane.
+    """
+
+    def refused(self, block):
+        mod = self.loaded("""
+lanes:
+  - id: suggested
+    title: Suggested
+%s
+""" % block)
+        with self.assertRaises(SystemExit) as caught:
+            mod.load_config()
+        return str(caught.exception)
+
+    def test_a_switch_with_no_value_is_refused(self):
+        self.assertIn("dedupe_songs must be true or false",
+                      self.refused("    dedupe_songs:"))
+
+    def test_every_switch_setting_is_refused_when_blank_not_just_the_one_that_bit(self):
+        """Derived from SWITCH_DEFAULTS, so a new true/false setting is covered by adding it."""
+        for path in switch_settings(self.loaded("lanes: []\n").SWITCH_DEFAULTS):
+            self.assertIn("%s must be true or false" % path[-1],
+                          self.refused(blank_setting(path)))
+
+    def test_a_blank_shuffle_switch_is_refused_inside_its_block(self):
+        """The one that was still open: a blank `enabled:` stopped a lane reordering, silently."""
+        self.assertIn("enabled must be true or false",
+                      self.refused("    shuffle:\n      enabled:"))
+
+    def test_a_block_given_a_bare_value_is_refused(self):
+        self.assertIn("shuffle must be a block of keys",
+                      self.refused("    shuffle: false"))
+
+    def test_a_switch_inherited_from_the_defaults_block_is_checked_too(self):
+        mod = self.loaded("""
+defaults:
+  dedupe_songs:
+lanes:
+  - id: suggested
+    title: Suggested
+""")
+        with self.assertRaises(SystemExit) as caught:
+            mod.load_config()
+        self.assertIn("dedupe_songs must be true or false", str(caught.exception))
+
+    def test_a_switch_set_to_a_word_is_refused(self):
+        self.assertIn("exclude_watched must be true or false",
+                      self.refused("    exclude_watched: yes please"))
+
+    def test_off_is_still_off(self):
+        mod = self.loaded("""
+lanes:
+  - id: suggested
+    title: Suggested
+    dedupe_songs: false
+""")
+        self.assertIs(False, mod.load_config()[0]["dedupe_songs"])
+
+    def test_an_override_with_no_value_is_refused_too(self):
+        mod = self.loaded("""
+lanes:
+  - id: suggested
+    title: Suggested
+users:
+  - email: %s
+    overrides:
+      suggested:
+        dedupe_songs:
+""" % ME)
+        with self.assertRaises(SystemExit) as caught:
+            mod.load_users()
+        self.assertIn("dedupe_songs must be true or false",
+                      str(caught.exception))
+
+
+class OneBadAccount(unittest.TestCase):
+    """A `users:` entry Invidious does not know must cost only itself.
+
+    `open_session` used to sys.exit, so one typo'd email took down every
+    account ordered after it, and the run said nothing about the ones it never
+    reached.
+    """
+
+    LANES = [{"id": "suggested", "title": "Suggested", "policy": "refill",
+              "size": 30, "min_watched": 0, "dedupe_songs": True}]
+    TYPO = "andr@example.com"
+
+    def setUp(self):
+        self.lines = []
+        self.filled = []
+        self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+        self.mod.log = self.lines.append
+        self.mod.load_config = lambda: self.LANES
+        self.mod.read_config = lambda: {"lanes": self.LANES}
+        self.mod.load_users = lambda: [self.user(self.TYPO), self.user(ME)]
+        self.mod.account_order = lambda users: users
+        self.mod.session_of = lambda email: ""
+        self.mod.one = lambda sql: "" if self.mod.lit(self.TYPO) in sql else "1"
+        self.mod.query = lambda sql: []
+        self.mod.execute = lambda sql: None
+        self.mod.read_user = lambda: ([], set())
+        self.mod.read_blocked = lambda: {}
+        self.mod.watch_count = lambda email: 900
+        self.mod.run_one_lane = self.run_one_lane
+
+    def run_one_lane(self, lane, run):
+        self.filled.append(self.mod.ACCOUNT)
+        return (0, 1, 0, 0), None
+
+    def user(self, email):
+        return {"email": email, "named": True, "lanes": "all", "overrides": {}}
+
+    def fill(self):
+        return self.mod.cmd_run(Args(account=None, seeds=0, rate=600,
+                                     budget=320))
+
+    def test_the_accounts_after_the_bad_one_are_still_filled(self):
+        self.fill()
+        self.assertEqual([ME], self.filled)
+
+    def test_the_run_names_the_account_it_could_not_serve(self):
+        self.fill()
+        named = [line for line in self.lines if self.TYPO in line]
+        self.assertTrue(named, "the skipped account has to be named: %r" % self.lines)
+
+    def test_the_run_still_reports_failure(self):
+        self.assertEqual(1, self.fill())
+
+    def test_a_command_without_a_per_account_handler_exits_rather_than_traces(self):
+        """Only `run` recovers per account; main() turns the rest into a clean exit."""
+        self.mod.accounts_wanted = lambda args: [self.user(self.TYPO)]
+        argv = sys.argv
+        sys.argv = ["iv-suggest", "dedupe"]
+        self.addCleanup(setattr, sys, "argv", argv)
+        with self.assertRaises(SystemExit) as caught:
+            self.mod.main()
+        self.assertIn(self.TYPO, str(caught.exception))
 
 
 class Budget(unittest.TestCase):

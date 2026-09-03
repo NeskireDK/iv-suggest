@@ -94,8 +94,8 @@ def use_account(email):
 def serve_account(email):
     """Point at this account and guarantee the session its API calls need."""
     global ACCOUNT, SESSION
-    ACCOUNT = email
-    SESSION = open_session(email)
+    session = open_session(email)
+    ACCOUNT, SESSION = email, session
 
 
 def acct():
@@ -150,6 +150,11 @@ RATE_PER_MIN = 20
 MAX_FETCHES = 320
 DAYS_BEFORE_RETRYING_A_BROKEN_VIDEO = 30
 MAX_CONSECUTIVE_FAILS = 5
+# Lanes that gave up with nothing answering in between. Past this a lane gives
+# up on its first failure instead of its fifth, which is what keeps a dead
+# upstream cheap: measured over a night of 22 lanes, 27 calls and 2 minutes of
+# backoff rather than 110 calls and 20 minutes, against TimeoutStartSec=2700.
+MAX_LANE_ABORTS = 3
 STORED_SCORE_DECIMALS = 4   # suggest.items.score is rounded to this before it is written
 DRY_SEEDS = 10          # a dry run uses few seeds; the nightly run uses the config
 
@@ -441,12 +446,13 @@ def session_of(email):
 
 
 def open_session(email):
-    """Give the bot a login for an account, once, and return the session id."""
+    """Give the bot a login for an account, once, and return the session id.
+    An unregistered email raises rather than exits, so one bad `users:` entry costs only itself."""
     sid = session_of(email)
     if sid:
         return sid
     if not one("SELECT 1 FROM users WHERE email=%s;" % lit(email)):
-        sys.exit("no Invidious account %s (the value in users.email)" % email)
+        raise Aborted("no Invidious account %s (the value in users.email)" % email)
     sid = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode()
     execute("INSERT INTO session_ids(id,email,issued) VALUES (%s,%s,now()); "
             "INSERT INTO suggest.accounts(account,sid) VALUES (%s,%s) "
@@ -500,6 +506,7 @@ class Fetcher:
         self.cache_hits = 0
         self.last = 0.0
         self.fails = 0
+        self.aborts = 0
         self.skipped_500 = 0
         self.dead_hits = 0
         self.lane_cap = None
@@ -514,7 +521,8 @@ class Fetcher:
         self.last = time.monotonic()
 
     def begin_lane(self, cap):
-        self.lane_cap, self.lane_used = cap, 0
+        """Start a lane's share of the run: its own fetch cap, and its own run of bad luck."""
+        self.lane_cap, self.lane_used, self.fails = cap, 0, 0
 
     def _spend_one_fetch(self):
         """Charge one call upstream to the run budget and to the lane's share of it."""
@@ -540,7 +548,7 @@ class Fetcher:
             try:
                 data = api("GET", "/api/v1/videos/" + vid)
                 self._spend_one_fetch()
-                self.fails = 0
+                self._upstream_answered()
                 if data and not data.get("error"):
                     self._remember(vid, data)
                     return data
@@ -549,11 +557,11 @@ class Fetcher:
             except urllib.error.HTTPError as e:
                 self._spend_one_fetch()
                 if e.code in (404, 410):
-                    self.fails = 0
+                    self._upstream_answered()
                     self.bury(vid, 365, "http %d" % e.code)
                     return None
                 if self._only_this_request_is_broken(e):
-                    self.fails = 0
+                    self._upstream_answered()
                     self.skipped_500 += 1
                     self.bury(vid, DAYS_BEFORE_RETRYING_A_BROKEN_VIDEO,
                               "upstream 500")
@@ -589,15 +597,15 @@ class Fetcher:
             try:
                 data = api("GET", "/api/v1/channels/%s/latest" % ucid)
                 self._spend_one_fetch()
-                self.fails = 0
+                self._upstream_answered()
                 return data
             except urllib.error.HTTPError as e:
                 self._spend_one_fetch()
                 if e.code in (404, 410):
-                    self.fails = 0
+                    self._upstream_answered()
                     return None
                 if self._only_this_request_is_broken(e):
-                    self.fails = 0
+                    self._upstream_answered()
                     log("  skipping channel %s (upstream %d)" % (ucid, e.code))
                     return None
                 self._trouble(e, delay)
@@ -614,11 +622,32 @@ class Fetcher:
         except Exception:
             return False
 
+    def _give_up_on_the_lane(self, reason):
+        """Abort the lane, and hand the next one a clean run of bad luck to spend."""
+        self.fails = 0
+        self.aborts += 1
+        raise Aborted(reason)
+
+    def _upstream_answered(self):
+        """Note a coherent answer, which is what makes the give-up counters start over."""
+        self.fails = 0
+        self.aborts = 0
+
+    def _upstream_looks_down(self):
+        """True once enough lanes have given up that the next one need not prove it again."""
+        return self.aborts >= MAX_LANE_ABORTS
+
     def _trouble(self, err, delay):
+        """Back off after a failed fetch, giving up on the lane once they stop being isolated."""
         self.fails += 1
         log("  fetch problem (%s), backing off %.0fs" % (err, delay))
+        if self._upstream_looks_down():
+            self._give_up_on_the_lane(
+                "%d lanes gave up before this one, so upstream is the problem "
+                "and one failure is enough" % self.aborts)
         if self.fails >= MAX_CONSECUTIVE_FAILS:
-            raise Aborted("%d consecutive fetch failures" % self.fails)
+            self._give_up_on_the_lane(
+                "%d consecutive fetch failures" % self.fails)
         time.sleep(min(delay, 120))
 
     def _remember(self, vid, data):
@@ -742,6 +771,8 @@ def load_config():
     lanes = []
     for raw in cfg.get("lanes") or []:
         lane = merge_lane(defaults, raw)
+        refuse_a_lane_key_that_cannot_mean_what_it_must(
+            "lane %r in %s" % (lane.get("id"), CONFIG), lane)
         lane["ignored"] = ignored_keys(lane["policy"], raw)
         lanes.append(lane)
     _CONFIG_CACHE["lanes"] = lanes
@@ -812,8 +843,53 @@ def watch_count(email):
     return _WATCH_COUNTS[email]
 
 
+SWITCH_DEFAULTS = dict(DEFAULTS, shuffle=SHUFFLE_DEFAULTS)
+
+
+def refuse_a_size_that_is_not_a_cap(where, block):
+    """Exit on a `size` that would publish an unbounded playlist rather than a lane's worth."""
+    if "size" not in block:
+        return
+    size = block["size"]
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        sys.exit("%s: size must be a whole number of videos, not %r. A `size:` "
+                 "with nothing after it reads as no value at all, which would "
+                 "publish every candidate rather than a lane's worth."
+                 % (where, size))
+
+
+def refuse_a_switch_that_is_not_on_or_off(where, key, value):
+    """Exit on a true/false lane key holding something else, which a blank `key:` does."""
+    if not isinstance(value, bool):
+        sys.exit("%s: %s must be true or false, not %r. A `%s:` with nothing "
+                 "after it reads as no value at all, and every reader of it "
+                 "takes that for false." % (where, key, value, key))
+
+
+def refuse_a_block_that_is_not_a_block(where, key, value):
+    """Exit on a lane key that holds a group of settings being given a bare value."""
+    if not isinstance(value, dict):
+        sys.exit("%s: %s must be a block of keys, not %r" % (where, key, value))
+
+
+def refuse_a_lane_key_that_cannot_mean_what_it_must(where, block,
+                                                    defaults=SWITCH_DEFAULTS):
+    """Exit on a lane or override value that would run but not do what its key says.
+    Walks the merged blocks: a blank `shuffle.enabled:` used to stop a lane reordering."""
+    for key, default in sorted(defaults.items()):
+        if key not in block:
+            continue
+        if isinstance(default, bool):
+            refuse_a_switch_that_is_not_on_or_off(where, key, block[key])
+        elif isinstance(default, dict):
+            refuse_a_block_that_is_not_a_block(where, key, block[key])
+            refuse_a_lane_key_that_cannot_mean_what_it_must(
+                "%s, %s" % (where, key), block[key], default)
+    refuse_a_size_that_is_not_a_cap(where, block)
+
+
 def checked_overrides(email, overrides):
-    """One account's override block, refusing the two shapes that would not survive a merge."""
+    """One account's override block, refusing the shapes that would not survive a merge."""
     for lane_id, patch in (overrides or {}).items():
         if not isinstance(patch, dict):
             sys.exit("%s: override of lane %r in %s must be a block of keys"
@@ -823,6 +899,8 @@ def checked_overrides(email, overrides):
                      "what a lane IS, not a per-account setting: give the "
                      "account a lane of its own instead."
                      % (email, lane_id, CONFIG))
+        refuse_a_lane_key_that_cannot_mean_what_it_must(
+            "%s: override of lane %r in %s" % (email, lane_id, CONFIG), patch)
     return overrides or {}
 
 
@@ -919,14 +997,19 @@ def without_the_compiled_lanes_somebody_else_holds(user, lanes):
             or holds_the_instance_copy(user, lane["id"])]
 
 
+def with_this_accounts_overrides(user, lanes):
+    """Each lane as this account has it, its `overrides:` block applied."""
+    overrides = user.get("overrides") or {}
+    return [overridden_lane(lane, overrides[lane["id"]])
+            if lane["id"] in overrides else lane for lane in lanes]
+
+
 def lanes_for(user, lanes, watched=None):
     """The lanes one account gets, in lanes.yml order, with its overrides applied.
     Pass `watched` to also drop the lanes it has too little history to fill."""
-    lanes = without_the_compiled_lanes_somebody_else_holds(
-        user, lanes_asked_for(user, lanes))
-    overrides = user.get("overrides") or {}
-    lanes = [overridden_lane(lane, overrides[lane["id"]])
-             if lane["id"] in overrides else lane for lane in lanes]
+    lanes = with_this_accounts_overrides(
+        user, without_the_compiled_lanes_somebody_else_holds(
+            user, lanes_asked_for(user, lanes)))
     if watched is None:
         return lanes
     return [lane for lane in lanes if watched >= lane["min_watched"]]
@@ -1091,6 +1174,14 @@ def retire_item(lane_id, plid, video, cooldown_days=0, reason=""):
             "DO UPDATE SET until=EXCLUDED.until, reason=EXCLUDED.reason;"
             % (acct(), lit(lane_id), lit(video["videoId"]), cooldown_days,
                lit(reason)))
+
+
+def song_key_to_store(lane, meta):
+    """The song key a lane's row should carry: none at all when the lane does not dedupe songs.
+    A stored key suppresses candidates in every OTHER lane, whatever this lane asked for."""
+    if not lane["dedupe_songs"]:
+        return ""
+    return song_key(meta.get("title"), meta.get("author"))
 
 
 def add_to_lane(lane_id, plid, vid, score, song, fetcher):
@@ -1496,7 +1587,7 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
         if cap and author and per_channel.get(author, 0) >= cap:
             rejected["channel_cap"] += 1
             continue
-        skey = song_key(meta.get("title"), meta.get("author")) if lane["dedupe_songs"] else ""
+        skey = song_key_to_store(lane, meta)
         if skey and skey in songs:
             rejected["same_song"] += 1
             continue
@@ -1639,7 +1730,7 @@ def run_lane_last_played(lane, run):
             continue
         if not add_to_lane(lane_id, plid, vid,
                            played_score(decay, desired.index(vid)),
-                           song_key(meta.get("title"), meta.get("author")),
+                           song_key_to_store(lane, meta),
                            run.fetcher):
             refused += 1
     kept = len(current) - len(to_drop)
@@ -1937,6 +2028,17 @@ def costs_no_fetch(lane):
     return lane["policy"] in COMPILED_POLICIES
 
 
+def forget_the_song_keys_of_the_opted_out_lanes(lanes):
+    """Clear keys an earlier `dedupe` stamped on lanes that opted out, so no lane reads them.
+    Every lane's fill reads every other lane's keys, so this has to precede the first of them."""
+    opted_out = [lane["id"] for lane in lanes if not lane["dedupe_songs"]]
+    if not opted_out:
+        return
+    execute("UPDATE suggest.items SET song_key=NULL WHERE account=%s "
+            "AND lane IN (%s) AND coalesce(song_key,'') <> '';"
+            % (acct(), ", ".join(lit(lane_id) for lane_id in opted_out)))
+
+
 def run_one_lane(lane, run):
     """One lane's (removed, added, kept, fetches), and its error if it had one.
     A lane that raises is recorded and never stops the account's other lanes."""
@@ -1956,11 +2058,33 @@ def run_one_lane(lane, run):
         return (0, 0, 0, 0), repr(e)
 
 
+def record_the_lane_run(lane_id, counts, error):
+    """Write one lane's row in suggest.runs. False when it could not be written.
+    The row is what the metrics and the account order read, so a lost one is a failed run."""
+    removed, added, kept, used = counts
+    try:
+        execute("INSERT INTO suggest.runs"
+                "(account,lane,added,removed,kept,fetches,error) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s);"
+                % (acct(), lit(lane_id), added, removed, kept, used, lit(error)))
+        return True
+    except Exception as e:
+        log("  WARNING: lane %s ran but its run row was not written: %r"
+            % (lane_id, e))
+        return False
+
+
 def run_account(user, all_lanes, fetcher, seed_override, args):
     """One account's lanes. Returns how many of them failed."""
     serve_account(user["email"])
     watched, subs = read_user()
     lanes = lanes_for(user, all_lanes, len(watched))
+    if not args.dry_run:
+        try:
+            forget_the_song_keys_of_the_opted_out_lanes(lanes)
+        except Exception as e:
+            log("  WARNING: could not clear the stale song keys, so an "
+                "opted-out lane may still suppress candidates tonight: %r" % e)
     held_back = [l["id"] for l in lanes_for(user, all_lanes)
                  if l["id"] not in {k["id"] for k in lanes}]
     if args.lane:
@@ -1976,23 +2100,11 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
     if run.blocked:
         log("blocked: %s" % ", ".join(sorted(run.blocked.values())))
     failed = 0
-    out_of_budget = False
     for lane in lanes:
-        if out_of_budget and not costs_no_fetch(lane):
-            continue
-        (removed, added, kept, used), error = run_one_lane(lane, run)
-        if error:
+        counts, error = run_one_lane(lane, run)
+        recorded = args.dry_run or record_the_lane_run(lane["id"], counts, error)
+        if error or not recorded:
             failed += 1
-        if not args.dry_run:
-            execute("INSERT INTO suggest.runs"
-                    "(account,lane,added,removed,kept,fetches,error) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s);"
-                    % (acct(), lit(lane["id"]), added, removed, kept, used,
-                       lit(error)))
-        if not out_of_budget and error and "budget" in error:
-            out_of_budget = True
-            log("fetch budget spent, skipping %s's remaining lanes that would "
-                "spend one" % ACCOUNT)
     return failed
 
 
@@ -2001,23 +2113,37 @@ def cmd_dedupe(args):
     for user in accounts_wanted(args):
         serve_account(user["email"])
         log("account %s" % user["email"])
-        dedupe_account(args)
+        dedupe_account(user, args)
     return 0
 
 
 Upload = namedtuple("Upload", "song quality lane_rank title_len lane plid video")
 
 
-def dedupe_account(args):
-    """One account's duplicates. The keeper wins on upload_quality first, lane order second."""
-    all_lanes = load_config()
+def why_dedupe_leaves_a_lane_alone(lane):
+    """Why `dedupe` must not touch this lane, or an empty string when it may."""
+    if costs_no_fetch(lane):
+        return "compiled from other lanes"
+    if not lane["dedupe_songs"]:
+        return "dedupe_songs: false"
+    return ""
+
+
+def dedupe_account(user, args):
+    """One account's duplicates. The keeper wins on upload_quality first, lane order second.
+    Reads the lanes as this account has them: `dedupe_songs` is a key an override may move."""
+    all_lanes = with_this_accounts_overrides(user, load_config())
     order = {lane["id"]: i for i, lane in enumerate(all_lanes)}
-    compiled = {lane["id"] for lane in all_lanes if costs_no_fetch(lane)}
+    left_alone = {}
+    for lane in all_lanes:
+        why = why_dedupe_leaves_a_lane_alone(lane)
+        if why:
+            left_alone[lane["id"]] = why
     entries = []
     for lane_id, plid in query("SELECT lane, plid FROM suggest.lanes "
                                "WHERE account=%s;" % acct()):
-        if lane_id in compiled:
-            log("lane %-16s compiled from other lanes, left alone" % lane_id)
+        if lane_id in left_alone:
+            log("lane %-16s %s, left alone" % (lane_id, left_alone[lane_id]))
             continue
         playlist = api("GET", "/api/v1/auth/playlists/" + plid)
         videos = playlist.get("videos") or []
@@ -2614,9 +2740,13 @@ def main():
     s.add_argument("--lane")
     s.add_argument("--account", help="reorder only this account")
     args = p.parse_args()
-    return {"init": cmd_init, "run": cmd_run, "status": cmd_status,
-            "metrics": cmd_metrics, "dedupe": cmd_dedupe,
-            "views": cmd_views, "shuffle": cmd_shuffle}[args.cmd](args)
+    command = {"init": cmd_init, "run": cmd_run, "status": cmd_status,
+               "metrics": cmd_metrics, "dedupe": cmd_dedupe,
+               "views": cmd_views, "shuffle": cmd_shuffle}[args.cmd]
+    try:
+        return command(args)
+    except Aborted as e:
+        sys.exit(str(e))
 
 
 if __name__ == "__main__":

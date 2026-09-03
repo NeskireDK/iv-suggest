@@ -210,5 +210,181 @@ class ChannelListingRetries(BudgetCase):
                 fetch.channel_latest(ucid)
 
 
+class AbortsAreCountedPerLane(BudgetCase):
+    """An abort must not leave the counter primed for whatever runs next.
+
+    `fails` lives on the Fetcher, and the Fetcher lives for the whole run. It
+    stayed at MAX_CONSECUTIVE_FAILS after an abort, so the next lane's first
+    single failure aborted that lane too, and so on to the end of the night: a
+    two-minute wobble in one lane cost every lane after it.
+    """
+
+    def abort(self, fetch):
+        with self.assertRaises(self.mod.Aborted) as caught:
+            for ucid in ("UC-a", "UC-b"):
+                fetch.channel_latest(ucid)
+        self.assertNotIsInstance(caught.exception, self.mod.BudgetSpent,
+                                 "a refused fetch is not a lane giving up")
+        return caught.exception
+
+    def test_the_counter_is_clear_once_the_abort_is_raised(self):
+        fetch = self.fetcher(Upstream(*([RATE_LIMITED] * 5)), budget=20)
+        self.abort(fetch)
+        self.assertEqual(0, fetch.fails)
+
+    def test_the_abort_still_says_how_many_failures_it_took(self):
+        """The clear runs first, so the count has to come from the constant, not the counter."""
+        fetch = self.fetcher(Upstream(*([RATE_LIMITED] * 5)), budget=20)
+        self.assertEqual("%d consecutive fetch failures"
+                         % self.mod.MAX_CONSECUTIVE_FAILS,
+                         str(self.abort(fetch)))
+
+    def test_the_next_lane_survives_one_failure_of_its_own(self):
+        fetch = self.fetcher(
+            Upstream(*([RATE_LIMITED] * 6 + [LISTING])), budget=20)
+        self.abort(fetch)
+        fetch.begin_lane(None)
+        self.assertEqual(LISTING, fetch.channel_latest("UC-c"))
+
+    def test_a_video_fetch_after_an_abort_survives_one_failure_too(self):
+        fetch = self.fetcher(
+            Upstream(*([RATE_LIMITED] * 5 + [OUTAGE, VIDEO])), budget=20)
+        self.abort(fetch)
+        self.assertEqual(VIDEO, fetch.video("v0000000000"))
+
+    def test_a_second_abort_needs_a_fresh_run_of_failures(self):
+        upstream = Upstream(*([RATE_LIMITED] * 10))
+        fetch = self.fetcher(upstream, budget=30)
+        self.abort(fetch)
+        fetch.begin_lane(None)
+        self.assertIsNone(fetch.channel_latest("UC-c"))
+        with self.assertRaises(self.mod.Aborted):
+            fetch.channel_latest("UC-d")
+        self.assertEqual(10, len(upstream.asked),
+                         "5 failures to the first abort, then a whole fresh 5")
+
+
+class FailuresAreCountedPerLane(BudgetCase):
+    """A lane that ends WITHOUT aborting must not hand its unspent failures on.
+
+    Only the abort cleared the counter, and `begin_lane` cleared the fetch cap
+    and nothing else. So the ordinary case leaked: `fresh-uploads` meets a few
+    dud channel listings, returns None for each without ever aborting, and the
+    next fetching lane aborted on its first or second failure of its own --
+    after its sweep had already issued the playlist DELETEs. A cache hit does
+    not clear it either, so a zero-fetch lane in between changes nothing.
+    """
+
+    def dud_listings(self, fetch, how_many):
+        for attempt in range(how_many):
+            fetch.channel_latest("UC-dud")
+
+    def test_a_lane_that_never_aborted_leaves_no_failures_behind(self):
+        fetch = self.fetcher(Upstream(*([RATE_LIMITED] * 20)), budget=100)
+        self.dud_listings(fetch, 1)
+        self.assertEqual(3, fetch.fails, "three attempts, no abort")
+        fetch.begin_lane(None)
+        self.assertEqual(0, fetch.fails)
+
+    def test_the_next_lane_gets_its_own_five_failures_not_what_was_left(self):
+        fetch = self.fetcher(Upstream(*([RATE_LIMITED] * 6 + [LISTING])),
+                             budget=100)
+        self.dud_listings(fetch, 1)
+        fetch.begin_lane(None)
+        self.assertIsNone(fetch.channel_latest("UC-a"),
+                          "three failures of its own are not five")
+        self.assertEqual(3, fetch.fails)
+        self.assertEqual(LISTING, fetch.channel_latest("UC-b"))
+
+    def test_a_borrowed_failure_cannot_count_towards_the_outage_brake(self):
+        """Otherwise three lanes losing other lanes' bad luck put the run on one strike."""
+        fetch = self.fetcher(Upstream(*([RATE_LIMITED] * 40)), budget=200)
+        for lane in range(4):
+            fetch.begin_lane(None)
+            self.dud_listings(fetch, 1)
+        self.assertEqual(0, fetch.aborts)
+
+
+class ADeadUpstreamGetsCheap(BudgetCase):
+    """Clearing `fails` per lane must not cost the run its brake against a dead upstream.
+
+    With the clear and nothing else, every lane paid a fresh run of five
+    failures before giving up: 110 dead calls and 20 minutes of backoff over a
+    night of 22 lanes, against 26 calls and 2 minutes before it. `aborts` counts
+    the lanes that gave up with nothing answering in between, and past
+    MAX_LANE_ABORTS a lane gives up on its first failure. Nothing is skipped and
+    nothing is refused, so the first call that answers clears both counters and
+    full patience comes back on its own.
+    """
+
+    def give_up_a_lane(self, fetch, ucids=("UC-a", "UC-b")):
+        """One lane's worth of bad luck. Returns the abort, which must be the lane's own."""
+        fetch.begin_lane(None)
+        with self.assertRaises(self.mod.Aborted) as caught:
+            for ucid in ucids:
+                fetch.channel_latest(ucid)
+        self.assertNotIsInstance(caught.exception, self.mod.BudgetSpent,
+                                 "a refused fetch is not a lane giving up")
+        return caught.exception
+
+    def establish_the_outage(self, fetch):
+        for lane in range(self.mod.MAX_LANE_ABORTS):
+            self.give_up_a_lane(fetch)
+
+    def dead(self, budget=10 ** 6):
+        return self.fetcher(Upstream(*([RATE_LIMITED] * 400)), budget=budget)
+
+    def test_a_lane_after_the_outage_is_established_gives_up_on_one_failure(self):
+        fetch = self.dead()
+        self.establish_the_outage(fetch)
+        spent_before = fetch.fetches
+        self.give_up_a_lane(fetch, ucids=("UC-c",))
+        self.assertEqual(1, fetch.fetches - spent_before)
+
+    def test_a_dead_night_costs_what_it_used_to_rather_than_four_times_it(self):
+        fetch = self.dead()
+        self.establish_the_outage(fetch)
+        for lane in range(19):
+            self.give_up_a_lane(fetch, ucids=("UC-c",))
+        self.assertEqual(
+            self.mod.MAX_LANE_ABORTS * self.mod.MAX_CONSECUTIVE_FAILS + 19,
+            fetch.fetches,
+            "five calls each to establish the outage, then one call a lane")
+
+    def test_it_says_upstream_is_the_problem_rather_than_the_lane(self):
+        fetch = self.dead()
+        self.establish_the_outage(fetch)
+        self.assertIn("upstream is the problem",
+                      str(self.give_up_a_lane(fetch, ucids=("UC-c",))))
+
+    def test_no_lane_is_ever_refused_a_fetch_over_this(self):
+        """The brake makes lanes cheap, not skipped: a starved lane still rebuilds from cache."""
+        fetch = self.dead()
+        self.establish_the_outage(fetch)
+        for lane in range(5):
+            self.give_up_a_lane(fetch, ucids=("UC-c",))
+        self.assertLess(fetch.fetches, fetch.budget)
+
+    def test_a_lane_that_answers_gives_the_run_its_patience_back(self):
+        answers = ([RATE_LIMITED] * (self.mod.MAX_CONSECUTIVE_FAILS
+                                     * self.mod.MAX_LANE_ABORTS)
+                   + [LISTING] + [RATE_LIMITED] * 20)
+        fetch = self.fetcher(Upstream(*answers), budget=10 ** 6)
+        self.establish_the_outage(fetch)
+        fetch.begin_lane(None)
+        self.assertEqual(LISTING, fetch.channel_latest("UC-ok"))
+        self.assertEqual(0, fetch.aborts)
+        spent_before = fetch.fetches
+        self.give_up_a_lane(fetch)
+        self.assertEqual(self.mod.MAX_CONSECUTIVE_FAILS,
+                         fetch.fetches - spent_before,
+                         "one answer and a lane gets its five failures back")
+
+    def test_nothing_is_braked_while_upstream_is_answering(self):
+        fetch = self.fetcher(Upstream(LISTING), budget=10)
+        fetch.channel_latest("UC-a")
+        self.assertEqual(0, fetch.aborts)
+
+
 if __name__ == "__main__":
     unittest.main()
