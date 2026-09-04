@@ -115,8 +115,32 @@ the host — Invidious publishes no port for it — so installing it would break
 6. **Clean up**, once a real fill has gone through the container:
    `/usr/local/bin/iv-suggest` and its `.bak` pile, `/usr/local/bin/iv-sid-check`
    and its two units, and `/etc/iv-suggest/` entirely — `lanes.yml` there is now
-   a decoy that nothing reads, and `env` holds a second copy of the database
-   password.
+   a decoy that nothing reads, and `env` holds nothing the compose `.env` does
+   not. Check `env` before deleting it rather than assuming what is in it: on
+   the reference install it held only `IV_SUGGEST_ACCOUNT`, because the old
+   transport authenticated by being inside the database container and never
+   needed a password at all.
+
+## What the first deploy actually needed
+
+Recorded from the reference install (LXC 109, 2026-09-04), because three of
+these are not in the steps above and each cost a retry:
+
+- **The compose file already ends in `volumes:`**, so the service block goes
+  before that, not at the end of the file. `docker compose config --quiet`
+  validates without printing a single interpolated secret.
+- **`docker compose exec … psql -c "…'literal'…"` loses its quotes** through
+  `ssh root@host 'pct exec 109 -- sh -c "…"'`. Three layers of shell strip
+  them and psql then reports a syntax error pointing at the value. Put the
+  statement in a file and send the file.
+- **Seed `suggest.host_events` from the real last nightly finish**, not from
+  `now()`. `systemctl show -p ExecMainExitTimestamp --value iv-nightly.service`
+  is the same boundary the old shell script read, so the first `sid-check`
+  answers about a real nightly instead of waiting a day. Until a row exists it
+  exits 2 and the unit reads as failed, which is correct and not an incident.
+- **`init` without `--all-users` prints one account.** That is the whole
+  schema created and the primary account confirmed; the other accounts' rows
+  and sessions are already in the database and do not need reminting.
 
 ## Verifying a deploy
 
@@ -132,6 +156,16 @@ journalctl -u iv-suggest.service -n 50 | grep '^iv-suggest '
 
 The journal line is there because a label alone says what is *pulled*, not what
 *ran*. `run` and `shuffle` print the revision as their first line.
+
+Those three agreeing prove the deploy is *consistent*, not that it is *current*.
+Every push to `main` publishes a tag, docs-only pushes included, so a tag being
+behind `main` does not by itself mean anything is undeployed. What settles it is
+whether anything the image is built from has moved:
+
+```sh
+# on 108, in the repo -- empty output means the running tag is current
+git log --oneline <deployed-tag>..main -- iv-suggest Dockerfile
+```
 
 ## Rolling back
 
