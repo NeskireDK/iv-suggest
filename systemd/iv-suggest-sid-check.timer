@@ -1,0 +1,9 @@
+[Unit]
+Description=Session survival check, after the nightly restart has settled
+
+[Timer]
+OnCalendar=05:34
+Persistent=true
+
+[Install]
+WantedBy=timers.target

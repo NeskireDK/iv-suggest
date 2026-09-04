@@ -69,12 +69,16 @@ def setting(name, default=""):
     return os.environ.get(name) or _ENV.get(name) or default
 
 
-COMPOSE_DIR = setting("IV_SUGGEST_COMPOSE_DIR", "/root/docker/youtube")
-DB_SERVICE = setting("IV_SUGGEST_DB_SERVICE", "invidious-db")
+DB_HOST = setting("IV_SUGGEST_DB_HOST", "invidious-db")
+DB_PORT = setting("IV_SUGGEST_DB_PORT", "5432")
 DB_USER = setting("IV_SUGGEST_DB_USER", "kemal")
 DB_NAME = setting("IV_SUGGEST_DB_NAME", "invidious")
 API = setting("IV_SUGGEST_API", "http://localhost:3000")
 CONFIG = setting("IV_SUGGEST_CONFIG", "/etc/iv-suggest/lanes.yml")
+# Set by the image build. The deploy check reads the image label, but nothing
+# in the journal used to say which code produced a given night's fill -- the
+# md5-the-binary check answered that and there is no binary to hash any more.
+REVISION = setting("IV_SUGGEST_REVISION", "unknown")
 # The account whose lanes are being filled right now. A reader moves it with
 # `use_account()`, anything that calls the API with `serve_account()` -- the
 # difference is which one guarantees a session, and a reader must not mint one.
@@ -200,6 +204,12 @@ CREATE TABLE IF NOT EXISTS suggest.shuffles (
 CREATE TABLE IF NOT EXISTS suggest.accounts (
   account text PRIMARY KEY, sid text NOT NULL,
   created timestamptz DEFAULT now());
+-- When the host's nightly ops last finished, recorded by the host script that
+-- does them. `sid-check` needs it to tell a session that survived the nightly
+-- recreate from one issued after it, and reading it here is what lets the check
+-- run in a container with no Docker socket and no systemd to ask.
+CREATE TABLE IF NOT EXISTS suggest.host_events (
+  event text PRIMARY KEY, at timestamptz NOT NULL DEFAULT now());
 """
 
 # Bring a single-account database up to the shape above. Everything that exists
@@ -351,12 +361,42 @@ class BudgetSpent(Aborted):
     pass
 
 
+# What psql inherits. An allowlist rather than the whole environment, because
+# libpq reads a dozen PG* variables and two of them redirect a connection
+# without failing: PGOPTIONS can set a search_path, so unqualified reads resolve
+# to another schema and return the wrong rows with exit 0.
+PSQL_KEEPS_FROM_THE_ENVIRONMENT = ("PATH", "LANG", "LC_ALL", "TZ")
+
+
+def _db_environment():
+    """The whole environment psql gets. The password goes here, never on a command line.
+    A command line is readable by every process on the box; an environment is not."""
+    env = {key: os.environ[key] for key in PSQL_KEEPS_FROM_THE_ENVIRONMENT
+           if key in os.environ}
+    env["PGCONNECT_TIMEOUT"] = setting("IV_SUGGEST_DB_CONNECT_TIMEOUT", "10")
+    env["PGOPTIONS"] = "-c statement_timeout=%s" % setting(
+        "IV_SUGGEST_DB_STATEMENT_TIMEOUT_MS", "300000")
+    password = setting("IV_SUGGEST_DB_PASSWORD")
+    if password:
+        env["PGPASSWORD"] = password
+    return env
+
+
+def psql_complaint(stderr):
+    """psql's first line of complaint, and only the first.
+    The lines after it echo the statement, values and any session id in it."""
+    first = (stderr or "").strip().split("\n")[0].strip()
+    return first or "psql failed and said nothing"
+
+
 def _psql(flags, sql):
-    cmd = ["docker", "compose", "exec", "-T", DB_SERVICE, "psql", "-U", DB_USER,
-           "-d", DB_NAME, "-v", "ON_ERROR_STOP=1"] + flags + ["-c", sql]
-    r = subprocess.run(cmd, cwd=COMPOSE_DIR, capture_output=True, text=True)
+    """One psql invocation. `-X` is load-bearing: test_transport.py says why."""
+    cmd = ["psql", "-h", DB_HOST, "-p", DB_PORT, "-U", DB_USER, "-d", DB_NAME,
+           "-w", "-X", "-v", "ON_ERROR_STOP=1"] + flags + ["-c", sql]
+    r = subprocess.run(cmd, capture_output=True, text=True,
+                       env=_db_environment())
     if r.returncode:
-        raise RuntimeError("psql failed: " + r.stderr.strip())
+        raise RuntimeError("psql failed: " + psql_complaint(r.stderr))
     return r.stdout
 
 
@@ -1972,8 +2012,14 @@ def run_lane_consensus(lane, run):
     return rebuild_playlist(lane, consensus_draw(weights, lane["size"]), run)
 
 
+def announce_the_build():
+    """Say which code this is, so the journal line and the image label can be compared."""
+    log("iv-suggest %s" % REVISION)
+
+
 def cmd_run(args):
     """Fill every managed account's lanes in one paced run: one timer, one budget."""
+    announce_the_build()
     all_lanes = load_config()
     warn_ignored_keys(all_lanes)
     warn_about_lanes_nobody_asked_for(all_lanes)
@@ -2431,6 +2477,7 @@ def shuffle_lane(lane, orders, dry):
 
 def cmd_shuffle(args):
     """Reorder every lane. Database only: no API call, no YouTube fetch."""
+    announce_the_build()
     all_lanes = load_config()
     failed = 0
     for user in accounts_wanted(args):
@@ -2489,6 +2536,80 @@ def cmd_init(args):
             plid, _ = playlist_of(lane, dry=False)
             log("  lane %-16s %s" % (lane["id"], plid))
     log("done: %d accounts ready" % len(users))
+    return 0
+
+
+NIGHTLY_RECREATE = "nightly-recreate"
+# A boundary older than this cannot be evidence of anything: every session
+# predates it, so the check would pass every account while watching nothing.
+NIGHTLY_STALE_AFTER_HOURS = 26
+LOST = "LOST -- the recorded sid no longer resolves to a session"
+UNTESTED = "untested -- issued after the nightly, so it has not faced one yet"
+SURVIVED = "survived the nightly"
+
+
+def nightly_finish():
+    """(when the host last recorded a nightly finish, hours since), or ("", None) if never.
+    A table that does not exist yet is `never`, not an error: `init` creates it."""
+    if one("SELECT to_regclass('suggest.host_events') IS NOT NULL;") != "t":
+        return "", None
+    row = query("SELECT at, extract(epoch FROM now() - at) / 3600 "
+                "FROM suggest.host_events WHERE event = %s;"
+                % lit(NIGHTLY_RECREATE))
+    if not row:
+        return "", None
+    return row[0][0], float(row[0][1])
+
+
+def session_verdict(joins_session_ids, issued_after_the_nightly):
+    """What the join says about one account's session. Untested is not a pass."""
+    if not joins_session_ids:
+        return LOST
+    if issued_after_the_nightly:
+        return UNTESTED
+    return SURVIVED
+
+
+def recorded_sessions():
+    """(account, sid fingerprint, verdict) per managed account. Never the sid itself.
+    The fingerprint tells yesterday's session from a fresh one without printing either."""
+    return [(account, fingerprint,
+             session_verdict(joins == "t", issued_after == "t"))
+            for account, fingerprint, joins, issued_after in query(
+                "SELECT a.account, left(md5(a.sid),8), (s.id IS NOT NULL), "
+                "coalesce(s.issued > (SELECT at FROM suggest.host_events "
+                "WHERE event = %s), false) "
+                "FROM suggest.accounts a LEFT JOIN session_ids s "
+                "ON s.id = a.sid AND s.email = a.account ORDER BY 1;"
+                % lit(NIGHTLY_RECREATE))]
+
+
+def cmd_sid_check(args):
+    """Say whether each managed account's login survived the nightly recreate."""
+    finished, hours_ago = nightly_finish()
+    if not finished:
+        log("the host has never recorded a nightly finish, so no session can "
+            "be said to have survived one yet. Have the nightly script write "
+            "suggest.host_events(%r)." % NIGHTLY_RECREATE)
+        return 2
+    if hours_ago > NIGHTLY_STALE_AFTER_HOURS:
+        log("the last recorded nightly finish is %.0f hours old. Every session "
+            "predates it, so this check would call them all survivors while "
+            "noticing nothing. The nightly is failing before it records, or it "
+            "has stopped recording." % hours_ago)
+        return 2
+    log("nightly last finished %s (%.0f hours ago)" % (finished, hours_ago))
+    sessions = recorded_sessions()
+    for account, fingerprint, verdict in sessions:
+        log("  %-28s sid#%s  %s" % (account, fingerprint, verdict))
+    lost = [account for account, _, verdict in sessions if verdict == LOST]
+    if lost:
+        log("\n%d session(s) did not survive: %s. Run `iv-suggest init "
+            "--all-users` to mint replacements: plain `init` only touches "
+            "IV_SUGGEST_ACCOUNT." % (len(lost), ", ".join(lost)))
+        return 1
+    if not sessions:
+        log("no managed account has a recorded session yet")
     return 0
 
 
@@ -2735,6 +2856,8 @@ def main():
     v.add_argument("--account", help="refresh only this account's lanes")
     v.add_argument("--rate", type=int, default=RATE_PER_MIN, help="fetches per minute")
     v.add_argument("--budget", type=int, default=MAX_FETCHES, help="fetches per run")
+    sub.add_parser("sid-check",
+                   help="did each account's login survive the nightly restart")
     s = sub.add_parser("shuffle", help="reorder the lanes; database only, no fetches")
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--lane")
@@ -2742,7 +2865,8 @@ def main():
     args = p.parse_args()
     command = {"init": cmd_init, "run": cmd_run, "status": cmd_status,
                "metrics": cmd_metrics, "dedupe": cmd_dedupe,
-               "views": cmd_views, "shuffle": cmd_shuffle}[args.cmd]
+               "views": cmd_views, "shuffle": cmd_shuffle,
+               "sid-check": cmd_sid_check}[args.cmd]
     try:
         return command(args)
     except Aborted as e:

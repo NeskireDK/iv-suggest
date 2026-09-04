@@ -7,9 +7,11 @@ Every setting, once. Two places hold configuration:
 - **`/etc/iv-suggest/lanes.yml`** — what the bot makes: lanes, who gets them,
   the blocklist. See [lanes.yml](../lanes.yml) for a working file.
 
-The systemd units call the script directly with **no `EnvironmentFile`**, which
-is why `env` is read off disk as well as from the environment. A value exported
-only in your shell is missing from the nightly run — test with `env -i`.
+The engine ships as a container and takes its settings from the environment
+compose gives it, so a default install sets `IV_SUGGEST_ENVFILE=/dev/null` and
+uses no file at all. The file is still read when you run the script directly:
+`env` is read off disk as well as from the environment, so a value exported only
+in your shell is missing from a run started by a timer — test with `env -i`.
 
 ## Environment
 
@@ -17,10 +19,14 @@ only in your shell is missing from the nightly run — test with `env -i`.
 |---|---|---|
 | `IV_SUGGEST_ACCOUNT` | — | **Required by `init`.** `users.email` of the account the bot belongs to. Owns the blocklist playlist; every pre-multi-user row migrates to it. With a `users:` block the other commands do not need it |
 | `IV_SUGGEST_API` | `http://localhost:3000` | Invidious base URL |
-| `IV_SUGGEST_COMPOSE_DIR` | `/root/docker/youtube` | directory holding Invidious's `docker-compose.yml` |
-| `IV_SUGGEST_DB_SERVICE` | `invidious-db` | compose service name of Postgres |
+| `IV_SUGGEST_DB_HOST` | `invidious-db` | Postgres host. The default is the compose service name, which is what resolves from a container on the same network |
+| `IV_SUGGEST_DB_PORT` | `5432` | Postgres port |
 | `IV_SUGGEST_DB_USER` | `kemal` | Postgres role |
 | `IV_SUGGEST_DB_NAME` | `invidious` | Postgres database |
+| `IV_SUGGEST_DB_PASSWORD` | — | **Required.** Reuse the one Invidious's own compose already holds. It travels in the environment and never on a command line, which every process on the box can read |
+| `IV_SUGGEST_DB_CONNECT_TIMEOUT` | `10` | seconds before giving up on the connection, so a dead database fails the run instead of holding it open |
+| `IV_SUGGEST_DB_STATEMENT_TIMEOUT_MS` | `300000` | milliseconds any one statement may take. The engine sets this itself rather than inheriting `PGOPTIONS`, because that variable can also redirect a connection |
+| `IV_SUGGEST_REVISION` | `unknown` | set by the image build. `run` and `shuffle` print it, so the journal says which code produced a night's fill |
 | `IV_SUGGEST_CONFIG` | `/etc/iv-suggest/lanes.yml` | lane config path |
 | `IV_SUGGEST_ENVFILE` | `/etc/iv-suggest/env` | file the above are also read from |
 | `IV_SUGGEST_DB_CONTAINER` | `youtube-invidious-db-1` | `kickstart.py` only, which talks to the container directly and reads the environment alone — not this file |
