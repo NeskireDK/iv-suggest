@@ -16,6 +16,9 @@ WorkingDirectory=/root/docker/youtube
 # interpolates changes, or the image moves behind its tag. So the readiness
 # that depends_on would have given has to be waited for here instead.
 ExecStartPre=/usr/bin/timeout 120 sh -c 'until docker compose exec -T invidious-db pg_isready -U kemal -d invidious >/dev/null 2>&1; do sleep 2; done'
-ExecStart=/usr/bin/docker compose run --rm --no-deps --name iv-suggest-shuffle iv-suggest shuffle
+# -T because nothing here reads stdin, and it is stdin that compose decides
+# pseudo-TTY allocation from -- so without it a hand run from a terminal
+# produces different line endings than the timer does.
+ExecStart=/usr/bin/docker compose run --rm -T --no-deps --name iv-suggest-shuffle iv-suggest shuffle
 ExecStopPost=-/usr/bin/docker rm -f iv-suggest-shuffle
 TimeoutStartSec=600

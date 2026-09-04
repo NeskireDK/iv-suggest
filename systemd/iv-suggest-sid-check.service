@@ -10,6 +10,9 @@ Wants=docker.service
 [Service]
 Type=oneshot
 WorkingDirectory=/root/docker/youtube
-ExecStart=/usr/bin/docker compose run --rm --no-deps --name iv-suggest-sid-check iv-suggest sid-check
+# -T because nothing here reads stdin, and it is stdin that compose decides
+# pseudo-TTY allocation from -- so without it a hand run from a terminal
+# produces different line endings than the timer does.
+ExecStart=/usr/bin/docker compose run --rm -T --no-deps --name iv-suggest-sid-check iv-suggest sid-check
 ExecStopPost=-/usr/bin/docker rm -f iv-suggest-sid-check
 TimeoutStartSec=300

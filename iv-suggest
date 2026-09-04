@@ -75,15 +75,15 @@ DB_USER = setting("IV_SUGGEST_DB_USER", "kemal")
 DB_NAME = setting("IV_SUGGEST_DB_NAME", "invidious")
 API = setting("IV_SUGGEST_API", "http://localhost:3000")
 CONFIG = setting("IV_SUGGEST_CONFIG", "/etc/iv-suggest/lanes.yml")
+# Set by the image build. The deploy check reads the image label, but nothing
+# in the journal used to say which code produced a given night's fill -- the
+# md5-the-binary check answered that and there is no binary to hash any more.
+REVISION = setting("IV_SUGGEST_REVISION", "unknown")
 # The account whose lanes are being filled right now. A reader moves it with
 # `use_account()`, anything that calls the API with `serve_account()` -- the
 # difference is which one guarantees a session, and a reader must not mint one.
 # PRIMARY is the one from the environment, which is also what the schema
 # migration backfills every pre-multi-user row to.
-# Set by the image build. The deploy check reads the image label, but nothing
-# in the journal used to say which code produced a given night's fill -- the
-# md5-the-binary check answered that and there is no binary to hash any more.
-REVISION = setting("IV_SUGGEST_REVISION", "unknown")
 PRIMARY = setting("IV_SUGGEST_ACCOUNT")
 ACCOUNT = PRIMARY
 

@@ -55,9 +55,12 @@ the host — Invidious publishes no port for it — so installing it would break
 1. **Build and push.** A merge to `main` publishes
    `ghcr.io/neskiredk/iv-suggest:<sha>` after the tests pass. There is no
    `:latest`, so nothing deploys itself.
-2. **Add the compose service** (`compose.iv-suggest.yml`), and put `lanes.yml`
-   beside `docker-compose.yml` **world-readable** — the container runs as uid
-   10001, and the file holds no secret:
+2. **Add the compose service.** Paste the `iv-suggest:` block from
+   `compose.iv-suggest.yml` into `/root/docker/youtube/docker-compose.yml` --
+   the timers run `docker compose` in that directory and read that one file,
+   so a second file would need a `COMPOSE_FILE` or an `include:` to be seen at
+   all. Put `lanes.yml` beside `docker-compose.yml` **world-readable** — the
+   container runs as uid 10001, and the file holds no secret:
 
    ```sh
    install -m 644 lanes.yml /root/docker/youtube/lanes.yml
@@ -66,7 +69,7 @@ the host — Invidious publishes no port for it — so installing it would break
    IV_SUGGEST_IMAGE_TAG=<the sha from step 1>
    EOT
    docker compose pull iv-suggest
-   docker compose run --rm --no-deps iv-suggest init
+   docker compose run --rm -T --no-deps iv-suggest init
    ```
 
    `pull` matters: compose defaults to `pull_policy: missing`, so without it
@@ -96,7 +99,7 @@ the host — Invidious publishes no port for it — so installing it would break
 
    ```diff
    -  /usr/local/bin/iv-suggest metrics 2>/dev/null || echo "iv_suggest_up 0"
-   +  docker compose run --rm --no-deps iv-suggest metrics 2>/dev/null || echo "iv_suggest_up 0"
+   +  docker compose run --rm -T --no-deps iv-suggest metrics 2>/dev/null || echo "iv_suggest_up 0"
    ```
 
    That is all Phase 2 needed. The script already appended the engine's own
