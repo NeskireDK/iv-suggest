@@ -593,8 +593,8 @@ def bot_api(method, path, body=None, attempt=0):
         note_fetch(kind, target_of_call(path, body), 200, attempt,
                    "unreadable answer: %s" % e)
         raise
-    except Exception:
-        note_fetch(kind, target_of_call(path, body), 0, attempt)
+    except Exception as e:
+        note_fetch(kind, target_of_call(path, body), 0, attempt, repr(e))
         raise
     note_fetch(kind, target_of_call(path, body), 200, attempt,
                error_in_the_answer(answer))
@@ -2743,7 +2743,7 @@ def shuffle_account(user, all_lanes, args):
             return 0
     log("account %s: reordering %d lanes%s"
         % (ACCOUNT, len(lanes),
-           "   [DRY RUN, no playlist and no lane state]" if args.dry_run else ""))
+           "   [DRY RUN, nothing is written]" if args.dry_run else ""))
     orders, failed = {}, 0
     for lane in lanes:
         if not lane["shuffle"]["enabled"]:
@@ -3319,9 +3319,10 @@ def _instance_wide_metrics(metric, users):
            [("", one("SELECT coalesce(sum(fetches),0) FROM suggest.runs "
                      "WHERE started > now() - interval '1 day';") or 0)])
     metric("upstream_fetches_24h",
-           "Calls that actually reached YouTube in the last day, by sort. Every "
-           "other call this engine makes is answered from the Invidious "
-           "database and is not counted here.", "gauge",
+           "Calls in the last day that CAN reach YouTube, by sort -- an upper "
+           "bound: `playlist_add` only goes out when Invidious's ten minute "
+           "video cache has gone stale. Everything not counted here is always "
+           "answered from the Invidious database.", "gauge",
            fetch_samples("upstream AND at > now() - interval '1 day'",
                          "kind", UPSTREAM_KINDS))
     metric("upstream_failures_24h",

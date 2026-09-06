@@ -279,7 +279,9 @@ parse a video, and `Fetcher.video` buries that video for 30 days on the strength
 of it. Counted as a clean call, a degraded night spends the whole fetch budget
 and blacklists real videos while every failure count sits at zero. A body that
 cannot be read at all is recorded as a 200 with an error too, because upstream
-did answer — the body was the problem.
+did answer — the body was the problem. A call nothing answered keeps its reason
+in the same column, since the journal that used to hold it is thrown away with
+the container every night.
 
 That last one is `cache_hits / lookups`, both counted at the point of lookup.
 It is deliberately not built on `fetches`, which counts channel listings and

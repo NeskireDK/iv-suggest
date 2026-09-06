@@ -628,14 +628,6 @@ class Instance:
         self.log.append("=== iv-suggest run %s ===" % sorted(over.items()))
         return self.engine.cmd_run(Args(**over))
 
-    def refresh_views(self, whose, **over):
-        """One `views` run, then back to an account: it clears the label."""
-        self.log.append("=== iv-suggest views %s ===" % sorted(over.items()))
-        try:
-            return self.engine.cmd_views(Args(**over))
-        finally:
-            self.engine.use_account(whose)
-
     def harvest(self, **over):
         """One play harvest, as its timer would fire it."""
         self.log.append("=== iv-suggest harvest-plays %s ===" % sorted(over.items()))

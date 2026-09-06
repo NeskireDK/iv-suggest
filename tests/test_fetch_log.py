@@ -168,8 +168,15 @@ class EveryCallIsLogged(unittest.TestCase):
         mod = self.call(raises=urllib.error.URLError("timed out"))
         with self.assertRaises(urllib.error.URLError):
             mod.bot_api("GET", "/api/v1/videos/" + VID)
-        self.assertEqual([(ME, "", "", "video", VID, 0, 0, "")],
-                         [row[1:] for row in mod.FETCH_LOG])
+        self.assertEqual((ME, "", "", "video", VID, 0, 0),
+                         mod.FETCH_LOG[0][1:8])
+
+    def test_it_keeps_the_reason_nothing_answered(self):
+        """The journal that used to hold it is thrown away every night."""
+        mod = self.call(raises=urllib.error.URLError("timed out"))
+        with self.assertRaises(urllib.error.URLError):
+            mod.bot_api("GET", "/api/v1/videos/" + VID)
+        self.assertIn("timed out", mod.FETCH_LOG[0][8])
 
     def test_the_attempt_number_is_carried_so_a_retry_is_visible(self):
         mod = self.call()
