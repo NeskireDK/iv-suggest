@@ -209,9 +209,10 @@ fallback when a listing is stored, and this command refreshes the rest.
 `suggest.fetches` holds **one row per call the engine makes**: when, which
 account, which lane, which job, what sort, what it was about, the HTTP status,
 and the attempt number. `job` is the subcommand, which is what tells the nightly
-fill's traffic from a `views` somebody started by hand. `lane` is empty when the
-call was not lane work — `views` walks a de-duplicated set across every lane, so
-naming one lane for those would be a lie. It is the only place a request is dated — `suggest.runs` carries
+fill's traffic from a `views` somebody started by hand. `lane` is set by the
+fill and left empty by every other job, `dedupe` included: only the fill's
+dispatcher starts a lane, and `views` walks a de-duplicated set across every
+lane, so naming one lane for those would be a lie. It is the only place a request is dated — `suggest.runs` carries
 a count per lane per night and nothing finer, so before this table "how many
 requests reached YouTube in that hour, for whom, of what sort" had no answer.
 
@@ -262,8 +263,7 @@ costs 16 statements rather than 200. A crash mid-lane loses that lane's rows,
 which is the right trade for a log: never fail a fill to record one, and a
 failed write warns rather than raising. A command with no lane loop — `views` is
 the one that makes real numbers of calls — flushes every `FETCH_LOG_BATCH` rows
-instead, so a timeout kill cannot take a whole run's log with it. A **dry run
-writes none of them**, because it writes nothing else either.
+instead, so a timeout kill cannot take a whole run's log with it.
 
 Three metrics carry the same numbers into Prometheus for alerting:
 `iv_suggest_upstream_fetches_24h{kind}`,

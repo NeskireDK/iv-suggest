@@ -7,8 +7,9 @@ already passes through.
 
 Two things it must not get wrong. Counting every call as a request to YouTube
 would overstate the number several times over -- most of them are answered from
-the Invidious database and never leave the machine. And a dry run makes real
-read calls, so a run that writes nothing else must not write these either.
+the Invidious database and never leave the machine. And a row has to be dated
+when the call happened rather than when the batch is written, or a `views` run
+spanning ten minutes lands on a single instant.
 """
 
 import ast
@@ -241,7 +242,8 @@ class TheFlush(unittest.TestCase):
         self.mod.execute = lambda sql: (_ for _ in ()).throw(RuntimeError("no table"))
         self.buffer((0.0, ME, "", "run", "video", VID, 200, 0))
         self.mod.flush_fetch_log()
-        self.assertTrue(any("fetch log" in line for line in said))
+        self.assertTrue(any("logged calls were not written" in line
+                            for line in said))
         self.assertEqual([], self.mod.FETCH_LOG)
 
 
@@ -266,19 +268,30 @@ class TheCacheHitRatio(unittest.TestCase):
         self.mod = engine()
 
     def answer(self, got, asked, migrated=True):
+        self.mod._COLUMNS_SEEN.clear()
         self.mod.one = lambda sql: "t" if migrated else "f"
         self.mod.query = lambda sql: [[str(got), str(asked)]]
         return self.mod.cache_hit_ratio("true")
 
+    def samples(self, got, asked, migrated=True):
+        self.mod._COLUMNS_SEEN.clear()
+        self.mod.one = lambda sql: "t" if migrated else "f"
+        self.mod.query = lambda sql: [[str(got), str(asked)]]
+        return self.mod.cache_hit_samples("true")
+
     def test_it_is_the_share_the_cache_answered(self):
         self.assertEqual(0.9, self.answer(90, 100))
 
-    def test_a_night_that_looked_nothing_up_is_zero_not_a_crash(self):
-        self.assertEqual(0, self.answer(0, 0))
+    def test_a_window_nothing_was_asked_in_gets_no_sample_at_all(self):
+        """0 would mean the cache answered nothing, which is the alarming one."""
+        self.assertEqual([], self.samples(0, 0))
 
-    def test_it_reads_zero_before_the_column_exists(self):
+    def test_a_real_share_does_get_a_sample(self):
+        self.assertEqual([("", 0.9)], self.samples(90, 100))
+
+    def test_it_publishes_nothing_before_the_column_exists(self):
         """A pull that lands before `init` must not take the exporter down."""
-        self.assertEqual(0, self.answer(90, 100, migrated=False))
+        self.assertEqual([], self.samples(90, 100, migrated=False))
 
 
 class OneLanesShareOfTheRun(unittest.TestCase):
@@ -391,23 +404,30 @@ class TheRunRow(unittest.TestCase):
 
 
 class TheRetention(unittest.TestCase):
-    def test_the_call_log_is_pruned_with_the_others(self):
+    def pruned(self, exists=True):
         mod = engine()
         written = []
         mod.execute = written.append
+        mod.one = lambda sql: "t" if exists else "f"
         mod.forget_the_far_past()
-        pruned = [sql.split("FROM ")[1].split(" ")[0] for sql in written]
+        return mod, written
+
+    def test_the_call_log_is_pruned_with_the_others(self):
+        _, written = self.pruned()
+        tables = [sql.split("FROM ")[1].split(" ")[0] for sql in written]
         self.assertEqual(["suggest.plays", "suggest.fetches",
-                          "suggest.bot_touches"], pruned)
+                          "suggest.bot_touches"], tables)
 
     def test_the_two_logs_share_one_retention_knob(self):
-        mod = engine()
-        written = []
-        mod.execute = written.append
-        mod.forget_the_far_past()
+        mod, written = self.pruned()
         days = "%d days" % mod.LOG_RETENTION_DAYS
         self.assertIn(days, written[0])
         self.assertIn(days, written[1])
+
+    def test_a_table_init_has_not_made_yet_is_left_alone(self):
+        """Deploy before `init` would otherwise crash the harvest every half hour."""
+        _, written = self.pruned(exists=False)
+        self.assertEqual([], written)
 
 
 class TheLaneLabel(unittest.TestCase):

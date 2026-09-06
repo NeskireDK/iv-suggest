@@ -672,6 +672,7 @@ def flush_fetch_log():
     """Write the buffered calls in one statement. Losing the log is never fatal."""
     if not FETCH_LOG:
         return
+    lost = len(FETCH_LOG)
     rows = ",".join(
         "(to_timestamp(%.6f),%s,%s,%s,%s,%s,%s,%d,%d)"
         % (at, lit(account), lit(lane), lit(job), lit(kind), lit(target),
@@ -683,7 +684,7 @@ def flush_fetch_log():
                 "(at,account,lane,job,kind,target,upstream,status,attempt) "
                 "VALUES %s;" % rows)
     except Exception as e:
-        log("  WARNING: the fetch log for this lane was not written: %r" % e)
+        log("  WARNING: %d logged calls were not written: %r" % (lost, e))
 
 
 def video_the_call_refreshes(path, body):
@@ -2300,10 +2301,15 @@ def run_one_lane(lane, run):
         return (0, 0, 0, 0), repr(e)
 
 
+# A lane that raised reports all four counts as zero, so its cache hits have to
+# be zero too. Left real, the row reads `fetches=0, cache_hits=300` and the hit
+# ratio RISES on the nights lanes abort -- the opposite of the warning it is.
 def record_the_lane_run(lane_id, counts, error, cache_hits):
     """Write one lane's row in suggest.runs. False when it could not be written.
     The row is what the metrics and the account order read, so a lost one is a failed run."""
     removed, added, kept, used = counts
+    if error:
+        cache_hits = 0
     fields = ["lane", "added", "removed", "kept", "fetches", "error"]
     values = [lit(lane_id), str(added), str(removed), str(kept), str(used),
               lit(error)]
@@ -2875,12 +2881,17 @@ def record_judged_open(vid, when, outcome, why):
 # bounds without a second timer to forget about.
 def forget_the_far_past():
     """Drop what neither a later harvest nor a later question can use."""
-    execute("DELETE FROM suggest.plays WHERE played < now() - interval '%d days';"
-            % LOG_RETENTION_DAYS)
-    execute("DELETE FROM suggest.fetches WHERE at < now() - interval '%d days';"
-            % LOG_RETENTION_DAYS)
-    execute("DELETE FROM suggest.bot_touches WHERE at < now() - interval "
-            "'%d days';" % BOT_TOUCH_LOG_DAYS)
+    prune("suggest.plays", "played", LOG_RETENTION_DAYS)
+    prune("suggest.fetches", "at", LOG_RETENTION_DAYS)
+    prune("suggest.bot_touches", "at", BOT_TOUCH_LOG_DAYS)
+
+
+def prune(table, dated_by, days):
+    """Drop that table's rows past `days`, or nothing when `init` has not run."""
+    if not table_exists(table):
+        return
+    execute("DELETE FROM %s WHERE %s < now() - interval '%d days';"
+            % (table, dated_by, days))
 
 
 # Dated from when the run looked, not from when it finished, so nothing
@@ -3228,14 +3239,23 @@ def failure_samples(window):
 
 
 def cache_hit_ratio(window):
-    """Share of candidate lookups the permanent cache answered, 0 when none were."""
+    """Share of metadata questions the cache answered, None when none were asked."""
     if not column_exists("runs", "cache_hits"):
-        return 0
+        return None
     got, asked = query(
         "SELECT coalesce(sum(cache_hits),0), "
         "coalesce(sum(cache_hits),0) + coalesce(sum(fetches),0) "
         "FROM suggest.runs WHERE cache_hits IS NOT NULL AND %s;" % window)[0]
-    return round(float(got) / float(asked), 4) if float(asked) else 0
+    return round(float(got) / float(asked), 4) if float(asked) else None
+
+
+# No sample at all rather than a zero when no lane ran in the window: a gauge
+# that reads 0 for "nothing asked" and 0 for "the cache answered nothing" says
+# the alarming thing every quiet night.
+def cache_hit_samples(window):
+    """The ratio as one sample, or none at all when nothing was asked."""
+    ratio = cache_hit_ratio(window)
+    return [] if ratio is None else [("", ratio)]
 
 
 def _instance_wide_metrics(metric, users):
@@ -3276,7 +3296,7 @@ def _instance_wide_metrics(metric, users):
            "twice about one video, for its channel and then for its genre. "
            "Falling is the warning that a night is about to cost far more "
            "fetches than the one before it.", "gauge",
-           [("", cache_hit_ratio("started > now() - interval '1 day'"))])
+           cache_hit_samples("started > now() - interval '1 day'"))
     metric("meta_rows", "Rows in the permanent metadata cache, shared by every "
            "account.", "gauge",
            [("", one("SELECT count(*) FROM suggest.video_meta;") or 0)])

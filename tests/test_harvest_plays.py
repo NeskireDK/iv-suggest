@@ -54,6 +54,8 @@ class Instance:
         self.mod.SESSION = "session-for-" + email
 
     def one(self, sql):
+        if "to_regclass" in sql:
+            return "t"
         if "suggest.job_runs" in sql:
             self.watermark_sql = sql
             return self.watermark
