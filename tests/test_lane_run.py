@@ -148,11 +148,12 @@ class Fetch:
         self.skipped_500 = 0
         self.lane_used = 0
         self.lane_cap = None
+        self.lane_cache_hits = 0
         self.buried = []
         self.remembered = []
 
-    def begin_lane(self, cap):
-        self.lane_cap, self.lane_used = cap, 0
+    def begin_lane(self, lane_id, cap):
+        self.lane_cap, self.lane_used, self.lane_cache_hits = cap, 0, 0
 
     def video(self, vid):
         self.fetches += 1
@@ -226,7 +227,7 @@ class TheDoubleChargesWhatTheRealFetcherCharges(unittest.TestCase):
         self.mod.time = Unhurried
 
     def spent(self, fetch, call):
-        fetch.begin_lane(5)
+        fetch.begin_lane("a-lane", 5)
         call(fetch)
         return fetch.fetches, fetch.lane_used
 

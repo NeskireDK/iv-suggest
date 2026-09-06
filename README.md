@@ -204,6 +204,51 @@ A candidate that only ever arrived through `recommendedVideos` or
 without the backfill it would show 0 for ever. The text form is parsed as a free
 fallback when a listing is stored, and this command refreshes the rest.
 
+## What it records, and how to ask
+
+`suggest.fetches` holds **one row per call the engine makes**: when, which
+account, which lane, what sort, what it was about, the HTTP status, and the
+attempt number. It is the only place a request is dated — `suggest.runs` carries
+a count per lane per night and nothing finer, so before this table "how many
+requests reached YouTube in that hour, for whom, of what sort" had no answer.
+
+Only two sorts actually leave the machine, `video` and `channel_latest`, because
+Invidious's own video cache is short lived and a channel listing is not cached
+at all. Everything else the engine calls is answered from the Invidious
+database. That distinction is the `upstream` column rather than something a
+query has to know, so a dashboard never has to match on paths.
+
+```sql
+-- requests to YouTube per hour, by account and sort
+SELECT date_trunc('hour', at) AS hour, account, kind, count(*)
+FROM suggest.fetches WHERE upstream
+GROUP BY 1, 2, 3 ORDER BY 1 DESC;
+
+-- what the retries and the refusals cost, by sort of non-answer
+SELECT date_trunc('day', at) AS day, status, count(*)
+FROM suggest.fetches WHERE upstream AND status <> 200
+GROUP BY 1, 2 ORDER BY 1 DESC;
+
+-- the cache hit ratio per night, which the run used to only print
+SELECT date_trunc('day', started) AS day,
+       sum(cache_hits) AS from_cache, sum(fetches) AS from_youtube,
+       round(sum(cache_hits)::numeric
+             / nullif(sum(cache_hits) + sum(fetches), 0), 3) AS ratio
+FROM suggest.runs GROUP BY 1 ORDER BY 1 DESC;
+```
+
+Rows are buffered in memory and written once per lane, so a night of 200 calls
+costs 16 statements rather than 200. A crash therefore loses at most the lane in
+progress, which is the right trade for a log: never fail a fill to record one.
+A **dry run writes none of them**, because it writes nothing else either.
+
+Three metrics carry the same numbers into Prometheus for alerting:
+`iv_suggest_upstream_fetches_24h{kind}`,
+`iv_suggest_upstream_failures_24h{class}` — `rate_limited` rising is the one
+that means back off — and `iv_suggest_cache_hit_ratio_24h`. They are 24-hour
+gauges recomputed at scrape time, so use the SQL above for anything that needs
+a time or a longer window than Prometheus keeps.
+
 ## More than one account
 
 `lanes.yml` is the shared library of lanes; `auto_enrol:` takes in every account

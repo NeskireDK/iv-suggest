@@ -90,16 +90,17 @@ ACCOUNT = PRIMARY
 
 def use_account(email):
     """Point every account-scoped query at this account. Reads only: mints nothing."""
-    global ACCOUNT, SESSION
+    global ACCOUNT, SESSION, LANE
     ACCOUNT = email
     SESSION = session_of(email)
+    LANE = ""
 
 
 def serve_account(email):
     """Point at this account and guarantee the session its API calls need."""
-    global ACCOUNT, SESSION
+    global ACCOUNT, SESSION, LANE
     session = open_session(email)
-    ACCOUNT, SESSION = email, session
+    ACCOUNT, SESSION, LANE = email, session, ""
 
 
 def acct():
@@ -108,6 +109,15 @@ def acct():
 
 
 VID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+# The lane whose work the current calls belong to, "" outside a lane. Changing
+# account leaves whatever lane you were in, so both account helpers clear it.
+LANE = ""
+
+# Calls made and not yet written. A dry run makes real read calls, so DRY is
+# what keeps it from writing rows for a run that wrote nothing else.
+FETCH_LOG = []
+DRY = False
 
 DEFAULTS = {
     "size": 30,
@@ -195,6 +205,11 @@ ALTER TABLE suggest.items ADD COLUMN IF NOT EXISTS last_top timestamptz;
 -- field is real EXCEPT genre, which those listings do not carry. A genre lane
 -- must treat such a row as a cache miss, everything else may use it.
 ALTER TABLE suggest.video_meta ADD COLUMN IF NOT EXISTS genre_known boolean DEFAULT true;
+-- The other half of `fetches`: a lane that fetched 12 times off 400 candidates
+-- is cheap, one that fetched 12 off 14 is about to get expensive. The run has
+-- always printed both numbers and stored neither, and the journal it printed
+-- them to is thrown away with the container every night.
+ALTER TABLE suggest.runs ADD COLUMN IF NOT EXISTS cache_hits int;
 CREATE TABLE IF NOT EXISTS suggest.shuffles (
   ran timestamptz DEFAULT now(), account text, lane text, videos int, moved int,
   error text);
@@ -235,6 +250,16 @@ CREATE TABLE IF NOT EXISTS suggest.bot_touches (
 -- read healthiest exactly when the job had never run.
 CREATE TABLE IF NOT EXISTS suggest.job_runs (
   job text PRIMARY KEY, at timestamptz NOT NULL DEFAULT now());
+-- One row per call this engine makes, which is the only place a request is
+-- dated. suggest.runs carries a count per lane per night and nothing finer, so
+-- "how many requests reached YouTube in that hour, for whom, of what sort" has
+-- no answer without this. An append log, no key: two identical calls a second
+-- apart are two facts.
+CREATE TABLE IF NOT EXISTS suggest.fetches (
+  at timestamptz NOT NULL DEFAULT now(), account text, lane text,
+  kind text NOT NULL, target text, upstream boolean NOT NULL,
+  status int, attempt int);
+CREATE INDEX IF NOT EXISTS fetches_at_idx ON suggest.fetches (at);
 """
 
 # Bring a single-account database up to the shape above. Everything that exists
@@ -541,11 +566,95 @@ def api(method, path, body=None):
     return json.loads(raw) if raw else None
 
 
-def bot_api(method, path, body=None):
+def bot_api(method, path, body=None, attempt=0):
     """Every call this engine makes. Recording the touch here rather than in the
     transport is what lets a stubbed `api` still exercise the recording."""
     note_bot_touch(video_the_call_refreshes(path, body))
-    return api(method, path, body)
+    kind = kind_of_call(method, path)
+    try:
+        answer = api(method, path, body)
+    except urllib.error.HTTPError as e:
+        note_fetch(kind, target_of_call(path, body), e.code, attempt)
+        raise
+    except Exception:
+        note_fetch(kind, target_of_call(path, body), 0, attempt)
+        raise
+    note_fetch(kind, target_of_call(path, body), 200, attempt)
+    return answer
+
+
+# Only these two make Invidious go out to YouTube: its own video cache is
+# short lived, and a channel listing is never cached at all. Everything else
+# here is answered from the Invidious database, so counting it as a request to
+# YouTube would overstate the number several times over.
+UPSTREAM_KINDS = ("video", "channel_latest")
+
+# A 429 means slow down, a 5xx means somebody upstream is having a bad minute,
+# and nothing at all means neither -- three different answers that used to end
+# up as the same line of prose in a journal the nightly throws away.
+FAILURE_CLASSES = ("rate_limited", "upstream_5xx", "client_4xx", "unanswered")
+
+
+def failure_class(status):
+    """Which sort of non-answer this was, or None when the call succeeded."""
+    if status == 200:
+        return None
+    if status == 429:
+        return "rate_limited"
+    if status >= 500:
+        return "upstream_5xx"
+    if status >= 400:
+        return "client_4xx"
+    return "unanswered"
+
+
+def kind_of_call(method, path):
+    """Which sort of call this is, named so a dashboard needs no path matching."""
+    if path.startswith("/api/v1/videos/"):
+        return "video"
+    if path.startswith("/api/v1/channels/"):
+        return "channel_latest"
+    if path == "/api/v1/stats":
+        return "stats"
+    if path.startswith("/api/v1/auth/history/"):
+        return "history_write"
+    if path.startswith("/api/v1/auth/playlists"):
+        return "playlist_read" if method == "GET" else "playlist_write"
+    return "other"
+
+
+def target_of_call(path, body):
+    """What the call was about: a video, a channel, or a playlist."""
+    named = video_the_call_refreshes(path, body)
+    if named:
+        return named
+    parts = [p for p in path.split("?")[0].split("/") if p]
+    return parts[3] if len(parts) > 3 else ""
+
+
+def note_fetch(kind, target, status, attempt):
+    """Buffer one call. Buffered, or every call would cost a second psql."""
+    if DRY:
+        return
+    FETCH_LOG.append((ACCOUNT, LANE, kind, target, status, attempt))
+
+
+def flush_fetch_log():
+    """Write the buffered calls in one statement. Losing the log is never fatal."""
+    if not FETCH_LOG:
+        return
+    rows = ",".join(
+        "(%s,%s,%s,%s,%s,%d,%d)"
+        % (lit(account), lit(lane), lit(kind), lit(target),
+           "true" if kind in UPSTREAM_KINDS else "false", status, attempt)
+        for account, lane, kind, target, status, attempt in FETCH_LOG)
+    del FETCH_LOG[:]
+    try:
+        execute("INSERT INTO suggest.fetches"
+                "(account,lane,kind,target,upstream,status,attempt) "
+                "VALUES %s;" % rows)
+    except Exception as e:
+        log("  WARNING: the fetch log for this lane was not written: %r" % e)
 
 
 def video_the_call_refreshes(path, body):
@@ -601,6 +710,7 @@ class Fetcher:
         self.dead_hits = 0
         self.lane_cap = None
         self.lane_used = 0
+        self.lane_cache_hits = 0
         self.dead = unfetchable_videos()
         self.meta = cached_video_meta()
 
@@ -610,9 +720,12 @@ class Fetcher:
             time.sleep(wait + random.uniform(0.0, 0.4))
         self.last = time.monotonic()
 
-    def begin_lane(self, cap):
+    def begin_lane(self, lane_id, cap):
         """Start a lane's share of the run: its own fetch cap, and its own run of bad luck."""
+        global LANE
+        LANE = lane_id
         self.lane_cap, self.lane_used, self.fails = cap, 0, 0
+        self.lane_cache_hits = 0
 
     def _spend_one_fetch(self):
         """Charge one call upstream to the run budget and to the lane's share of it."""
@@ -636,7 +749,7 @@ class Fetcher:
         for attempt in range(3):
             self._pace()
             try:
-                data = bot_api("GET", "/api/v1/videos/" + vid)
+                data = bot_api("GET", "/api/v1/videos/" + vid, attempt=attempt)
                 self._spend_one_fetch()
                 self._upstream_answered()
                 if data and not data.get("error"):
@@ -685,7 +798,8 @@ class Fetcher:
         for attempt in range(3):
             self._pace()
             try:
-                data = bot_api("GET", "/api/v1/channels/%s/latest" % ucid)
+                data = bot_api("GET", "/api/v1/channels/%s/latest" % ucid,
+                               attempt=attempt)
                 self._spend_one_fetch()
                 self._upstream_answered()
                 return data
@@ -794,6 +908,7 @@ class Fetcher:
         m = self.meta.get(vid)
         if m:
             self.cache_hits += 1
+            self.lane_cache_hits += 1
         return m
 
     def meta_of(self, vid):
@@ -1299,7 +1414,7 @@ def run_lane(lane, run):
     lane_id = lane["id"]
     log("\nlane %s  (%s)" % (lane_id, lane["title"]))
     started = run.fetcher.fetches
-    run.fetcher.begin_lane(lane["fetch_cap"])
+    run.fetcher.begin_lane(lane_id, lane["fetch_cap"])
     plid, playlist = playlist_of(lane, run.dry)
     current = playlist.get("videos") or []
     drop, keep, room = sweep_lane(lane, current, plid, run)
@@ -1788,7 +1903,7 @@ def run_lane_last_played(lane, run):
     lane_id = lane["id"]
     log("\nlane %s  (%s)  policy last_played" % (lane_id, lane["title"]))
     started = run.fetcher.fetches
-    run.fetcher.begin_lane(lane["fetch_cap"])
+    run.fetcher.begin_lane(lane_id, lane["fetch_cap"])
     plid, playlist = playlist_of(lane, run.dry)
     current = {v["videoId"]: v for v in (playlist.get("videos") or [])}
 
@@ -2154,15 +2269,16 @@ def run_one_lane(lane, run):
         return (0, 0, 0, 0), repr(e)
 
 
-def record_the_lane_run(lane_id, counts, error):
+def record_the_lane_run(lane_id, counts, error, cache_hits):
     """Write one lane's row in suggest.runs. False when it could not be written.
     The row is what the metrics and the account order read, so a lost one is a failed run."""
     removed, added, kept, used = counts
     try:
         execute("INSERT INTO suggest.runs"
-                "(account,lane,added,removed,kept,fetches,error) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s);"
-                % (acct(), lit(lane_id), added, removed, kept, used, lit(error)))
+                "(account,lane,added,removed,kept,fetches,error,cache_hits) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%d);"
+                % (acct(), lit(lane_id), added, removed, kept, used, lit(error),
+                   cache_hits))
         return True
     except Exception as e:
         log("  WARNING: lane %s ran but its run row was not written: %r"
@@ -2198,7 +2314,9 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
     failed = 0
     for lane in lanes:
         counts, error = run_one_lane(lane, run)
-        recorded = args.dry_run or record_the_lane_run(lane["id"], counts, error)
+        recorded = args.dry_run or record_the_lane_run(
+            lane["id"], counts, error, run.fetcher.lane_cache_hits)
+        flush_fetch_log()
         if error or not recorded:
             failed += 1
     return failed
@@ -3025,6 +3143,37 @@ def plays_samples(where):
             for outcome in PLAY_OUTCOMES]
 
 
+def fetch_samples(where, column, wanted):
+    """One zero filled sample per `wanted` value, all zero before `init` ran."""
+    counted = dict((value, 0) for value in wanted)
+    if table_exists("suggest.fetches"):
+        counted.update((value, int(rows)) for value, rows in query(
+            "SELECT %s, count(*) FROM suggest.fetches WHERE %s GROUP BY 1;"
+            % (column, where)))
+    return [('{%s="%s"}' % (column, value), counted.get(value, 0))
+            for value in wanted]
+
+
+def failure_samples(window):
+    """Failed upstream calls per class, read in Python so the buckets live once."""
+    counted = dict((name, 0) for name in FAILURE_CLASSES)
+    if table_exists("suggest.fetches"):
+        for status, rows in query(
+                "SELECT status, count(*) FROM suggest.fetches "
+                "WHERE upstream AND status <> 200 AND %s GROUP BY 1;" % window):
+            counted[failure_class(int(status))] += int(rows)
+    return [('{class="%s"}' % name, counted[name]) for name in FAILURE_CLASSES]
+
+
+def cache_hit_ratio(window):
+    """Share of candidate lookups the permanent cache answered, 0 when none were."""
+    got, asked = query(
+        "SELECT coalesce(sum(cache_hits),0), "
+        "coalesce(sum(cache_hits),0) + coalesce(sum(fetches),0) "
+        "FROM suggest.runs WHERE %s;" % window)[0]
+    return round(float(got) / float(asked), 4) if float(asked) else 0
+
+
 def _instance_wide_metrics(metric, users):
     """The series with no account label, because the budget and cache are shared.
     Unlabelled also keeps the alerts already written against them working."""
@@ -3047,6 +3196,21 @@ def _instance_wide_metrics(metric, users):
            "budget is shared, so this is the number that matters.", "gauge",
            [("", one("SELECT coalesce(sum(fetches),0) FROM suggest.runs "
                      "WHERE started > now() - interval '1 day';") or 0)])
+    metric("upstream_fetches_24h",
+           "Calls that actually reached YouTube in the last day, by sort. Every "
+           "other call this engine makes is answered from the Invidious "
+           "database and is not counted here.", "gauge",
+           fetch_samples("upstream AND at > now() - interval '1 day'",
+                         "kind", UPSTREAM_KINDS))
+    metric("upstream_failures_24h",
+           "Upstream calls in the last day that did not answer 200, by sort of "
+           "non-answer. `rate_limited` rising is the one that means back off.",
+           "gauge", failure_samples("at > now() - interval '1 day'"))
+    metric("cache_hit_ratio_24h",
+           "Share of candidate lookups the permanent metadata cache answered "
+           "over the last day. Falling is the warning that a night is about to "
+           "cost far more fetches than the one before it.", "gauge",
+           [("", cache_hit_ratio("started > now() - interval '1 day'"))])
     metric("meta_rows", "Rows in the permanent metadata cache, shared by every "
            "account.", "gauge",
            [("", one("SELECT count(*) FROM suggest.video_meta;") or 0)])
@@ -3116,6 +3280,8 @@ def main():
     s.add_argument("--lane")
     s.add_argument("--account", help="reorder only this account")
     args = p.parse_args()
+    global DRY
+    DRY = bool(getattr(args, "dry_run", False))
     command = {"init": cmd_init, "run": cmd_run, "status": cmd_status,
                "metrics": cmd_metrics, "dedupe": cmd_dedupe,
                "views": cmd_views, "shuffle": cmd_shuffle,
@@ -3125,6 +3291,8 @@ def main():
         return command(args)
     except Aborted as e:
         sys.exit(str(e))
+    finally:
+        flush_fetch_log()
 
 
 if __name__ == "__main__":

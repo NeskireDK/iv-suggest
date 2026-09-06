@@ -209,10 +209,11 @@ class Order(unittest.TestCase):
 
 
 class Spent:
-    """A fetcher with nothing left, so only the log line reads it."""
+    """A fetcher with nothing left, so only the log line and the run row read it."""
 
     budget = 320
     fetches = 320
+    lane_cache_hits = 0
 
 
 class Args:
