@@ -363,10 +363,18 @@ class TheFetchLog(unittest.TestCase):
             "SELECT count(*) FROM suggest.fetches WHERE upstream "
             "AND kind IN ('playlist_read', 'playlist_write', 'stats');") or 0))
 
-    def test_every_row_carries_the_account_that_made_the_call(self):
+    def test_a_fills_row_carries_the_account_that_made_the_call(self):
         self.assertEqual(0, int(self.value(
-            "SELECT count(*) FROM suggest.fetches "
-            "WHERE account IS NULL OR account = '';") or 0))
+            "SELECT count(*) FROM suggest.fetches WHERE job = 'run' "
+            "AND (account IS NULL OR account = '');") or 0))
+
+    def test_only_init_and_the_fill_ran_here(self):
+        """`views` is deliberately not driven in this harness: it clears the
+        account label and refreshes every genre, which would quietly change
+        what the shared-cache tests above are asserting."""
+        jobs = {row[0] for row in HARNESS["instance"].db.rows(
+            "SELECT DISTINCT job FROM suggest.fetches;")}
+        self.assertEqual({"init", "run"}, jobs)
 
     def test_a_fills_upstream_call_carries_the_lane_that_wanted_it(self):
         """Scoped to the fill on purpose. `views` walks a de-duplicated set

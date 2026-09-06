@@ -141,7 +141,7 @@ class EveryCallIsLogged(unittest.TestCase):
     def test_a_call_that_answered_is_logged_as_200(self):
         mod = self.call(JOB="run")
         mod.bot_api("GET", "/api/v1/videos/" + VID)
-        self.assertEqual([(ME, "", "run", "video", VID, 200, 0)],
+        self.assertEqual([(ME, "", "run", "video", VID, 200, 0, "")],
                          [row[1:] for row in mod.FETCH_LOG])
 
     def test_it_is_dated_when_it_happened_and_not_when_it_is_written(self):
@@ -161,20 +161,20 @@ class EveryCallIsLogged(unittest.TestCase):
         mod = self.call(raises=urllib.error.HTTPError("u", 429, "no", {}, None))
         with self.assertRaises(urllib.error.HTTPError):
             mod.bot_api("GET", "/api/v1/videos/" + VID)
-        self.assertEqual([(ME, "", "", "video", VID, 429, 0)],
+        self.assertEqual([(ME, "", "", "video", VID, 429, 0, "")],
                          [row[1:] for row in mod.FETCH_LOG])
 
     def test_a_call_nothing_answered_is_logged_as_zero_and_still_raises(self):
         mod = self.call(raises=urllib.error.URLError("timed out"))
         with self.assertRaises(urllib.error.URLError):
             mod.bot_api("GET", "/api/v1/videos/" + VID)
-        self.assertEqual([(ME, "", "", "video", VID, 0, 0)],
+        self.assertEqual([(ME, "", "", "video", VID, 0, 0, "")],
                          [row[1:] for row in mod.FETCH_LOG])
 
     def test_the_attempt_number_is_carried_so_a_retry_is_visible(self):
         mod = self.call()
         mod.bot_api("GET", "/api/v1/videos/" + VID, attempt=2)
-        self.assertEqual(2, mod.FETCH_LOG[0][-1])
+        self.assertEqual(2, mod.FETCH_LOG[0][7])
 
     def test_the_lane_is_carried_so_the_cost_can_be_attributed(self):
         mod = self.call(LANE="autos")
@@ -184,7 +184,7 @@ class EveryCallIsLogged(unittest.TestCase):
     def test_the_buffer_is_flushed_before_it_can_grow_unbounded(self):
         """A command with no lane loop would otherwise lose the lot to a kill."""
         mod = self.call(JOB="views")
-        mod.FETCH_LOG[:] = [(0.0, ME, "", "views", "video", VID, 200, 0)] * (
+        mod.FETCH_LOG[:] = [(0.0, ME, "", "views", "video", VID, 200, 0, "")] * (
             mod.FETCH_LOG_BATCH - 1)
         mod.bot_api("GET", "/api/v1/videos/" + VID)
         self.assertEqual([], mod.FETCH_LOG)
@@ -204,6 +204,37 @@ class EveryCallIsLogged(unittest.TestCase):
         self.assertEqual([], mod.FETCH_LOG)
 
 
+class AnErrorInsideA200(unittest.TestCase):
+    """Invidious answers 200 with an error body when it cannot parse a video."""
+
+    def setUp(self):
+        self.mod = engine()
+        self.mod.note_bot_touch = lambda vid: None
+
+    def logged(self, answer):
+        self.mod.api = lambda *a, **k: answer
+        self.mod.bot_api("GET", "/api/v1/videos/" + VID)
+        return self.mod.FETCH_LOG[0]
+
+    def test_the_error_is_recorded_beside_the_200(self):
+        row = self.logged({"error": "could not parse"})
+        self.assertEqual(200, row[6])
+        self.assertEqual("could not parse", row[8])
+
+    def test_a_clean_answer_records_no_error(self):
+        self.assertEqual("", self.logged({"title": "fine"})[8])
+
+    def test_an_unreadable_answer_is_not_recorded_as_unanswered(self):
+        """Upstream did answer; the body was the problem."""
+        self.mod.api = lambda *a, **k: (_ for _ in ()).throw(
+            ValueError("Expecting value"))
+        with self.assertRaises(ValueError):
+            self.mod.bot_api("GET", "/api/v1/videos/" + VID)
+        row = self.mod.FETCH_LOG[0]
+        self.assertEqual(200, row[6])
+        self.assertIn("unreadable answer", row[8])
+
+
 class TheFlush(unittest.TestCase):
     def setUp(self):
         self.mod = engine()
@@ -213,21 +244,21 @@ class TheFlush(unittest.TestCase):
         self.mod.FETCH_LOG[:] = list(rows)
 
     def test_many_calls_cost_one_statement(self):
-        self.buffer((0.0, ME, "autos", "run", "video", VID, 200, 0),
-                    (1.0, ME, "autos", "run", "video", "abcdefghijk", 429, 1))
+        self.buffer((0.0, ME, "autos", "run", "video", VID, 200, 0, ""),
+                    (1.0, ME, "autos", "run", "video", "abcdefghijk", 429, 1, ""))
         self.mod.flush_fetch_log()
         self.assertEqual(1, len(self.recorded.written))
 
     def test_it_marks_only_the_upstream_sorts_as_upstream(self):
-        self.buffer((0.0, ME, "autos", "run", "video", VID, 200, 0),
-                    (0.0, ME, "autos", "run", "playlist_write", VID, 200, 0))
+        self.buffer((0.0, ME, "autos", "run", "video", VID, 200, 0, ""),
+                    (0.0, ME, "autos", "run", "playlist_write", VID, 200, 0, ""))
         self.mod.flush_fetch_log()
         written = self.recorded.written[0]
         self.assertIn("'video','%s',true" % VID, written)
         self.assertIn("'playlist_write','%s',false" % VID, written)
 
     def test_it_empties_the_buffer_so_nothing_is_written_twice(self):
-        self.buffer((0.0, ME, "", "run", "video", VID, 200, 0))
+        self.buffer((0.0, ME, "", "run", "video", VID, 200, 0, ""))
         self.mod.flush_fetch_log()
         self.mod.flush_fetch_log()
         self.assertEqual(1, len(self.recorded.written))
@@ -240,7 +271,7 @@ class TheFlush(unittest.TestCase):
         said = []
         self.mod.log = said.append
         self.mod.execute = lambda sql: (_ for _ in ()).throw(RuntimeError("no table"))
-        self.buffer((0.0, ME, "", "run", "video", VID, 200, 0))
+        self.buffer((0.0, ME, "", "run", "video", VID, 200, 0, ""))
         self.mod.flush_fetch_log()
         self.assertTrue(any("logged calls were not written" in line
                             for line in said))
@@ -251,16 +282,23 @@ class WhatSortOfNonAnswer(unittest.TestCase):
     def setUp(self):
         self.mod = engine()
 
-    def test_it_tells_the_three_apart(self):
+    def test_it_tells_them_apart(self):
         self.assertIsNone(self.mod.failure_class(200))
         self.assertEqual("rate_limited", self.mod.failure_class(429))
         self.assertEqual("upstream_5xx", self.mod.failure_class(503))
         self.assertEqual("client_4xx", self.mod.failure_class(404))
         self.assertEqual("unanswered", self.mod.failure_class(0))
 
+    def test_a_200_carrying_an_error_is_a_failure_not_a_clean_call(self):
+        """It is what buries a video for 30 days."""
+        self.assertEqual("answered_an_error",
+                         self.mod.failure_class(200, "could not parse"))
+
     def test_every_class_it_can_return_has_a_metric_label(self):
-        for status in (429, 503, 404, 0):
-            self.assertIn(self.mod.failure_class(status), self.mod.FAILURE_CLASSES)
+        for status, error in ((429, ""), (503, ""), (404, ""), (0, ""),
+                              (200, "boom")):
+            self.assertIn(self.mod.failure_class(status, error),
+                          self.mod.FAILURE_CLASSES)
 
 
 class TheCacheHitRatio(unittest.TestCase):

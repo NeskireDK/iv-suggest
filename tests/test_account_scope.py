@@ -47,7 +47,7 @@ ALLOWED = (
     # and budgeted for the instance, not per person, so these count everybody --
     # `account` is a column on the table for the SQL that asks per person.
     "SELECT %s, count(*) FROM suggest.fetches WHERE %s GROUP BY 1;",
-    "SELECT status, count(*) FROM suggest.fetches ",
+    "SELECT status, coalesce(error,''), count(*) FROM "
 )
 
 

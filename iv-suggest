@@ -269,7 +269,7 @@ CREATE TABLE IF NOT EXISTS suggest.job_runs (
 CREATE TABLE IF NOT EXISTS suggest.fetches (
   at timestamptz NOT NULL DEFAULT now(), account text, lane text, job text,
   kind text NOT NULL, target text, upstream boolean NOT NULL,
-  status int, attempt int);
+  status int, attempt int, error text);
 CREATE INDEX IF NOT EXISTS fetches_at_idx ON suggest.fetches (at);
 """
 
@@ -589,11 +589,25 @@ def bot_api(method, path, body=None, attempt=0):
     except urllib.error.HTTPError as e:
         note_fetch(kind, target_of_call(path, body), e.code, attempt)
         raise
+    except ValueError as e:
+        note_fetch(kind, target_of_call(path, body), 200, attempt,
+                   "unreadable answer: %s" % e)
+        raise
     except Exception:
         note_fetch(kind, target_of_call(path, body), 0, attempt)
         raise
-    note_fetch(kind, target_of_call(path, body), 200, attempt)
+    note_fetch(kind, target_of_call(path, body), 200, attempt,
+               error_in_the_answer(answer))
     return answer
+
+
+# Invidious answers 200 with an error in the body when it cannot parse a video,
+# and `Fetcher.video` buries that video for 30 days on the strength of it. Read
+# as a clean call, a degraded night spends the whole budget and blacklists real
+# videos while every failure gauge sits at 0.
+def error_in_the_answer(answer):
+    """The error Invidious put in a 200, or "" when it did not."""
+    return str(answer.get("error") or "") if isinstance(answer, dict) else ""
 
 
 # The calls that can make Invidious go out to YouTube. A metadata fetch and a
@@ -608,11 +622,14 @@ UPSTREAM_KINDS = ("video", "channel_latest", "playlist_add")
 # A 429 means slow down, a 5xx means somebody upstream is having a bad minute,
 # and nothing at all means neither -- three different answers that used to end
 # up as the same line of prose in a journal the nightly throws away.
-FAILURE_CLASSES = ("rate_limited", "upstream_5xx", "client_4xx", "unanswered")
+FAILURE_CLASSES = ("rate_limited", "upstream_5xx", "client_4xx", "unanswered",
+                   "answered_an_error")
 
 
-def failure_class(status):
+def failure_class(status, error=""):
     """Which sort of non-answer this was, or None when the call succeeded."""
+    if error:
+        return "answered_an_error"
     if status == 200:
         return None
     if status == 429:
@@ -674,10 +691,10 @@ def for_nobody_in_particular():
     ACCOUNT = ""
 
 
-def note_fetch(kind, target, status, attempt):
+def note_fetch(kind, target, status, attempt, error=""):
     """Buffer one call, dated now: the flush is minutes later and in one batch."""
     FETCH_LOG.append((time.time(), ACCOUNT, LANE, JOB, kind, target, status,
-                      attempt))
+                      attempt, error[:200]))
     if len(FETCH_LOG) >= FETCH_LOG_BATCH:
         flush_fetch_log()
 
@@ -688,15 +705,17 @@ def flush_fetch_log():
         return
     lost = len(FETCH_LOG)
     rows = ",".join(
-        "(to_timestamp(%.6f),%s,%s,%s,%s,%s,%s,%d,%d)"
+        "(to_timestamp(%.6f),%s,%s,%s,%s,%s,%s,%d,%d,%s)"
         % (at, lit(account), lit(lane), lit(job), lit(kind), lit(target),
-           "true" if kind in UPSTREAM_KINDS else "false", status, attempt)
-        for at, account, lane, job, kind, target, status, attempt in FETCH_LOG)
+           "true" if kind in UPSTREAM_KINDS else "false", status, attempt,
+           lit(error))
+        for at, account, lane, job, kind, target, status, attempt, error
+        in FETCH_LOG)
     del FETCH_LOG[:]
     try:
         execute("INSERT INTO suggest.fetches"
-                "(at,account,lane,job,kind,target,upstream,status,attempt) "
-                "VALUES %s;" % rows)
+                "(at,account,lane,job,kind,target,upstream,status,attempt,"
+                "error) VALUES %s;" % rows)
     except Exception as e:
         log("  WARNING: %d logged calls were not written: %r" % (lost, e))
 
@@ -3250,10 +3269,11 @@ def failure_samples(window):
     """Failed upstream calls per class, read in Python so the buckets live once."""
     counted = dict((name, 0) for name in FAILURE_CLASSES)
     if table_exists("suggest.fetches"):
-        for status, rows in query(
-                "SELECT status, count(*) FROM suggest.fetches "
-                "WHERE upstream AND status <> 200 AND %s GROUP BY 1;" % window):
-            counted[failure_class(int(status))] += int(rows)
+        for status, error, rows in query(
+                "SELECT status, coalesce(error,''), count(*) FROM "
+                "suggest.fetches WHERE upstream AND (status <> 200 OR "
+                "coalesce(error,'') <> '') AND %s GROUP BY 1, 2;" % window):
+            counted[failure_class(int(status), error)] += int(rows)
     return [('{class="%s"}' % name, counted[name]) for name in FAILURE_CLASSES]
 
 
@@ -3305,8 +3325,10 @@ def _instance_wide_metrics(metric, users):
            fetch_samples("upstream AND at > now() - interval '1 day'",
                          "kind", UPSTREAM_KINDS))
     metric("upstream_failures_24h",
-           "Upstream calls in the last day that did not answer 200, by sort of "
-           "non-answer. `rate_limited` rising is the one that means back off.",
+           "Upstream calls in the last day that did not come back clean, by "
+           "sort of failure. `rate_limited` rising means back off; "
+           "`answered_an_error` is a 200 carrying an error, which is what "
+           "buries a video for 30 days.",
            "gauge", failure_samples("at > now() - interval '1 day'"))
     metric("cache_hit_ratio_24h",
            "Share of metadata lookups the permanent cache answered over the "

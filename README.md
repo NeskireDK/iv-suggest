@@ -208,7 +208,7 @@ fallback when a listing is stored, and this command refreshes the rest.
 
 `suggest.fetches` holds **one row per call the engine makes**: when, which
 account, which lane, which job, what sort, what it was about, the HTTP status,
-and the attempt number. `job` is the subcommand, which is what tells the nightly
+the attempt number, and any error the answer carried. `job` is the subcommand, which is what tells the nightly
 fill's traffic from a `views` somebody started by hand. `lane` is set by the
 fill and left empty by every other job, `dedupe` included: only the fill's
 dispatcher starts a lane. `views` leaves **`account` empty too**, because the
@@ -248,9 +248,11 @@ WHERE upstream AND job = 'run' AND at > now() - interval '7 days'
 GROUP BY 1, 2 ORDER BY 3 DESC;
 
 -- what the retries and the refusals cost, by sort of non-answer
-SELECT date_trunc('day', at) AS day, status, count(*)
-FROM suggest.fetches WHERE upstream AND status <> 200
-GROUP BY 1, 2 ORDER BY 1 DESC;
+SELECT date_trunc('day', at) AS day, status, left(error, 40) AS answered,
+       count(*)
+FROM suggest.fetches
+WHERE upstream AND (status <> 200 OR coalesce(error, '') <> '')
+GROUP BY 1, 2, 3 ORDER BY 1 DESC;
 
 -- the cache hit ratio per night, which the run used to only print
 SELECT date_trunc('day', started) AS day,
@@ -268,8 +270,16 @@ instead, so a timeout kill cannot take a whole run's log with it.
 
 Three metrics carry the same numbers into Prometheus for alerting:
 `iv_suggest_upstream_fetches_24h{kind}`,
-`iv_suggest_upstream_failures_24h{class}` — `rate_limited` rising is the one
-that means back off — and `iv_suggest_cache_hit_ratio_24h`.
+`iv_suggest_upstream_failures_24h{class}` and
+`iv_suggest_cache_hit_ratio_24h`.
+
+`rate_limited` rising means back off. `answered_an_error` is the one worth
+knowing about: Invidious answers **200 with an error in the body** when it cannot
+parse a video, and `Fetcher.video` buries that video for 30 days on the strength
+of it. Counted as a clean call, a degraded night spends the whole fetch budget
+and blacklists real videos while every failure count sits at zero. A body that
+cannot be read at all is recorded as a 200 with an error too, because upstream
+did answer — the body was the problem.
 
 That last one is `cache_hits / lookups`, both counted at the point of lookup.
 It is deliberately not built on `fetches`, which counts channel listings and
