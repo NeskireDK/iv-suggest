@@ -2596,8 +2596,11 @@ VIDEO_CACHE_LIFETIME_HOURS = 6
 
 # A call by this bot refreshes the same cache row a person's playback does, so
 # the two are told apart by whether suggest.bot_touches lands next to it. The
-# call itself takes up to 3 seconds, hence a window rather than equality.
-BOT_FETCH_MATCH_SECONDS = 60
+# touch is written before the call and Invidious stamps `updated` only once its
+# own upstream fetch returns, which this client waits 30 seconds for -- so the
+# gap is bounded by that timeout, not by a few milliseconds. Widening it costs
+# only a play made within the window of an engine write to the same video.
+BOT_FETCH_MATCH_SECONDS = 120
 
 # A touch is only ever compared against a cache row, and Invidious deletes
 # those after VIDEO_CACHE_LIFETIME_HOURS, so a day is already generous.
@@ -3068,9 +3071,9 @@ def _instance_wide_metrics(metric, users):
            "this can go down." % PLAY_LOG_DAYS, "gauge",
            plays_samples("true"))
     metric("last_judged_open_timestamp_seconds",
-           "Newest open the harvest has judged, marked or not. This one goes "
-           "quiet when nobody watches anything, which is why it is not the "
-           "liveness signal.", "gauge",
+           "Newest cache refresh the harvest has judged, this engine's own "
+           "writes included. Alert on the harvest timestamp instead: a fill "
+           "keeps this one moving whether or not anybody watched.", "gauge",
            [("", newest_judged_open())])
     metric("up", "1 when this exporter read the database.", "gauge",
            [("", 1)])

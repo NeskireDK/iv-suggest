@@ -40,6 +40,7 @@ def setUpModule():
 def drive_a_night_then_a_viewer(engine, instance):
     instance.enrol(ALICE)
     engine.cmd_init(Args())
+    instance.harvest()
     HARNESS["before"] = instance.watched_by(ALICE.email)
     instance.night()
     HARNESS["after_a_night"] = instance.watched_by(ALICE.email)
@@ -48,6 +49,10 @@ def drive_a_night_then_a_viewer(engine, instance):
     instance.harvest()
     HARNESS["after_harvesting_the_night"] = instance.watched_by(ALICE.email)
     HARNESS["judged_the_night"] = int(count(instance, "suggest.plays") or 0)
+    HARNESS["called_the_bots"] = int(instance.db.value(
+        "SELECT count(*) FROM suggest.plays WHERE outcome = 'bot';") or 0)
+    HARNESS["called_a_play"] = int(instance.db.value(
+        "SELECT count(*) FROM suggest.plays WHERE outcome <> 'bot';") or 0)
 
     opened = instance.db.value("SELECT min(id) FROM videos;")
     HARNESS["opened"] = opened
@@ -87,8 +92,16 @@ class AFillIsNotWatching(unittest.TestCase):
         """The pair of calls per video is the case a single latest touch loses."""
         self.assertGreater(HARNESS["touch_rows"], HARNESS["cache_rows"])
 
-    def test_nothing_from_the_night_was_judged_a_play(self):
-        self.assertEqual(0, HARNESS["judged_the_night"])
+    def test_the_nights_refreshes_were_in_range_to_be_judged(self):
+        """A harvest runs before the fill as well, so its watermark predates it.
+        Without that the scan starts after the night and proves nothing."""
+        self.assertGreater(HARNESS["judged_the_night"], 0)
+
+    def test_every_one_of_them_was_judged_this_engine_writing(self):
+        self.assertEqual(HARNESS["judged_the_night"], HARNESS["called_the_bots"])
+
+    def test_not_one_of_them_was_judged_a_play(self):
+        self.assertEqual(0, HARNESS["called_a_play"])
 
 
 class AViewersOpenIsWatching(unittest.TestCase):
@@ -105,7 +118,8 @@ class AViewersOpenIsWatching(unittest.TestCase):
 
     def test_the_engines_own_older_touches_did_not_veto_it(self):
         """The touch rows are aged, not deleted, so the window is really read."""
-        self.assertEqual(1, HARNESS["judged_the_open"])
+        self.assertEqual(HARNESS["judged_the_night"] + 1,
+                         HARNESS["judged_the_open"])
 
 
 class ARepeatedHarvest(unittest.TestCase):

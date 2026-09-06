@@ -91,8 +91,8 @@ the host — Invidious publishes no port for it — so installing it would break
    not a failure and not a pass.
 4. **Repoint the timers.** `install -m 644 systemd/* /etc/systemd/system/`,
    check each `WorkingDirectory`, `systemctl daemon-reload`, then
-   `systemctl enable --now iv-suggest-sid-check.timer` and disable the old
-   `iv-sid-check.timer`. The shipped units carry three things that are load
+   `systemctl enable --now iv-suggest-sid-check.timer iv-suggest-harvest.timer`
+   and disable the old `iv-sid-check.timer`. The shipped units carry three things that are load
    bearing, each explained where it sits: a fixed `--name`, an `ExecStopPost`
    removal, and `--no-deps`.
 5. **Repoint the metrics line.** In `iv-stats-json.sh`, one line:
@@ -166,6 +166,25 @@ whether anything the image is built from has moved:
 # on 108, in the repo -- empty output means the running tag is current
 git log --oneline <deployed-tag>..main -- iv-suggest Dockerfile
 ```
+
+## Upgrading to a tag that adds a table
+
+**Move the tag, pull, then run `init` before any timer fires.** `init` is
+idempotent and its whole job is `CREATE TABLE IF NOT EXISTS`, so it costs
+nothing on a deploy that adds none:
+
+```sh
+# on 109, in /root/docker/youtube, after editing IV_SUGGEST_IMAGE_TAG
+docker compose pull iv-suggest
+docker compose run --rm -T --no-deps iv-suggest init
+```
+
+Skipping it does not fail cleanly. `bot_api` writes a row before every call it
+makes, so a missing `suggest.bot_touches` raises inside the fetch loop, where
+`Fetcher.video` swallows it as an unreachable video: three attempts with a
+growing backoff, budget spent on nothing, and the lane giving up after five
+consecutive failures. The run looks like a bad night upstream rather than a
+half-finished deploy.
 
 ## Rolling back
 
