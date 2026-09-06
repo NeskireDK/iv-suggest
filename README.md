@@ -145,12 +145,19 @@ trace of that playback is Invidious refreshing its own `videos` cache row, which
 it does on any metadata fetch more than ten minutes stale; this command reads
 those refreshes and marks the video watched.
 
-It has to tell a person's open from this bot's own metadata fetches, of which a
-fill makes about 160 a night — marking those would have the next fill reject its
-own candidates. The two are separated by whether `suggest.video_meta.fetched`
-lands within a minute of the cache refresh. A play that coincides with a fetch
-of the same video inside that minute is skipped, which is the safe direction:
-miss a real play rather than invent one.
+It has to tell a person's open from this engine's own writes, and there are more
+of those than the obvious one. `insert_video_into_playlist` reaches `get_video`
+too, so **every candidate a fill adds to a lane rewrites the same row a playback
+does** — about 60 a night on top of 160 metadata fetches. Marking those watched
+would have the next fill retire its own candidates with a 365-day cooldown.
+
+So every call the engine makes goes through `bot_api`, which records the video
+into `suggest.bot_touches` before the call. The harvest treats an open as a
+person's only when no touch lands within a minute of the refresh. A play that
+coincides with an engine write to the same video inside that minute is skipped,
+which is the safe direction: miss a real play rather than invent one. A static
+test holds `api` to having exactly one caller, so a new call site cannot quietly
+start reading as somebody watching.
 
 Every open it judges is written to `suggest.plays`, skipped ones included, and
 that log is also the watermark. Invidious deletes a cache row six hours after
@@ -159,12 +166,17 @@ with no trace anywhere; the shipped one runs twice an hour. It exits 1 when the
 history API refused an open — 409 is the account's own `watch_history`
 preference being off.
 
-Four series follow it: `iv_suggest_plays_judged_24h{outcome=}` and
+Four series follow it. `iv_suggest_plays_judged_24h{outcome=}` and
 `iv_suggest_plays_logged{outcome=}` split every open into `watched`, `bot` or
-`refused`, and `iv_suggest_plays_watermark_age_seconds` is the one to alert on —
-past the six hour cache lifetime the harvest is losing opens with no trace. A
-rising `bot` share against a flat `watched` count is the separation drifting,
-which is the thing to watch as the fill's fetch volume changes.
+`refused`; a rising `bot` share against a flat `watched` count is the separation
+drifting, which is the thing to watch as the fill's fetch volume changes.
+
+`iv_suggest_last_play_harvest_timestamp_seconds` is the one to alert on —
+`time() - it > 6h` means the harvest has stopped and Invidious is deleting opens
+before it reads them. It dates the *run*, so it does not go quiet just because
+nobody watched anything; `iv_suggest_last_judged_open_timestamp_seconds` is the
+one that does, which is why it is not the liveness signal. Both read 0 for
+"never", so the staleness expression fires rather than looking healthy.
 
 `sid-check` exits 0 when every login survived, 1 when one did not, and **2 when
 it cannot tell** — no recorded nightly, or one too old to be evidence. Two is

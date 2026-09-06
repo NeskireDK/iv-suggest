@@ -26,7 +26,7 @@ SECOND_HUMAN_OPEN = ("irTExR9_FRY", "2026-09-06 10:22:31", "f")
 class Instance:
     """The database and the history API, as the harvest reaches them."""
 
-    def __init__(self, opens=(), watermark=0, refuse=None):
+    def __init__(self, opens=(), watermark="", refuse=None):
         self.opens = list(opens)
         self.watermark = watermark
         self.refuse = refuse or {}
@@ -35,6 +35,7 @@ class Instance:
         self.marked = []
         self.scan_sql = ""
         self.served = []
+        self.dated = False
 
     def install(self, mod):
         mod.one = self.one
@@ -62,8 +63,11 @@ class Instance:
         return []
 
     def execute(self, sql):
-        if "DELETE FROM suggest.plays" in sql:
+        if sql.startswith("DELETE FROM"):
             self.pruned = True
+            return
+        if "suggest.job_runs" in sql:
+            self.dated = True
             return
         self.written.append(sql)
 
@@ -134,25 +138,32 @@ class TheBotsOwnFetch(unittest.TestCase):
 
 class TheScanWindow(unittest.TestCase):
     def test_a_first_run_looks_back_only_as_far_as_the_cache_lives(self):
-        inst = Instance(opens=[], watermark=0)
+        inst = Instance(opens=[], watermark="")
         _, mod = harvest(inst)
         self.assertIn("interval '%d hours'" % mod.VIDEO_CACHE_LIFETIME_HOURS,
                       inst.scan_sql)
-        self.assertNotIn("to_timestamp", inst.scan_sql)
 
     def test_a_later_run_starts_where_the_last_one_stopped(self):
-        inst = Instance(opens=[], watermark=1757145600)
+        inst = Instance(opens=[], watermark="2026-09-06 10:04:00.123456+00")
         harvest(inst)
-        self.assertIn("to_timestamp(1757145600", inst.scan_sql)
+        self.assertIn("'2026-09-06 10:04:00.123456+00'::timestamptz",
+                      inst.scan_sql)
         self.assertNotIn("interval '6 hours'", inst.scan_sql)
 
-    def test_an_empty_scan_writes_nothing_and_succeeds(self):
+    def test_the_watermark_keeps_the_microseconds_it_was_given(self):
+        """Truncated to the second, the newest open is re-judged every run."""
+        inst = Instance(opens=[], watermark="2026-09-06 10:04:00.123456+00")
+        harvest(inst)
+        self.assertIn(".123456", inst.scan_sql)
+
+    def test_an_empty_scan_marks_nothing_but_still_dates_the_run(self):
         inst = Instance(opens=[])
         code, _ = harvest(inst)
         self.assertEqual(0, code)
         self.assertEqual([], inst.written)
         self.assertEqual([], inst.marked)
-        self.assertFalse(inst.pruned)
+        self.assertTrue(inst.dated)
+        self.assertTrue(inst.pruned)
 
 
 class ADryRun(unittest.TestCase):
@@ -163,6 +174,7 @@ class ADryRun(unittest.TestCase):
         self.assertEqual([], inst.marked)
         self.assertEqual([], inst.written)
         self.assertFalse(inst.pruned)
+        self.assertFalse(inst.dated)
 
 
 class ARefusal(unittest.TestCase):
@@ -204,6 +216,59 @@ class TheLog(unittest.TestCase):
         recorded = [outcome for outcome in mod.PLAY_OUTCOMES
                     for row in rows if "'%s'" % outcome in row]
         self.assertEqual(sorted(mod.PLAY_OUTCOMES), sorted(recorded))
+
+
+class TheScanSql(unittest.TestCase):
+    """The join is the whole correctness argument, so its shape is asserted.
+
+    `insert_video_into_playlist` calls `get_video` as well, so every candidate
+    the fill adds to a lane rewrites the same cache row a viewer does. Reading
+    the metadata cache instead of the touch log would call each of those a play.
+    """
+
+    def test_it_reads_the_touch_log_and_not_the_metadata_cache(self):
+        inst = Instance(opens=[])
+        _, mod = harvest(inst)
+        self.assertIn("suggest.bot_touches", inst.scan_sql)
+        self.assertNotIn("video_meta", inst.scan_sql)
+
+    def test_it_matches_a_touch_on_either_side_of_the_refresh(self):
+        inst = Instance(opens=[])
+        _, mod = harvest(inst)
+        window = "interval '%d seconds'" % mod.BOT_FETCH_MATCH_SECONDS
+        self.assertEqual(2, inst.scan_sql.count(window))
+
+
+class EveryCallThatRefreshesACacheRow(unittest.TestCase):
+    """Recorded at the choke point, or a new call site starts looking human."""
+
+    def cases(self):
+        mod = load(IV_SUGGEST_ACCOUNT=ME)
+        return mod, mod.video_the_call_refreshes
+
+    def test_a_metadata_fetch_is_a_touch(self):
+        _, refreshes = self.cases()
+        self.assertEqual("dQw4w9WgXcQ",
+                         refreshes("/api/v1/videos/dQw4w9WgXcQ", None))
+
+    def test_adding_a_video_to_a_lane_is_a_touch(self):
+        _, refreshes = self.cases()
+        self.assertEqual("dQw4w9WgXcQ",
+                         refreshes("/api/v1/auth/playlists/IVPLx/videos",
+                                   {"videoId": "dQw4w9WgXcQ"}))
+
+    def test_reading_the_playlists_is_not(self):
+        _, refreshes = self.cases()
+        self.assertIsNone(refreshes("/api/v1/auth/playlists", None))
+
+    def test_removing_a_video_by_index_is_not(self):
+        _, refreshes = self.cases()
+        self.assertIsNone(
+            refreshes("/api/v1/auth/playlists/IVPLx/videos/12345", None))
+
+    def test_a_channel_listing_is_not(self):
+        _, refreshes = self.cases()
+        self.assertIsNone(refreshes("/api/v1/channels/UCabc/latest", None))
 
 
 class TheMetricSamples(unittest.TestCase):

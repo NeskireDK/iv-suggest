@@ -190,6 +190,8 @@ CREATE INDEX channel_videos_ucid_idx ON channel_videos (ucid);
 CREATE TABLE channels (
   id text NOT NULL, author text, updated timestamptz, deleted boolean,
   subscribed timestamptz, CONSTRAINT channels_id_key UNIQUE (id));
+CREATE UNLOGGED TABLE videos (
+  id text NOT NULL PRIMARY KEY, info text, updated timestamptz);
 """
 
 
@@ -360,13 +362,32 @@ class ApiStub:
             return self._video(path.rsplit("/", 1)[-1])
         if path.startswith("/api/v1/channels/"):
             return self._channel_latest(path.split("/")[4])
+        if path.startswith("/api/v1/auth/history/"):
+            return self._mark_watched(path.rsplit("/", 1)[-1].split("?")[0])
         if path == "/api/v1/auth/playlists":
             return self._create(body)
         if path.startswith("/api/v1/auth/playlists/"):
             return self._playlist(method, path.split("/")[5:], body)
         raise AssertionError("the stub was asked for %s %s" % (method, path))
 
+    def _mark_watched(self, vid):
+        """What Invidious does: append, having removed it, so it reads as newest."""
+        lit = self.engine.lit
+        self.db.psql(
+            "UPDATE users SET watched = array_append(array_remove(watched, %s), "
+            "%s) WHERE email = %s;" % (lit(vid), lit(vid), lit(self.engine.ACCOUNT)))
+        return None
+
+    def _refresh_video_cache(self, vid):
+        """What `get_video` does, and the reason a playlist add looks like a play.
+        Both routes reach it, so both rewrite the row a viewer's playback does."""
+        self.db.psql(
+            "INSERT INTO videos(id, info, updated) VALUES (%s, '{}', now()) "
+            "ON CONFLICT (id) DO UPDATE SET updated = now();"
+            % self.engine.lit(vid))
+
     def _video(self, vid):
+        self._refresh_video_cache(vid)
         self.fetched.append(vid)
         if vid in self.missing:
             raise urllib.error.HTTPError(vid, 404, "no such video", {}, None)
@@ -439,6 +460,7 @@ class ApiStub:
 
     def _add(self, plid, vid):
         lit = self.engine.lit
+        self._refresh_video_cache(vid)
         channel = channel_of(vid)
         index = int(self.db.value(
             "SELECT coalesce(max(\"index\"),0)+1 FROM playlist_videos "
@@ -593,6 +615,25 @@ class Instance:
         """One nightly run, as the timer would fire it."""
         self.log.append("=== iv-suggest run %s ===" % sorted(over.items()))
         return self.engine.cmd_run(Args(**over))
+
+    def harvest(self, **over):
+        """One play harvest, as its timer would fire it."""
+        self.log.append("=== iv-suggest harvest-plays %s ===" % sorted(over.items()))
+        return self.engine.cmd_harvest_plays(Args(**over))
+
+    def somebody_opens(self, vid):
+        """A viewer's playback: Invidious refreshes the row, nothing tells us who."""
+        self.db.psql(
+            "INSERT INTO videos(id, info, updated) VALUES (%s, '{}', now()) "
+            "ON CONFLICT (id) DO UPDATE SET updated = now(); "
+            "DELETE FROM suggest.bot_touches WHERE vid = %s;"
+            % (self.engine.lit(vid), self.engine.lit(vid)))
+
+    def watched_by(self, email):
+        """That account's watch history, oldest first, as Invidious stores it."""
+        rows = self.db.value("SELECT array_to_string(watched, ' ') FROM users "
+                             "WHERE email = %s;" % self.engine.lit(email))
+        return (rows or "").split()
 
     def hour(self, **over):
         """One hourly reorder, as the shuffle timer would fire it."""
