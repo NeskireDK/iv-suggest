@@ -1,0 +1,14 @@
+[Unit]
+Description=Half-hourly harvest of what somebody opened
+
+# Invidious drops a video cache row 6 hours after its last refresh, so this is
+# the interval that has to hold: a gap longer than that loses opens with no
+# trace. Half-hourly leaves eleven missed runs of headroom. The offset keeps it
+# clear of the hourly shuffle, which competes for the same compose project.
+[Timer]
+OnCalendar=*:07,37
+RandomizedDelaySec=60
+Persistent=false
+
+[Install]
+WantedBy=timers.target

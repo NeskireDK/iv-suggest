@@ -316,7 +316,8 @@ class WhoMints(unittest.TestCase):
     def test_an_api_caller_never_sets_the_account_without_a_session(self):
         api_callers = callers_of(self.source, "api")
         for expected in ("run_account", "dedupe_account",
-                         "videos_across_every_lane", "retire_item"):
+                         "videos_across_every_lane", "retire_item",
+                         "cmd_harvest_plays"):
             self.assertIn(expected, api_callers)
         self.assertEqual(set(),
                          api_callers & callers_of(self.source, "use_account"),

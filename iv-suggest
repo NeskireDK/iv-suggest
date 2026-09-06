@@ -210,6 +210,14 @@ CREATE TABLE IF NOT EXISTS suggest.accounts (
 -- run in a container with no Docker socket and no systemd to ask.
 CREATE TABLE IF NOT EXISTS suggest.host_events (
   event text PRIMARY KEY, at timestamptz NOT NULL DEFAULT now());
+-- Every video open the harvest has judged. Yattee reports no play at all, so
+-- the only server side trace of one is Invidious refreshing its own metadata
+-- cache; `harvest-plays` reads that and marks the video watched. A skipped row
+-- is written too, with the reason: that is what moves the watermark past an
+-- open this bot caused itself, so it is never reconsidered.
+CREATE TABLE IF NOT EXISTS suggest.plays (
+  vid text, played timestamptz, account text, marked boolean, why text,
+  PRIMARY KEY (vid, played));
 """
 
 # Bring a single-account database up to the shape above. Everything that exists
@@ -2539,6 +2547,22 @@ def cmd_init(args):
     return 0
 
 
+# Invidious deletes a `videos` cache row 6 hours after its last refresh
+# (database/videos.cr delete_expired), so an open older than that leaves no
+# trace anywhere. It is the furthest back a first harvest can usefully look.
+VIDEO_CACHE_LIFETIME_HOURS = 6
+
+# A fetch by this bot refreshes the same cache row a person's playback does, so
+# the two are told apart by whether suggest.video_meta.fetched lands next to it.
+# The API call itself takes up to 3 seconds, hence a window rather than equality.
+BOT_FETCH_MATCH_SECONDS = 60
+
+# Long enough to answer "did it mark that one?" months later, short enough that
+# the table stays a log rather than a second watch history.
+PLAY_LOG_DAYS = 180
+
+BOT_FETCHED_IT = "the bot fetched it, not a person"
+
 NIGHTLY_RECREATE = "nightly-recreate"
 # A boundary older than this cannot be evidence of anything: every session
 # predates it, so the check would pass every account while watching nothing.
@@ -2582,6 +2606,84 @@ def recorded_sessions():
                 "FROM suggest.accounts a LEFT JOIN session_ids s "
                 "ON s.id = a.sid AND s.email = a.account ORDER BY 1;"
                 % lit(NIGHTLY_RECREATE))]
+
+
+def plays_watermark():
+    """When this harvest last judged an open; 0.0 before it has ever run."""
+    return float(one("SELECT coalesce(extract(epoch FROM max(played)), 0) "
+                     "FROM suggest.plays;") or 0)
+
+
+def unjudged_opens(since):
+    """Videos Invidious refreshed its cache for since `since`, oldest first.
+    Each carries whether this bot's own fetch is what refreshed it."""
+    floor = ("to_timestamp(%f)" % since if since
+             else "now() - interval '%d hours'" % VIDEO_CACHE_LIFETIME_HOURS)
+    return [(vid, when, by_the_bot == "t") for vid, when, by_the_bot in query(
+        "SELECT v.id, to_char(v.updated, 'YYYY-MM-DD HH24:MI:SS'), "
+        "(m.fetched BETWEEN v.updated - interval '%d seconds' "
+        "                AND v.updated + interval '%d seconds') "
+        "FROM videos v LEFT JOIN suggest.video_meta m ON m.vid = v.id "
+        "WHERE v.updated > %s ORDER BY v.updated;"
+        % (BOT_FETCH_MATCH_SECONDS, BOT_FETCH_MATCH_SECONDS, floor))]
+
+
+def mark_watched(vid):
+    """Record a watch for the current account; 0, or the status that refused it."""
+    try:
+        api("POST", "/api/v1/auth/history/" + vid)
+    except urllib.error.HTTPError as e:
+        return e.code
+    return 0
+
+
+def record_judged_open(vid, when, marked, why):
+    """Remember this open was judged, so the watermark moves past it either way."""
+    execute("INSERT INTO suggest.plays(vid, played, account, marked, why) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (vid, played) DO NOTHING;"
+            % (lit(vid), lit(when), acct(),
+               "true" if marked else "false", lit(why)))
+
+
+def forget_old_plays():
+    """Drop judged opens from past the point anyone would ask about them."""
+    execute("DELETE FROM suggest.plays WHERE played < now() - interval '%d days';"
+            % PLAY_LOG_DAYS)
+
+
+def cmd_harvest_plays(args):
+    """Mark as watched what somebody opened, because Yattee reports no play."""
+    serve_account(PRIMARY)
+    opens = unjudged_opens(plays_watermark())
+    if not opens:
+        log("nothing opened since the last harvest")
+        return 0
+    marked, refused = 0, 0
+    for vid, when, by_the_bot in opens:
+        if by_the_bot:
+            why = BOT_FETCHED_IT
+        elif args.dry_run:
+            why = "dry run"
+        else:
+            status = mark_watched(vid)
+            why = "history API said %d" % status if status else ""
+            if status:
+                refused += 1
+            else:
+                marked += 1
+        log("  %s  %s  %s" % (when, vid, why or "marked watched"))
+        if not args.dry_run:
+            record_judged_open(vid, when, not why, why)
+    log("%d opened, %d marked watched, %d left alone%s"
+        % (len(opens), marked, len(opens) - marked,
+           " (dry run, nothing written)" if args.dry_run else ""))
+    if not args.dry_run:
+        forget_old_plays()
+    if refused:
+        log("a refusal is Invidious declining to record it. 409 is the "
+            "account's own watch_history preference being off, which no retry "
+            "will fix.")
+    return 1 if refused else 0
 
 
 def cmd_sid_check(args):
@@ -2826,6 +2928,18 @@ def _instance_wide_metrics(metric, users):
            "gauge",
            [("", one("SELECT count(*) FROM suggest.video_dead "
                      "WHERE until > now();") or 0)])
+    metric("plays_harvested_24h",
+           "Opens marked watched in the last day. Yattee reports no play at "
+           "all, so a day at 0 means the harvest stopped, not that nobody "
+           "watched anything.", "gauge",
+           [("", one("SELECT CASE WHEN to_regclass('suggest.plays') IS NULL "
+                     "THEN 0 ELSE (SELECT count(*) FROM suggest.plays WHERE "
+                     "marked AND played > now() - interval '1 day') END;") or 0)])
+    metric("last_play_harvest_timestamp_seconds",
+           "Newest open the harvest has judged, marked or not.", "gauge",
+           [("", one("SELECT CASE WHEN to_regclass('suggest.plays') IS NULL "
+                     "THEN 0 ELSE (SELECT coalesce(extract(epoch FROM "
+                     "max(played))::bigint, 0) FROM suggest.plays) END;") or 0)])
     metric("up", "1 when this exporter read the database.", "gauge",
            [("", 1)])
 
@@ -2856,6 +2970,10 @@ def main():
     v.add_argument("--account", help="refresh only this account's lanes")
     v.add_argument("--rate", type=int, default=RATE_PER_MIN, help="fetches per minute")
     v.add_argument("--budget", type=int, default=MAX_FETCHES, help="fetches per run")
+    h = sub.add_parser("harvest-plays",
+                       help="mark what somebody opened as watched; Yattee "
+                            "reports no play of its own")
+    h.add_argument("--dry-run", action="store_true")
     sub.add_parser("sid-check",
                    help="did each account's login survive the nightly restart")
     s = sub.add_parser("shuffle", help="reorder the lanes; database only, no fetches")
@@ -2866,6 +2984,7 @@ def main():
     command = {"init": cmd_init, "run": cmd_run, "status": cmd_status,
                "metrics": cmd_metrics, "dedupe": cmd_dedupe,
                "views": cmd_views, "shuffle": cmd_shuffle,
+               "harvest-plays": cmd_harvest_plays,
                "sid-check": cmd_sid_check}[args.cmd]
     try:
         return command(args)

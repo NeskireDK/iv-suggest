@@ -80,7 +80,8 @@ docker compose run --rm iv-suggest run      # fill the lanes
 install -m 644 systemd/* /etc/systemd/system/
 $EDITOR /etc/systemd/system/iv-suggest.service     # WorkingDirectory, if not
                                                    # /root/docker/youtube
-systemctl enable --now iv-suggest.timer iv-suggest-shuffle.timer
+systemctl enable --now iv-suggest.timer iv-suggest-shuffle.timer \
+                       iv-suggest-harvest.timer
 ```
 
 One config file, two variables, no unit for the engine itself. The timers run
@@ -130,9 +131,33 @@ iv-suggest dedupe [--dry-run] [--account EMAIL]   one upload per song
 iv-suggest views [--rate N] [--budget N]          backfill missing view counts
            [--account EMAIL]
 iv-suggest metrics                                Prometheus text, database only
+iv-suggest harvest-plays [--dry-run]              mark what somebody opened as
+                                                  watched
 iv-suggest sid-check                              did the logins survive the
                                                   nightly restart
 ```
+
+`harvest-plays` exists because Yattee reports no play. It syncs subscriptions
+and playlists with Invidious but never calls
+`POST /api/v1/auth/history/:id`, so a video watched on an Apple TV never reaches
+`users.watched` and every lane keeps offering it back. The only server side
+trace of that playback is Invidious refreshing its own `videos` cache row, which
+it does on any metadata fetch more than ten minutes stale; this command reads
+those refreshes and marks the video watched.
+
+It has to tell a person's open from this bot's own metadata fetches, of which a
+fill makes about 160 a night — marking those would have the next fill reject its
+own candidates. The two are separated by whether `suggest.video_meta.fetched`
+lands within a minute of the cache refresh. A play that coincides with a fetch
+of the same video inside that minute is skipped, which is the safe direction:
+miss a real play rather than invent one.
+
+Every open it judges is written to `suggest.plays`, skipped ones included, and
+that log is also the watermark. Invidious deletes a cache row six hours after
+the last refresh, so the timer has to run more often than that or opens are lost
+with no trace anywhere; the shipped one runs twice an hour. It exits 1 when the
+history API refused an open — 409 is the account's own `watch_history`
+preference being off.
 
 `sid-check` exits 0 when every login survived, 1 when one did not, and **2 when
 it cannot tell** — no recorded nightly, or one too old to be evidence. Two is
