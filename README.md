@@ -204,6 +204,96 @@ A candidate that only ever arrived through `recommendedVideos` or
 without the backfill it would show 0 for ever. The text form is parsed as a free
 fallback when a listing is stored, and this command refreshes the rest.
 
+## What it records, and how to ask
+
+`suggest.fetches` holds **one row per call the engine makes**: when, which
+account, which lane, which job, what sort, what it was about, the HTTP status,
+the attempt number, and any error the answer carried. `job` is the subcommand, which is what tells the nightly
+fill's traffic from a `views` somebody started by hand. `lane` is set by the
+fill and left empty by every other job, `dedupe` included: only the fill's
+dispatcher starts a lane. `views` leaves **`account` empty too**, because the
+set it walks is de-duplicated across accounts — one fetch serves everybody, and
+naming whichever account the collection happened to serve last would charge one
+person for the household. It is the only place a request is dated — `suggest.runs` carries
+a count per lane per night and nothing finer, so before this table "how many
+requests reached YouTube in that hour, for whom, of what sort" had no answer.
+
+`upstream` marks the calls that **can** reach YouTube, and it is a column rather
+than something each query works out from paths. `video` and `channel_latest`
+always do: the video cache is short lived and a channel listing is not cached at
+all. `playlist_add` can, because adding a video reaches `get_video` too — it
+goes out whenever that cache row has gone stale, which is the normal case for a
+compiled `mix` or `consensus` lane adding a video no lane fetched recently, and
+not the case for a fill adding a candidate it fetched a minute ago. So
+`WHERE upstream` is an upper bound; `WHERE kind IN ('video','channel_latest')`
+is the calls made *in order to* fetch. A playlist read, delete or create never
+leaves the machine.
+
+Rows are dated when the call happened, not when they are written — a `views`
+batch spans ten minutes at the default pacing and flushes in one statement, so
+the flush time would misdate every row in it. A **dry run is logged like any
+other**: it makes the same real calls, and `run --dry-run` already fills the
+metadata cache, so withholding these would hide requests that genuinely
+happened.
+
+```sql
+-- requests to YouTube per hour, by account and sort
+SELECT date_trunc('hour', at) AS hour, account, kind, count(*)
+FROM suggest.fetches WHERE upstream
+GROUP BY 1, 2, 3 ORDER BY 1 DESC;
+
+-- what each lane of the nightly fill cost, and what it was on
+SELECT lane, kind, count(*) FROM suggest.fetches
+WHERE upstream AND job = 'run' AND at > now() - interval '7 days'
+GROUP BY 1, 2 ORDER BY 3 DESC;
+
+-- what the retries and the refusals cost, by sort of non-answer
+SELECT date_trunc('day', at) AS day, status, left(error, 40) AS answered,
+       count(*)
+FROM suggest.fetches
+WHERE upstream AND (status <> 200 OR coalesce(error, '') <> '')
+GROUP BY 1, 2, 3 ORDER BY 1 DESC;
+
+-- the cache hit ratio per night, which the run used to only print
+SELECT date_trunc('day', started) AS day,
+       sum(cache_hits) AS answered, sum(lookups) AS asked,
+       round(sum(cache_hits)::numeric / nullif(sum(lookups), 0), 3) AS ratio
+FROM suggest.runs GROUP BY 1 ORDER BY 1 DESC;
+```
+
+Rows are buffered in memory and written once per lane, so a night of 200 calls
+costs 16 statements rather than 200. A crash mid-lane loses that lane's rows,
+which is the right trade for a log: never fail a fill to record one, and a
+failed write warns rather than raising. A command with no lane loop — `views` is
+the one that makes real numbers of calls — flushes every `FETCH_LOG_BATCH` rows
+instead, so a timeout kill cannot take a whole run's log with it.
+
+Three metrics carry the same numbers into Prometheus for alerting:
+`iv_suggest_upstream_fetches_24h{kind}`,
+`iv_suggest_upstream_failures_24h{class}` and
+`iv_suggest_cache_hit_ratio_24h`.
+
+`rate_limited` rising means back off. `answered_an_error` is the one worth
+knowing about: Invidious answers **200 with an error in the body** when it cannot
+parse a video, and `Fetcher.video` buries that video for 30 days on the strength
+of it. Counted as a clean call, a degraded night spends the whole fetch budget
+and blacklists real videos while every failure count sits at zero. A body that
+cannot be read at all is recorded as a 200 with an error too, because upstream
+did answer — the body was the problem. A call nothing answered keeps its reason
+in the same column, since the journal that used to hold it is thrown away with
+the container every night.
+
+That last one is `cache_hits / lookups`, both counted at the point of lookup.
+It is deliberately not built on `fetches`, which counts channel listings and
+every retry attempt — a rate-limited night would move a ratio built on that
+while the cache did nothing different. A genre lane asks twice about one video,
+once for its channel and again for its genre; both are real lookups and both
+count, so the number stays comparable between a genre lane and a plain one. It
+is not a per-candidate hit rate.
+
+All three are 24-hour gauges recomputed at scrape time, so use the SQL above for
+anything that needs a time or a window longer than Prometheus keeps.
+
 ## More than one account
 
 `lanes.yml` is the shared library of lanes; `auto_enrol:` takes in every account

@@ -209,10 +209,12 @@ class Order(unittest.TestCase):
 
 
 class Spent:
-    """A fetcher with nothing left, so only the log line reads it."""
+    """A fetcher with nothing left, so only the log line and the run row read it."""
 
     budget = 320
     fetches = 320
+    lane_cache_hits = 0
+    lane_lookups = 0
 
 
 class Args:
@@ -252,6 +254,7 @@ class ASpentBudget(unittest.TestCase):
         self.mod.read_blocked = lambda: {}
         self.mod.watch_count = lambda email: 900
         self.mod.execute = lambda sql: self.written.append(sql)
+        self.mod.one = lambda sql: "t"
         self.written = []
         self.ran = []
         self.mod.run_one_lane = self.run_one_lane

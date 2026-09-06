@@ -339,5 +339,66 @@ class Enrolment(Harnessed):
                          self.lanes_of(NEWCOMER))
 
 
+class TheFetchLog(unittest.TestCase):
+    """Written for real, against a real database, over several nights.
+
+    The unit tests build the statement and never send it, so a quoting mistake
+    in a multi-row INSERT or a column that does not exist would pass them.
+    """
+
+    def value(self, sql):
+        return HARNESS["instance"].db.value(sql)
+
+    def test_the_nights_calls_were_written(self):
+        self.assertGreater(int(self.value(
+            "SELECT count(*) FROM suggest.fetches;") or 0), 0)
+
+    def test_a_call_that_reached_youtube_is_marked_upstream(self):
+        self.assertGreater(int(self.value(
+            "SELECT count(*) FROM suggest.fetches WHERE upstream;") or 0), 0)
+
+    def test_a_playlist_read_or_delete_is_not(self):
+        """An add is: it reaches get_video, so it can go out to YouTube."""
+        self.assertEqual(0, int(self.value(
+            "SELECT count(*) FROM suggest.fetches WHERE upstream "
+            "AND kind IN ('playlist_read', 'playlist_write', 'stats');") or 0))
+
+    def test_a_fills_row_carries_the_account_that_made_the_call(self):
+        self.assertEqual(0, int(self.value(
+            "SELECT count(*) FROM suggest.fetches WHERE job = 'run' "
+            "AND (account IS NULL OR account = '');") or 0))
+
+    def test_only_init_and_the_fill_ran_here(self):
+        """`views` is deliberately not driven in this harness: it clears the
+        account label and refreshes every genre, which would quietly change
+        what the shared-cache tests above are asserting."""
+        jobs = {row[0] for row in HARNESS["instance"].db.rows(
+            "SELECT DISTINCT job FROM suggest.fetches;")}
+        self.assertEqual({"init", "run"}, jobs)
+
+    def test_a_fills_upstream_call_carries_the_lane_that_wanted_it(self):
+        """Scoped to the fill on purpose. `views` walks a de-duplicated set
+        across every lane, so naming one lane for those would be a lie."""
+        self.assertEqual(0, int(self.value(
+            "SELECT count(*) FROM suggest.fetches WHERE job = 'run' "
+            "AND upstream AND (lane IS NULL OR lane = '');") or 0))
+
+    def test_every_row_names_the_job_that_made_the_call(self):
+        self.assertEqual(0, int(self.value(
+            "SELECT count(*) FROM suggest.fetches "
+            "WHERE job IS NULL OR job = '';") or 0))
+
+    def test_the_question_it_exists_for_can_be_asked(self):
+        """Requests to YouTube per hour, per account, per sort."""
+        rows = HARNESS["instance"].db.rows(
+            "SELECT date_trunc('hour', at), account, kind, count(*) "
+            "FROM suggest.fetches WHERE upstream GROUP BY 1, 2, 3 ORDER BY 1;")
+        self.assertTrue(rows)
+
+    def test_the_run_rows_carry_the_cache_hits_the_log_only_printed(self):
+        self.assertGreater(int(self.value(
+            "SELECT coalesce(sum(cache_hits), 0) FROM suggest.runs;") or 0), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

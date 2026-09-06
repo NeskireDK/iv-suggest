@@ -64,7 +64,7 @@ class BudgetCase(unittest.TestCase):
     def fetcher(self, upstream, budget=10, lane_cap=None):
         self.mod.api = upstream.call
         fetch = self.mod.Fetcher(budget=budget)
-        fetch.begin_lane(lane_cap)
+        fetch.begin_lane("a-lane", lane_cap)
         return fetch
 
 
@@ -129,7 +129,7 @@ class LaneShare(BudgetCase):
     def test_begin_lane_resets_the_share_for_the_next_lane(self):
         fetch = self.fetcher(Upstream(VIDEO, VIDEO), lane_cap=1)
         fetch.video("v0000000000")
-        fetch.begin_lane(1)
+        fetch.begin_lane("a-lane", 1)
         self.assertEqual(0, fetch.lane_used)
         fetch.video("v0000000001")
 
@@ -243,7 +243,7 @@ class AbortsAreCountedPerLane(BudgetCase):
         fetch = self.fetcher(
             Upstream(*([RATE_LIMITED] * 6 + [LISTING])), budget=20)
         self.abort(fetch)
-        fetch.begin_lane(None)
+        fetch.begin_lane("a-lane", None)
         self.assertEqual(LISTING, fetch.channel_latest("UC-c"))
 
     def test_a_video_fetch_after_an_abort_survives_one_failure_too(self):
@@ -256,7 +256,7 @@ class AbortsAreCountedPerLane(BudgetCase):
         upstream = Upstream(*([RATE_LIMITED] * 10))
         fetch = self.fetcher(upstream, budget=30)
         self.abort(fetch)
-        fetch.begin_lane(None)
+        fetch.begin_lane("a-lane", None)
         self.assertIsNone(fetch.channel_latest("UC-c"))
         with self.assertRaises(self.mod.Aborted):
             fetch.channel_latest("UC-d")
@@ -283,14 +283,14 @@ class FailuresAreCountedPerLane(BudgetCase):
         fetch = self.fetcher(Upstream(*([RATE_LIMITED] * 20)), budget=100)
         self.dud_listings(fetch, 1)
         self.assertEqual(3, fetch.fails, "three attempts, no abort")
-        fetch.begin_lane(None)
+        fetch.begin_lane("a-lane", None)
         self.assertEqual(0, fetch.fails)
 
     def test_the_next_lane_gets_its_own_five_failures_not_what_was_left(self):
         fetch = self.fetcher(Upstream(*([RATE_LIMITED] * 6 + [LISTING])),
                              budget=100)
         self.dud_listings(fetch, 1)
-        fetch.begin_lane(None)
+        fetch.begin_lane("a-lane", None)
         self.assertIsNone(fetch.channel_latest("UC-a"),
                           "three failures of its own are not five")
         self.assertEqual(3, fetch.fails)
@@ -300,7 +300,7 @@ class FailuresAreCountedPerLane(BudgetCase):
         """Otherwise three lanes losing other lanes' bad luck put the run on one strike."""
         fetch = self.fetcher(Upstream(*([RATE_LIMITED] * 40)), budget=200)
         for lane in range(4):
-            fetch.begin_lane(None)
+            fetch.begin_lane("a-lane", None)
             self.dud_listings(fetch, 1)
         self.assertEqual(0, fetch.aborts)
 
@@ -319,7 +319,7 @@ class ADeadUpstreamGetsCheap(BudgetCase):
 
     def give_up_a_lane(self, fetch, ucids=("UC-a", "UC-b")):
         """One lane's worth of bad luck. Returns the abort, which must be the lane's own."""
-        fetch.begin_lane(None)
+        fetch.begin_lane("a-lane", None)
         with self.assertRaises(self.mod.Aborted) as caught:
             for ucid in ucids:
                 fetch.channel_latest(ucid)
@@ -371,7 +371,7 @@ class ADeadUpstreamGetsCheap(BudgetCase):
                    + [LISTING] + [RATE_LIMITED] * 20)
         fetch = self.fetcher(Upstream(*answers), budget=10 ** 6)
         self.establish_the_outage(fetch)
-        fetch.begin_lane(None)
+        fetch.begin_lane("a-lane", None)
         self.assertEqual(LISTING, fetch.channel_latest("UC-ok"))
         self.assertEqual(0, fetch.aborts)
         spent_before = fetch.fetches
