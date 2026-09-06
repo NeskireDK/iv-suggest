@@ -18,7 +18,7 @@ from support import SCRIPT, source
 VERB_RE = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE|JOIN)\b")
 
 SCOPED = ("suggest.lanes", "suggest.items", "suggest.cooldown",
-          "suggest.runs", "suggest.shuffles")
+          "suggest.runs", "suggest.shuffles", "suggest.fetches")
 
 # The two places a bare table name is right.
 ALLOWED = (
@@ -39,6 +39,12 @@ ALLOWED = (
     "SELECT coalesce(extract(epoch FROM max(ran))::bigint,0) FROM suggest.shuffles;",
     "SELECT coalesce(sum(fetches),0) FROM suggest.runs ",
     "SELECT coalesce(sum(cache_hits),0), ",
+    # The call log's two household-wide rollups. Requests to YouTube are paced
+    # and budgeted for the instance, not per person, so these count everybody --
+    # `account` is a column on the table for the SQL that asks per person.
+    "SELECT %s, count(*) FROM suggest.fetches WHERE %s GROUP BY 1;",
+    "SELECT status, count(*) FROM suggest.fetches ",
+    "DELETE FROM suggest.fetches WHERE at < now() ",
 )
 
 

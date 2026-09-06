@@ -11,6 +11,8 @@ the Invidious database and never leave the machine. And a dry run makes real
 read calls, so a run that writes nothing else must not write these either.
 """
 
+import ast
+import pathlib
 import unittest
 import urllib.error
 
@@ -76,6 +78,28 @@ class WhatTheCallWasAbout(unittest.TestCase):
 
     def test_a_call_about_nothing_in_particular_names_nothing(self):
         self.assertEqual("", self.mod.target_of_call("/api/v1/stats", None))
+
+    def test_a_playlist_call_names_the_playlist(self):
+        """`auth` sits between the version and the collection on these paths."""
+        for path in ("/api/v1/auth/playlists/IVPLx",
+                     "/api/v1/auth/playlists/IVPLx/videos",
+                     "/api/v1/auth/playlists/IVPLx/videos/12345"):
+            self.assertEqual("IVPLx", self.mod.target_of_call(path, None), path)
+
+    def test_a_history_write_names_the_video(self):
+        self.assertEqual(VID, self.mod.target_of_call(
+            "/api/v1/auth/history/" + VID, None))
+
+    def test_a_collection_with_no_id_names_nothing(self):
+        self.assertEqual("", self.mod.target_of_call(
+            "/api/v1/auth/playlists", None))
+
+    def test_it_never_records_the_collection_name_as_the_target(self):
+        for path in ("/api/v1/auth/playlists/IVPLx",
+                     "/api/v1/auth/history/" + VID,
+                     "/api/v1/channels/%s/latest" % UCID):
+            self.assertNotIn(self.mod.target_of_call(path, None),
+                             ("playlists", "history", "channels"))
 
 
 class Recorded:
@@ -204,7 +228,8 @@ class TheCacheHitRatio(unittest.TestCase):
     def setUp(self):
         self.mod = engine()
 
-    def answer(self, got, asked):
+    def answer(self, got, asked, migrated=True):
+        self.mod.one = lambda sql: "t" if migrated else "f"
         self.mod.query = lambda sql: [[str(got), str(asked)]]
         return self.mod.cache_hit_ratio("true")
 
@@ -213,6 +238,85 @@ class TheCacheHitRatio(unittest.TestCase):
 
     def test_a_night_that_looked_nothing_up_is_zero_not_a_crash(self):
         self.assertEqual(0, self.answer(0, 0))
+
+    def test_it_reads_zero_before_the_column_exists(self):
+        """A pull that lands before `init` must not take the exporter down."""
+        self.assertEqual(0, self.answer(90, 100, migrated=False))
+
+
+class OneLanesShareOfTheRun(unittest.TestCase):
+    """`begin_lane` is the only thing that sets the lane label and resets the
+    per-lane cache hits, so a policy that never reached it logged its calls
+    under the previous lane and rewrote that lane's hit count."""
+
+    def test_only_the_dispatcher_starts_a_lane(self):
+        text = (pathlib.Path(__file__).resolve().parent.parent
+                / "iv-suggest").read_text()
+        callers = {node.name for node in ast.walk(ast.parse(text))
+                   if isinstance(node, ast.FunctionDef)
+                   and "begin_lane" in {
+                       call.func.attr for call in ast.walk(node)
+                       if isinstance(call, ast.Call)
+                       and isinstance(call.func, ast.Attribute)}}
+        self.assertEqual({"run_one_lane"}, callers,
+                         "every policy goes through the dispatcher, so a lane "
+                         "must be started there and nowhere else")
+
+
+class TheCacheHitCount(unittest.TestCase):
+    """Both lookups count, or the ratio reads falsely low for a genre lane."""
+
+    def fetcher(self):
+        mod = engine()
+        mod.unfetchable_videos = lambda: set()
+        mod.cached_video_meta = lambda: {
+            VID: {"genre": "Music", "genre_known": True},
+            "unknowngenr": {"genre": None, "genre_known": False}}
+        fetcher = mod.Fetcher()
+        fetcher.begin_lane("music-discover", None)
+        return fetcher
+
+    def test_a_plain_lookup_counts(self):
+        fetcher = self.fetcher()
+        fetcher.known(VID)
+        self.assertEqual(1, fetcher.lane_cache_hits)
+
+    def test_a_genre_lookup_counts_too(self):
+        fetcher = self.fetcher()
+        fetcher.meta_of(VID)
+        self.assertEqual(1, fetcher.lane_cache_hits)
+
+    def test_the_two_counters_never_disagree(self):
+        fetcher = self.fetcher()
+        fetcher.known(VID)
+        fetcher.meta_of(VID)
+        self.assertEqual(fetcher.cache_hits, fetcher.lane_cache_hits)
+
+    def test_starting_a_lane_clears_it(self):
+        fetcher = self.fetcher()
+        fetcher.known(VID)
+        fetcher.begin_lane("autos", None)
+        self.assertEqual(0, fetcher.lane_cache_hits)
+
+
+class TheRetention(unittest.TestCase):
+    def test_the_call_log_is_pruned_with_the_others(self):
+        mod = engine()
+        written = []
+        mod.execute = written.append
+        mod.forget_the_far_past()
+        pruned = [sql.split("FROM ")[1].split(" ")[0] for sql in written]
+        self.assertEqual(["suggest.plays", "suggest.fetches",
+                          "suggest.bot_touches"], pruned)
+
+    def test_the_two_logs_share_one_retention_knob(self):
+        mod = engine()
+        written = []
+        mod.execute = written.append
+        mod.forget_the_far_past()
+        days = "%d days" % mod.LOG_RETENTION_DAYS
+        self.assertIn(days, written[0])
+        self.assertIn(days, written[1])
 
 
 class TheLaneLabel(unittest.TestCase):

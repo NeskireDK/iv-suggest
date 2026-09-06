@@ -623,13 +623,18 @@ def kind_of_call(method, path):
     return "other"
 
 
+# Every path here is a collection and then its id, once `/api/v1` and the
+# `auth` that only some of them carry are dropped. Indexing a fixed position
+# instead recorded the collection name for every authenticated call.
 def target_of_call(path, body):
     """What the call was about: a video, a channel, or a playlist."""
     named = video_the_call_refreshes(path, body)
     if named:
         return named
-    parts = [p for p in path.split("?")[0].split("/") if p]
-    return parts[3] if len(parts) > 3 else ""
+    parts = [p for p in path.split("?")[0].split("/") if p][2:]
+    if parts[:1] == ["auth"]:
+        parts = parts[1:]
+    return parts[1] if len(parts) > 1 else ""
 
 
 def note_fetch(kind, target, status, attempt):
@@ -721,7 +726,8 @@ class Fetcher:
         self.last = time.monotonic()
 
     def begin_lane(self, lane_id, cap):
-        """Start a lane's share of the run: its own fetch cap, and its own run of bad luck."""
+        """Start a lane's share of the run: its own fetch cap, and its own run of bad luck.
+        Called from the dispatcher, so a compiled lane cannot inherit the last one's label."""
         global LANE
         LANE = lane_id
         self.lane_cap, self.lane_used, self.fails = cap, 0, 0
@@ -917,6 +923,7 @@ class Fetcher:
         m = self.meta.get(vid)
         if m and m.get("genre_known", True):
             self.cache_hits += 1
+            self.lane_cache_hits += 1
             return m
         data = self.video(vid)
         return self.meta.get(vid) if data else None
@@ -1414,7 +1421,6 @@ def run_lane(lane, run):
     lane_id = lane["id"]
     log("\nlane %s  (%s)" % (lane_id, lane["title"]))
     started = run.fetcher.fetches
-    run.fetcher.begin_lane(lane_id, lane["fetch_cap"])
     plid, playlist = playlist_of(lane, run.dry)
     current = playlist.get("videos") or []
     drop, keep, room = sweep_lane(lane, current, plid, run)
@@ -1903,7 +1909,6 @@ def run_lane_last_played(lane, run):
     lane_id = lane["id"]
     log("\nlane %s  (%s)  policy last_played" % (lane_id, lane["title"]))
     started = run.fetcher.fetches
-    run.fetcher.begin_lane(lane_id, lane["fetch_cap"])
     plid, playlist = playlist_of(lane, run.dry)
     current = {v["videoId"]: v for v in (playlist.get("videos") or [])}
 
@@ -2253,6 +2258,7 @@ def forget_the_song_keys_of_the_opted_out_lanes(lanes):
 def run_one_lane(lane, run):
     """One lane's (removed, added, kept, fetches), and its error if it had one.
     A lane that raises is recorded and never stops the account's other lanes."""
+    run.fetcher.begin_lane(lane["id"], lane["fetch_cap"])
     try:
         if lane["policy"] == "last_played":
             return run_lane_last_played(lane, run), None
@@ -2726,9 +2732,10 @@ BOT_TOUCH_LOG_DAYS = 1
 
 PLAY_HARVEST = "play-harvest"
 
-# Long enough to answer "did it mark that one?" months later, short enough that
-# the table stays a log rather than a second watch history.
-PLAY_LOG_DAYS = 180
+# Long enough to answer "did it mark that one?" or "what did that week cost?"
+# months later, short enough that these stay logs rather than a second watch
+# history. One knob for both, so the two cannot drift apart.
+LOG_RETENTION_DAYS = 180
 
 # What became of one open. Stored rather than derived from the reason text,
 # because these are what the metrics are grouped by and a reason is prose.
@@ -2831,10 +2838,15 @@ def record_judged_open(vid, when, outcome, why):
             % (lit(vid), lit(when), acct(), lit(outcome), lit(why)))
 
 
-def forget_old_plays():
+# The harvest carries this for the fetch log as well as its own tables: it is
+# the only job that runs often enough to keep a table written by every fill in
+# bounds without a second timer to forget about.
+def forget_the_far_past():
     """Drop what neither a later harvest nor a later question can use."""
     execute("DELETE FROM suggest.plays WHERE played < now() - interval '%d days';"
-            % PLAY_LOG_DAYS)
+            % LOG_RETENTION_DAYS)
+    execute("DELETE FROM suggest.fetches WHERE at < now() - interval '%d days';"
+            % LOG_RETENTION_DAYS)
     execute("DELETE FROM suggest.bot_touches WHERE at < now() - interval "
             "'%d days';" % BOT_TOUCH_LOG_DAYS)
 
@@ -2882,7 +2894,7 @@ def cmd_harvest_plays(args):
     tally = judge_every_open(opens, args.dry_run)
     if not args.dry_run:
         note_job_run(PLAY_HARVEST, looked)
-        forget_old_plays()
+        forget_the_far_past()
     if not opens:
         log("nothing opened since the last harvest")
         return 0
@@ -3110,6 +3122,13 @@ def cmd_metrics(args):
     return 0
 
 
+def column_exists(table, column):
+    """Whether the migration has added it. A table can exist without it."""
+    return one("SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+               "WHERE table_schema='suggest' AND table_name=%s "
+               "AND column_name=%s);" % (lit(table), lit(column))) == "t"
+
+
 def table_exists(name):
     """Whether `init` has created it. A CASE cannot stand in for this: PostgreSQL
     resolves every relation in a statement whichever branch would run."""
@@ -3167,6 +3186,8 @@ def failure_samples(window):
 
 def cache_hit_ratio(window):
     """Share of candidate lookups the permanent cache answered, 0 when none were."""
+    if not column_exists("runs", "cache_hits"):
+        return 0
     got, asked = query(
         "SELECT coalesce(sum(cache_hits),0), "
         "coalesce(sum(cache_hits),0) + coalesce(sum(fetches),0) "
@@ -3232,7 +3253,7 @@ def _instance_wide_metrics(metric, users):
            plays_samples("played > now() - interval '1 day'"))
     metric("plays_logged",
            "Opens in the log, by what became of each. Pruned at %d days, so "
-           "this can go down." % PLAY_LOG_DAYS, "gauge",
+           "this can go down." % LOG_RETENTION_DAYS, "gauge",
            plays_samples("true"))
     metric("last_judged_open_timestamp_seconds",
            "Newest cache refresh the harvest has judged, this engine's own "
