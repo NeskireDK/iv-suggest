@@ -80,7 +80,8 @@ docker compose run --rm iv-suggest run      # fill the lanes
 install -m 644 systemd/* /etc/systemd/system/
 $EDITOR /etc/systemd/system/iv-suggest.service     # WorkingDirectory, if not
                                                    # /root/docker/youtube
-systemctl enable --now iv-suggest.timer iv-suggest-shuffle.timer
+systemctl enable --now iv-suggest.timer iv-suggest-shuffle.timer \
+                       iv-suggest-harvest.timer
 ```
 
 One config file, two variables, no unit for the engine itself. The timers run
@@ -130,9 +131,65 @@ iv-suggest dedupe [--dry-run] [--account EMAIL]   one upload per song
 iv-suggest views [--rate N] [--budget N]          backfill missing view counts
            [--account EMAIL]
 iv-suggest metrics                                Prometheus text, database only
+iv-suggest harvest-plays [--dry-run]              mark what somebody opened as
+                                                  watched
 iv-suggest sid-check                              did the logins survive the
                                                   nightly restart
 ```
+
+`harvest-plays` exists because Yattee reports no play. It syncs subscriptions
+and playlists with Invidious but never calls
+`POST /api/v1/auth/history/:id`, so a video watched on an Apple TV never reaches
+`users.watched` and every lane keeps offering it back. The only server side
+trace of that playback is Invidious refreshing its own `videos` cache row, which
+it does on any metadata fetch more than ten minutes stale; this command reads
+those refreshes and marks the video watched.
+
+It has to tell a person's open from this engine's own writes, and there are more
+of those than the obvious one. `insert_video_into_playlist` reaches `get_video`
+too, so **every candidate a fill adds to a lane rewrites the same row a playback
+does** — about 60 a night on top of 160 metadata fetches. Marking those watched
+would have the next fill retire its own candidates with a 365-day cooldown.
+
+So every call the engine makes goes through `bot_api`, which records the video
+into `suggest.bot_touches` before the call. The harvest treats an open as a
+person's only when no touch lands within a minute of the refresh. A play that
+coincides with an engine write to the same video inside that minute is skipped,
+which is the safe direction: miss a real play rather than invent one. A static
+test holds `api` to having exactly one caller, so a new call site cannot quietly
+start reading as somebody watching.
+
+`bot_touches` keeps **one row per touch**, not one per video. A lane fetches a
+video's metadata and adds it to the playlist minutes later, and that second call
+finds the cache row too fresh to rewrite — so one `updated` stands against two
+touches at different moments, and keeping only the newest would leave a gap the
+harvest would read as somebody watching.
+
+Its watermark is **the last run**, not the newest judged open. A night whose
+only refreshes were the engine's own judges nothing, and a watermark read off
+the judged rows would reset to now on every quiet run and never see anything
+again. A first run starts from now rather than reaching back over the cache
+lifetime, because the fill that ran before the upgrade left refreshes with no
+touch beside them.
+
+Every open it judges is written to `suggest.plays`, skipped ones included, and
+that log is also the watermark. Invidious deletes a cache row six hours after
+the last refresh, so the timer has to run more often than that or opens are lost
+with no trace anywhere; the shipped one runs twice an hour. It exits 1 when the
+history API refused an open — 409 is the account's own `watch_history`
+preference being off.
+
+Four series follow it. `iv_suggest_plays_judged_24h{outcome=}` and
+`iv_suggest_plays_logged{outcome=}` split every open into `watched`, `bot` or
+`refused`; a rising `bot` share against a flat `watched` count is the separation
+drifting, which is the thing to watch as the fill's fetch volume changes.
+
+`iv_suggest_last_play_harvest_timestamp_seconds` is the one to alert on —
+`time() - it > 6h` means the harvest has stopped and Invidious is deleting opens
+before it reads them. It dates the *run*, so it does not go quiet just because
+nobody watched anything; `iv_suggest_last_judged_open_timestamp_seconds` is the
+one that does, which is why it is not the liveness signal. Both read 0 for
+"never", so the staleness expression fires rather than looking healthy.
 
 `sid-check` exits 0 when every login survived, 1 when one did not, and **2 when
 it cannot tell** — no recorded nightly, or one too old to be evidence. Two is

@@ -290,6 +290,12 @@ def plain_calls(function):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
 
 
+def direct_callers_of(text, target):
+    """Only the functions whose own body names `target`."""
+    return {name for name, node in named_functions(text).items()
+            if target in plain_calls(node)}
+
+
 def callers_of(text, target):
     """Every function that reaches `target`, directly or through another function."""
     edges = {name: plain_calls(node)
@@ -316,7 +322,8 @@ class WhoMints(unittest.TestCase):
     def test_an_api_caller_never_sets_the_account_without_a_session(self):
         api_callers = callers_of(self.source, "api")
         for expected in ("run_account", "dedupe_account",
-                         "videos_across_every_lane", "retire_item"):
+                         "videos_across_every_lane", "retire_item",
+                         "cmd_harvest_plays"):
             self.assertIn(expected, api_callers)
         self.assertEqual(set(),
                          api_callers & callers_of(self.source, "use_account"),
@@ -330,6 +337,15 @@ class WhoMints(unittest.TestCase):
                        "cmd_sid_check", "recorded_sessions",
                        "shuffle_account", "status_account", "use_account"):
             self.assertNotIn(reader, minters)
+
+    def test_the_transport_is_only_reached_through_bot_api(self):
+        """`bot_api` records that this engine, not a viewer, refreshed a video's
+        cache row. A call site that skipped it would read as somebody watching:
+        `insert_video_into_playlist` reaches `get_video` as well, so adding a
+        candidate to a lane rewrites the row a playback does."""
+        self.assertEqual({"bot_api"}, direct_callers_of(self.source, "api"),
+                         "a new call site must go through bot_api, or the "
+                         "harvest will call the bot's own writes a play")
 
     def test_the_engine_carries_no_bearer_token_path(self):
         self.assertNotIn("IV_SUGGEST_TOKEN", self.source)

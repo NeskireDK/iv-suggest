@@ -160,6 +160,11 @@ LANES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 CONSENSUS_LANES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                     "synthetic_consensus_lanes.yml")
 
+# Invidious refreshes a video's cache row only once it is this stale
+# (src/invidious/videos.cr:308), which is why two calls about one video minutes
+# apart leave a single `updated` and two touches.
+CACHE_STALE_AFTER = "10 minutes"
+
 # Column order and types as `\d` reports them on a live instance. Hand written
 # rather than dumped, so it can hold no real row. suggest.* is absent on purpose:
 # `iv-suggest init` creates that, so the fixture cannot drift from the migration.
@@ -190,6 +195,8 @@ CREATE INDEX channel_videos_ucid_idx ON channel_videos (ucid);
 CREATE TABLE channels (
   id text NOT NULL, author text, updated timestamptz, deleted boolean,
   subscribed timestamptz, CONSTRAINT channels_id_key UNIQUE (id));
+CREATE UNLOGGED TABLE videos (
+  id text NOT NULL PRIMARY KEY, info text, updated timestamptz);
 """
 
 
@@ -360,13 +367,39 @@ class ApiStub:
             return self._video(path.rsplit("/", 1)[-1])
         if path.startswith("/api/v1/channels/"):
             return self._channel_latest(path.split("/")[4])
+        if path.startswith("/api/v1/auth/history/"):
+            return self._mark_watched(path.rsplit("/", 1)[-1].split("?")[0])
         if path == "/api/v1/auth/playlists":
             return self._create(body)
         if path.startswith("/api/v1/auth/playlists/"):
             return self._playlist(method, path.split("/")[5:], body)
         raise AssertionError("the stub was asked for %s %s" % (method, path))
 
+    def _mark_watched(self, vid):
+        """What Invidious does: append, having removed it, so it reads as newest."""
+        lit = self.engine.lit
+        self.db.psql(
+            "UPDATE users SET watched = array_append(array_remove(watched, %s), "
+            "%s) WHERE email = %s;" % (lit(vid), lit(vid), lit(self.engine.ACCOUNT)))
+        return None
+
+    def _refresh_video_cache(self, vid):
+        """What `get_video` does, and the reason a playlist add looks like a play.
+
+        Both the metadata route and `insert_video_into_playlist` reach it, so
+        both rewrite the row a viewer's playback does. The staleness rule is
+        modelled too, at CACHE_STALE_AFTER of videos.cr:308: without it the
+        second call of a pair rewrites `updated` and the gap the harvest has to
+        survive never appears.
+        """
+        self.db.psql(
+            "INSERT INTO videos(id, info, updated) VALUES (%s, '{}', now()) "
+            "ON CONFLICT (id) DO UPDATE SET updated = now() "
+            "WHERE videos.updated < now() - interval '%s';"
+            % (self.engine.lit(vid), CACHE_STALE_AFTER))
+
     def _video(self, vid):
+        self._refresh_video_cache(vid)
         self.fetched.append(vid)
         if vid in self.missing:
             raise urllib.error.HTTPError(vid, 404, "no such video", {}, None)
@@ -439,6 +472,7 @@ class ApiStub:
 
     def _add(self, plid, vid):
         lit = self.engine.lit
+        self._refresh_video_cache(vid)
         channel = channel_of(vid)
         index = int(self.db.value(
             "SELECT coalesce(max(\"index\"),0)+1 FROM playlist_videos "
@@ -593,6 +627,32 @@ class Instance:
         """One nightly run, as the timer would fire it."""
         self.log.append("=== iv-suggest run %s ===" % sorted(over.items()))
         return self.engine.cmd_run(Args(**over))
+
+    def harvest(self, **over):
+        """One play harvest, as its timer would fire it."""
+        self.log.append("=== iv-suggest harvest-plays %s ===" % sorted(over.items()))
+        return self.engine.cmd_harvest_plays(Args(**over))
+
+    def somebody_opens(self, vid):
+        """A viewer's playback, an hour after the fill last wrote that video.
+
+        Everything already recorded is aged rather than deleted. Clearing the
+        touch rows would remove the evidence the harvest exists to weigh, and
+        an hour is what makes the cache row stale enough to be rewritten.
+        """
+        lit = self.engine.lit
+        self.db.psql(
+            "UPDATE suggest.bot_touches SET at = at - interval '1 hour'; "
+            "UPDATE videos SET updated = updated - interval '1 hour'; "
+            "UPDATE suggest.plays SET played = played - interval '1 hour'; "
+            "INSERT INTO videos(id, info, updated) VALUES (%s, '{}', now()) "
+            "ON CONFLICT (id) DO UPDATE SET updated = now();" % lit(vid))
+
+    def watched_by(self, email):
+        """That account's watch history, oldest first, as Invidious stores it."""
+        rows = self.db.value("SELECT array_to_string(watched, ' ') FROM users "
+                             "WHERE email = %s;" % self.engine.lit(email))
+        return (rows or "").split()
 
     def hour(self, **over):
         """One hourly reorder, as the shuffle timer would fire it."""

@@ -210,6 +210,31 @@ CREATE TABLE IF NOT EXISTS suggest.accounts (
 -- run in a container with no Docker socket and no systemd to ask.
 CREATE TABLE IF NOT EXISTS suggest.host_events (
   event text PRIMARY KEY, at timestamptz NOT NULL DEFAULT now());
+-- Every video open the harvest has judged. Yattee reports no play at all, so
+-- the only server side trace of one is Invidious refreshing its own metadata
+-- cache; `harvest-plays` reads that and marks the video watched. A skipped row
+-- is written too, with the reason: that is what moves the watermark past an
+-- open this bot caused itself, so it is never reconsidered.
+CREATE TABLE IF NOT EXISTS suggest.plays (
+  vid text, played timestamptz, account text, outcome text, why text,
+  PRIMARY KEY (vid, played));
+-- When this bot last made Invidious refresh a video's cache row, which is the
+-- same write a person's playback causes. Written at the one choke point every
+-- call goes through, so a new call site cannot quietly start looking like a
+-- viewer: `insert_video_into_playlist` calls `get_video` too, so adding a
+-- candidate to a lane refreshes the row exactly as opening the video does.
+-- One row per touch, not one per video: a lane fetches a video's metadata and
+-- then adds it minutes later, and that second call finds the cache row too
+-- fresh to rewrite. Keeping only the newest touch would leave a gap against an
+-- `updated` the first call set, and the harvest would read the difference as
+-- somebody watching.
+CREATE TABLE IF NOT EXISTS suggest.bot_touches (
+  vid text, at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (vid, at));
+-- Last run of a job that has no lane rows to date itself by. A timestamp of 0
+-- for "never" is what makes `time() - metric` alert correctly; an age would
+-- read healthiest exactly when the job had never run.
+CREATE TABLE IF NOT EXISTS suggest.job_runs (
+  job text PRIMARY KEY, at timestamptz NOT NULL DEFAULT now());
 """
 
 # Bring a single-account database up to the shape above. Everything that exists
@@ -516,6 +541,31 @@ def api(method, path, body=None):
     return json.loads(raw) if raw else None
 
 
+def bot_api(method, path, body=None):
+    """Every call this engine makes. Recording the touch here rather than in the
+    transport is what lets a stubbed `api` still exercise the recording."""
+    note_bot_touch(video_the_call_refreshes(path, body))
+    return api(method, path, body)
+
+
+def video_the_call_refreshes(path, body):
+    """The video whose Invidious cache row this call rewrites, or None.
+    Both of these reach `get_video`, which is what does the rewriting."""
+    asked_for = path.rsplit("/", 1)[-1].split("?")[0]
+    if path.startswith("/api/v1/videos/") and VID_RE.match(asked_for):
+        return asked_for
+    added = body.get("videoId") if isinstance(body, dict) else None
+    return added if added and VID_RE.match(added) else None
+
+
+def note_bot_touch(vid):
+    """Record that this bot, not a viewer, is about to refresh that cache row."""
+    if not vid:
+        return
+    execute("INSERT INTO suggest.bot_touches(vid, at) VALUES (%s, now()) "
+            "ON CONFLICT (vid, at) DO NOTHING;" % lit(vid))
+
+
 def unfetchable_videos():
     """Ids no run should try again, so none re-pays the timeouts they already cost."""
     return {r[0] for r in query(
@@ -586,7 +636,7 @@ class Fetcher:
         for attempt in range(3):
             self._pace()
             try:
-                data = api("GET", "/api/v1/videos/" + vid)
+                data = bot_api("GET", "/api/v1/videos/" + vid)
                 self._spend_one_fetch()
                 self._upstream_answered()
                 if data and not data.get("error"):
@@ -635,7 +685,7 @@ class Fetcher:
         for attempt in range(3):
             self._pace()
             try:
-                data = api("GET", "/api/v1/channels/%s/latest" % ucid)
+                data = bot_api("GET", "/api/v1/channels/%s/latest" % ucid)
                 self._spend_one_fetch()
                 self._upstream_answered()
                 return data
@@ -658,7 +708,7 @@ class Fetcher:
 
     def _alive(self):
         try:
-            return bool(api("GET", "/api/v1/stats"))
+            return bool(bot_api("GET", "/api/v1/stats"))
         except Exception:
             return False
 
@@ -1147,7 +1197,7 @@ def lane_plid(account, lane_id):
 
 def force_privacy(plid, title, privacy):
     """Re-apply privacy after a create, which Invidious ignores and stores Public."""
-    api("PATCH", "/api/v1/auth/playlists/" + plid,
+    bot_api("PATCH", "/api/v1/auth/playlists/" + plid,
         {"title": title, "privacy": privacy})
 
 
@@ -1157,7 +1207,7 @@ def playlist_of(lane, dry):
     plid = lane_plid(ACCOUNT, lane_id)
     if plid:
         try:
-            return plid, api("GET", "/api/v1/auth/playlists/" + plid)
+            return plid, bot_api("GET", "/api/v1/auth/playlists/" + plid)
         except urllib.error.HTTPError as e:
             if e.code != 404:
                 raise
@@ -1168,14 +1218,14 @@ def playlist_of(lane, dry):
     if dry:
         log("  would create the playlist %r" % title)
         return None, {"videos": []}
-    made = api("POST", "/api/v1/auth/playlists",
+    made = bot_api("POST", "/api/v1/auth/playlists",
                {"title": title, "privacy": lane["privacy"]})
     plid = made["playlistId"]
     force_privacy(plid, title, lane["privacy"])
     execute("INSERT INTO suggest.lanes(account,lane,plid,title) VALUES (%s,%s,%s,%s);"
             % (acct(), lit(lane_id), lit(plid), lit(title)))
     log("  created the playlist %r (%s)" % (title, plid))
-    return plid, api("GET", "/api/v1/auth/playlists/" + plid)
+    return plid, bot_api("GET", "/api/v1/auth/playlists/" + plid)
 
 
 def seed_order(watched, seed_cfg):
@@ -1200,7 +1250,7 @@ def cooldown_days_for(lane, why):
 
 def retire_item(lane_id, plid, video, cooldown_days=0, reason=""):
     """Take one video out of a lane's playlist and out of the lane's state."""
-    api("DELETE", "/api/v1/auth/playlists/%s/videos/%s" % (plid, video["indexId"]))
+    bot_api("DELETE", "/api/v1/auth/playlists/%s/videos/%s" % (plid, video["indexId"]))
     forget = ("DELETE FROM suggest.items "
               "WHERE account=%s AND lane=%s AND vid=%s;"
               % (acct(), lit(lane_id), lit(video["videoId"])))
@@ -1228,7 +1278,7 @@ def add_to_lane(lane_id, plid, vid, score, song, fetcher):
     """Add one video to a lane and track it. False when Invidious refused the add.
     Invidious resolves the video as it writes the row, so a bad candidate fails only here."""
     try:
-        api("POST", "/api/v1/auth/playlists/%s/videos" % plid, {"videoId": vid})
+        bot_api("POST", "/api/v1/auth/playlists/%s/videos" % plid, {"videoId": vid})
     except urllib.error.HTTPError as e:
         log("    add refused (%s), skipping this one" % e)
         fetcher.bury(vid, 30, "playlist add %s" % e.code)
@@ -1922,9 +1972,9 @@ def rebuild_playlist(lane, desired, run):
         log("  would rebuild to %d videos (%d now)" % (len(desired), len(current)))
         return len(current), len(desired), 0, 0
     for v in (playlist.get("videos") or []):
-        api("DELETE", "/api/v1/auth/playlists/%s/videos/%s" % (plid, v["indexId"]))
+        bot_api("DELETE", "/api/v1/auth/playlists/%s/videos/%s" % (plid, v["indexId"]))
     for vid in desired:
-        api("POST", "/api/v1/auth/playlists/%s/videos" % plid, {"videoId": vid})
+        bot_api("POST", "/api/v1/auth/playlists/%s/videos" % plid, {"videoId": vid})
     log("  rebuilt: %d videos (was %d)" % (len(desired), len(current)))
     return len(current), len(desired), 0, 0
 
@@ -2191,7 +2241,7 @@ def dedupe_account(user, args):
         if lane_id in left_alone:
             log("lane %-16s %s, left alone" % (lane_id, left_alone[lane_id]))
             continue
-        playlist = api("GET", "/api/v1/auth/playlists/" + plid)
+        playlist = bot_api("GET", "/api/v1/auth/playlists/" + plid)
         videos = playlist.get("videos") or []
         log("lane %-16s %d videos" % (lane_id, len(videos)))
         for v in videos:
@@ -2225,7 +2275,7 @@ def dedupe_account(user, args):
             log("  DROP [%-14s] %-52s  by %s" % (lane_id, v["title"][:52], v.get("author")))
             removed += 1
             if not args.dry_run:
-                api("DELETE", "/api/v1/auth/playlists/%s/videos/%s" % (plid, v["indexId"]))
+                bot_api("DELETE", "/api/v1/auth/playlists/%s/videos/%s" % (plid, v["indexId"]))
                 execute("DELETE FROM suggest.items "
                         "WHERE account=%s AND lane=%s AND vid=%s; "
                         "INSERT INTO suggest.cooldown(account,lane,vid,until,reason) "
@@ -2245,7 +2295,7 @@ def videos_across_every_lane(args):
         serve_account(user["email"])
         for lane_id, plid in query("SELECT lane, plid FROM suggest.lanes "
                                    "WHERE account=%s;" % acct()):
-            playlist = api("GET", "/api/v1/auth/playlists/" + plid)
+            playlist = bot_api("GET", "/api/v1/auth/playlists/" + plid)
             videos = playlist.get("videos") or []
             log("%-24s lane %-16s %d videos"
                 % (user["email"], lane_id, len(videos)))
@@ -2539,6 +2589,36 @@ def cmd_init(args):
     return 0
 
 
+# Invidious deletes a `videos` cache row 6 hours after its last refresh
+# (database/videos.cr delete_expired), so an open older than that leaves no
+# trace anywhere. It is the furthest back a first harvest can usefully look.
+VIDEO_CACHE_LIFETIME_HOURS = 6
+
+# A call by this bot refreshes the same cache row a person's playback does, so
+# the two are told apart by whether suggest.bot_touches lands next to it. The
+# touch is written before the call and Invidious stamps `updated` only once its
+# own upstream fetch returns, which this client waits 30 seconds for -- so the
+# gap is bounded by that timeout, not by a few milliseconds. Widening it costs
+# only a play made within the window of an engine write to the same video.
+BOT_FETCH_MATCH_SECONDS = 120
+
+# A touch is only ever compared against a cache row, and Invidious deletes
+# those after VIDEO_CACHE_LIFETIME_HOURS, so a day is already generous.
+BOT_TOUCH_LOG_DAYS = 1
+
+PLAY_HARVEST = "play-harvest"
+
+# Long enough to answer "did it mark that one?" months later, short enough that
+# the table stays a log rather than a second watch history.
+PLAY_LOG_DAYS = 180
+
+# What became of one open. Stored rather than derived from the reason text,
+# because these are what the metrics are grouped by and a reason is prose.
+WATCHED, BOT, REFUSED = "watched", "bot", "refused"
+PLAY_OUTCOMES = (WATCHED, BOT, REFUSED)
+
+BOT_FETCHED_IT = "the bot fetched it, not a person"
+
 NIGHTLY_RECREATE = "nightly-recreate"
 # A boundary older than this cannot be evidence of anything: every session
 # predates it, so the check would pass every account while watching nothing.
@@ -2582,6 +2662,121 @@ def recorded_sessions():
                 "FROM suggest.accounts a LEFT JOIN session_ids s "
                 "ON s.id = a.sid AND s.email = a.account ORDER BY 1;"
                 % lit(NIGHTLY_RECREATE))]
+
+
+# The run, deliberately, and not the newest judged open: a night whose only
+# refreshes were this engine's own judges nothing, and a watermark read off the
+# judged rows would then reset to now on every run and never see anything again.
+# A first run starts from now rather than reaching back over the cache lifetime,
+# because the fill before the upgrade left refreshes with no touch beside them
+# and every one of those would read as somebody watching.
+def plays_watermark():
+    """When this harvest last looked, so it sees every refresh since."""
+    return one("SELECT coalesce(max(at)::text, now()::text) "
+               "FROM suggest.job_runs WHERE job = %s;" % lit(PLAY_HARVEST))
+
+
+# Leaving out a refresh already in suggest.plays is what makes a run that
+# stopped part way through resumable rather than a second judgement.
+def unjudged_opens(since):
+    """Refreshes since `since`, oldest first, each flagged if this engine caused it."""
+    return [(vid, when, by_the_bot == "t") for vid, when, by_the_bot in query(
+        "SELECT v.id, v.updated::text, EXISTS ("
+        "  SELECT 1 FROM suggest.bot_touches b WHERE b.vid = v.id "
+        "  AND b.at BETWEEN v.updated - interval '%d seconds' "
+        "                AND v.updated + interval '%d seconds') "
+        "FROM videos v "
+        "WHERE v.updated > %s::timestamptz AND NOT EXISTS ("
+        "  SELECT 1 FROM suggest.plays p "
+        "  WHERE p.vid = v.id AND p.played = v.updated) "
+        "ORDER BY v.updated;"
+        % (BOT_FETCH_MATCH_SECONDS, BOT_FETCH_MATCH_SECONDS, lit(since)))]
+
+
+# A 5xx is not a refusal but an instance that cannot answer, so it is raised
+# rather than returned: the watermark must not move past a play nobody kept.
+def mark_watched(vid):
+    """Record a watch for the current account; 0, or the status that refused it."""
+    try:
+        bot_api("POST", "/api/v1/auth/history/" + vid)
+    except urllib.error.HTTPError as e:
+        if e.code >= 500:
+            raise
+        return e.code
+    return 0
+
+
+def record_judged_open(vid, when, outcome, why):
+    """Remember this open was judged, so the watermark moves past it either way."""
+    execute("INSERT INTO suggest.plays(vid, played, account, outcome, why) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (vid, played) DO NOTHING;"
+            % (lit(vid), lit(when), acct(), lit(outcome), lit(why)))
+
+
+def forget_old_plays():
+    """Drop what neither a later harvest nor a later question can use."""
+    execute("DELETE FROM suggest.plays WHERE played < now() - interval '%d days';"
+            % PLAY_LOG_DAYS)
+    execute("DELETE FROM suggest.bot_touches WHERE at < now() - interval "
+            "'%d days';" % BOT_TOUCH_LOG_DAYS)
+
+
+# Dated from when the run looked, not from when it finished, so nothing
+# refreshed while it worked is missed. Called at the end, because a metric
+# saying the job ran must not be set by a run that then died.
+def note_job_run(job, at):
+    """Record that this job ran, for a metric that can say it stopped."""
+    execute("INSERT INTO suggest.job_runs(job, at) VALUES (%s, %s) "
+            "ON CONFLICT (job) DO UPDATE SET at = EXCLUDED.at;"
+            % (lit(job), lit(at)))
+
+
+def judge_every_open(opens, dry):
+    """Judge each open in turn and tally the outcomes."""
+    tally = dict((outcome, 0) for outcome in PLAY_OUTCOMES)
+    for vid, when, by_the_bot in opens:
+        outcome, why = judge_one_open(vid, by_the_bot, dry)
+        tally[outcome] += 1
+        log("  %s  %s  %s" % (when, vid, why or "marked watched"))
+        if not dry:
+            record_judged_open(vid, when, outcome, why)
+    return tally
+
+
+def judge_one_open(vid, by_the_bot, dry):
+    """What becomes of one open, and the reason when it does not become a watch.
+    A dry run reports the outcome it would have written without writing it."""
+    if by_the_bot:
+        return BOT, BOT_FETCHED_IT
+    if dry:
+        return WATCHED, "would mark watched"
+    status = mark_watched(vid)
+    if status:
+        return REFUSED, "history API said %d" % status
+    return WATCHED, ""
+
+
+def cmd_harvest_plays(args):
+    """Mark as watched what somebody opened, because Yattee reports no play."""
+    serve_account(PRIMARY)
+    looked = one("SELECT now()::text;")
+    opens = unjudged_opens(plays_watermark())
+    tally = judge_every_open(opens, args.dry_run)
+    if not args.dry_run:
+        note_job_run(PLAY_HARVEST, looked)
+        forget_old_plays()
+    if not opens:
+        log("nothing opened since the last harvest")
+        return 0
+    log("%d opened, %d marked watched, %d were this bot's own writes, "
+        "%d refused%s"
+        % (len(opens), tally[WATCHED], tally[BOT], tally[REFUSED],
+           " (dry run, nothing written)" if args.dry_run else ""))
+    if tally[REFUSED]:
+        log("a refusal is Invidious declining to record it. 409 is the "
+            "account's own watch_history preference being off, which no retry "
+            "will fix.")
+    return 1 if tally[REFUSED] else 0
 
 
 def cmd_sid_check(args):
@@ -2797,6 +2992,39 @@ def cmd_metrics(args):
     return 0
 
 
+def table_exists(name):
+    """Whether `init` has created it. A CASE cannot stand in for this: PostgreSQL
+    resolves every relation in a statement whichever branch would run."""
+    return one("SELECT to_regclass('%s') IS NOT NULL;" % name) == "t"
+
+
+def job_last_run(job):
+    """Epoch seconds of that job's last run, 0 when it has never run."""
+    if not table_exists("suggest.job_runs"):
+        return 0
+    return one("SELECT coalesce(extract(epoch FROM max(at))::bigint, 0) "
+               "FROM suggest.job_runs WHERE job = %s;" % lit(job)) or 0
+
+
+def newest_judged_open():
+    """Epoch seconds of the newest open judged, 0 when none has been."""
+    if not table_exists("suggest.plays"):
+        return 0
+    return one("SELECT coalesce(extract(epoch FROM max(played))::bigint, 0) "
+               "FROM suggest.plays;") or 0
+
+
+def plays_samples(where):
+    """One zero filled sample per outcome, all zero before `init` made the table."""
+    counted = dict((outcome, 0) for outcome in PLAY_OUTCOMES)
+    if table_exists("suggest.plays"):
+        counted.update((outcome, int(rows)) for outcome, rows in query(
+            "SELECT outcome, count(*) FROM suggest.plays WHERE %s GROUP BY 1;"
+            % where))
+    return [('{outcome="%s"}' % outcome, counted.get(outcome, 0))
+            for outcome in PLAY_OUTCOMES]
+
+
 def _instance_wide_metrics(metric, users):
     """The series with no account label, because the budget and cache are shared.
     Unlabelled also keeps the alerts already written against them working."""
@@ -2826,6 +3054,27 @@ def _instance_wide_metrics(metric, users):
            "gauge",
            [("", one("SELECT count(*) FROM suggest.video_dead "
                      "WHERE until > now();") or 0)])
+    metric("last_play_harvest_timestamp_seconds",
+           "When `harvest-plays` last ran. 0 means never, so "
+           "`time() - this` is the staleness to alert on; past %d hours it is "
+           "losing opens Invidious has already deleted."
+           % VIDEO_CACHE_LIFETIME_HOURS, "gauge",
+           [("", job_last_run(PLAY_HARVEST))])
+    metric("plays_judged_24h",
+           "Opens judged in the last day, by what became of each. `bot` is "
+           "this engine's own metadata fetches, which must never be marked "
+           "watched: a rising bot share against a flat watched count is the "
+           "separation drifting.", "gauge",
+           plays_samples("played > now() - interval '1 day'"))
+    metric("plays_logged",
+           "Opens in the log, by what became of each. Pruned at %d days, so "
+           "this can go down." % PLAY_LOG_DAYS, "gauge",
+           plays_samples("true"))
+    metric("last_judged_open_timestamp_seconds",
+           "Newest cache refresh the harvest has judged, this engine's own "
+           "writes included. Alert on the harvest timestamp instead: a fill "
+           "keeps this one moving whether or not anybody watched.", "gauge",
+           [("", newest_judged_open())])
     metric("up", "1 when this exporter read the database.", "gauge",
            [("", 1)])
 
@@ -2856,6 +3105,10 @@ def main():
     v.add_argument("--account", help="refresh only this account's lanes")
     v.add_argument("--rate", type=int, default=RATE_PER_MIN, help="fetches per minute")
     v.add_argument("--budget", type=int, default=MAX_FETCHES, help="fetches per run")
+    h = sub.add_parser("harvest-plays",
+                       help="mark what somebody opened as watched; Yattee "
+                            "reports no play of its own")
+    h.add_argument("--dry-run", action="store_true")
     sub.add_parser("sid-check",
                    help="did each account's login survive the nightly restart")
     s = sub.add_parser("shuffle", help="reorder the lanes; database only, no fetches")
@@ -2866,6 +3119,7 @@ def main():
     command = {"init": cmd_init, "run": cmd_run, "status": cmd_status,
                "metrics": cmd_metrics, "dedupe": cmd_dedupe,
                "views": cmd_views, "shuffle": cmd_shuffle,
+               "harvest-plays": cmd_harvest_plays,
                "sid-check": cmd_sid_check}[args.cmd]
     try:
         return command(args)
