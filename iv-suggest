@@ -223,8 +223,13 @@ CREATE TABLE IF NOT EXISTS suggest.plays (
 -- call goes through, so a new call site cannot quietly start looking like a
 -- viewer: `insert_video_into_playlist` calls `get_video` too, so adding a
 -- candidate to a lane refreshes the row exactly as opening the video does.
+-- One row per touch, not one per video: a lane fetches a video's metadata and
+-- then adds it minutes later, and that second call finds the cache row too
+-- fresh to rewrite. Keeping only the newest touch would leave a gap against an
+-- `updated` the first call set, and the harvest would read the difference as
+-- somebody watching.
 CREATE TABLE IF NOT EXISTS suggest.bot_touches (
-  vid text PRIMARY KEY, at timestamptz NOT NULL DEFAULT now());
+  vid text, at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (vid, at));
 -- Last run of a job that has no lane rows to date itself by. A timestamp of 0
 -- for "never" is what makes `time() - metric` alert correctly; an age would
 -- read healthiest exactly when the job had never run.
@@ -558,7 +563,7 @@ def note_bot_touch(vid):
     if not vid:
         return
     execute("INSERT INTO suggest.bot_touches(vid, at) VALUES (%s, now()) "
-            "ON CONFLICT (vid) DO UPDATE SET at = now();" % lit(vid))
+            "ON CONFLICT (vid, at) DO NOTHING;" % lit(vid))
 
 
 def unfetchable_videos():
@@ -2656,31 +2661,44 @@ def recorded_sessions():
                 % lit(NIGHTLY_RECREATE))]
 
 
+# The run, deliberately, and not the newest judged open: a night whose only
+# refreshes were this engine's own judges nothing, and a watermark read off the
+# judged rows would then reset to now on every run and never see anything again.
+# A first run starts from now rather than reaching back over the cache lifetime,
+# because the fill before the upgrade left refreshes with no touch beside them
+# and every one of those would read as somebody watching.
 def plays_watermark():
-    """The newest open already judged, full precision; empty before the first run.
-    Truncating it to whole seconds would re-select that open on every run."""
-    return one("SELECT coalesce(max(played)::text, '') FROM suggest.plays;") or ""
+    """When this harvest last looked, so it sees every refresh since."""
+    return one("SELECT coalesce(max(at)::text, now()::text) "
+               "FROM suggest.job_runs WHERE job = %s;" % lit(PLAY_HARVEST))
 
 
+# Leaving out a refresh already in suggest.plays is what makes a run that
+# stopped part way through resumable rather than a second judgement.
 def unjudged_opens(since):
-    """Videos Invidious refreshed its cache for since `since`, oldest first.
-    Each carries whether this bot's own fetch is what refreshed it."""
-    floor = ("%s::timestamptz" % lit(since) if since
-             else "now() - interval '%d hours'" % VIDEO_CACHE_LIFETIME_HOURS)
+    """Refreshes since `since`, oldest first, each flagged if this engine caused it."""
     return [(vid, when, by_the_bot == "t") for vid, when, by_the_bot in query(
-        "SELECT v.id, v.updated::text, "
-        "(b.at BETWEEN v.updated - interval '%d seconds' "
-        "            AND v.updated + interval '%d seconds') "
-        "FROM videos v LEFT JOIN suggest.bot_touches b ON b.vid = v.id "
-        "WHERE v.updated > %s ORDER BY v.updated;"
-        % (BOT_FETCH_MATCH_SECONDS, BOT_FETCH_MATCH_SECONDS, floor))]
+        "SELECT v.id, v.updated::text, EXISTS ("
+        "  SELECT 1 FROM suggest.bot_touches b WHERE b.vid = v.id "
+        "  AND b.at BETWEEN v.updated - interval '%d seconds' "
+        "                AND v.updated + interval '%d seconds') "
+        "FROM videos v "
+        "WHERE v.updated > %s::timestamptz AND NOT EXISTS ("
+        "  SELECT 1 FROM suggest.plays p "
+        "  WHERE p.vid = v.id AND p.played = v.updated) "
+        "ORDER BY v.updated;"
+        % (BOT_FETCH_MATCH_SECONDS, BOT_FETCH_MATCH_SECONDS, lit(since)))]
 
 
+# A 5xx is not a refusal but an instance that cannot answer, so it is raised
+# rather than returned: the watermark must not move past a play nobody kept.
 def mark_watched(vid):
     """Record a watch for the current account; 0, or the status that refused it."""
     try:
         bot_api("POST", "/api/v1/auth/history/" + vid)
     except urllib.error.HTTPError as e:
+        if e.code >= 500:
+            raise
         return e.code
     return 0
 
@@ -2700,10 +2718,26 @@ def forget_old_plays():
             "'%d days';" % BOT_TOUCH_LOG_DAYS)
 
 
-def note_job_run(job):
-    """Date this run, so a metric can say the job stopped rather than went quiet."""
-    execute("INSERT INTO suggest.job_runs(job, at) VALUES (%s, now()) "
-            "ON CONFLICT (job) DO UPDATE SET at = now();" % lit(job))
+# Dated from when the run looked, not from when it finished, so nothing
+# refreshed while it worked is missed. Called at the end, because a metric
+# saying the job ran must not be set by a run that then died.
+def note_job_run(job, at):
+    """Record that this job ran, for a metric that can say it stopped."""
+    execute("INSERT INTO suggest.job_runs(job, at) VALUES (%s, %s) "
+            "ON CONFLICT (job) DO UPDATE SET at = EXCLUDED.at;"
+            % (lit(job), lit(at)))
+
+
+def judge_every_open(opens, dry):
+    """Judge each open in turn and tally the outcomes."""
+    tally = dict((outcome, 0) for outcome in PLAY_OUTCOMES)
+    for vid, when, by_the_bot in opens:
+        outcome, why = judge_one_open(vid, by_the_bot, dry)
+        tally[outcome] += 1
+        log("  %s  %s  %s" % (when, vid, why or "marked watched"))
+        if not dry:
+            record_judged_open(vid, when, outcome, why)
+    return tally
 
 
 def judge_one_open(vid, by_the_bot, dry):
@@ -2722,21 +2756,16 @@ def judge_one_open(vid, by_the_bot, dry):
 def cmd_harvest_plays(args):
     """Mark as watched what somebody opened, because Yattee reports no play."""
     serve_account(PRIMARY)
+    looked = one("SELECT now()::text;")
     opens = unjudged_opens(plays_watermark())
+    tally = judge_every_open(opens, args.dry_run)
     if not args.dry_run:
-        note_job_run(PLAY_HARVEST)
+        note_job_run(PLAY_HARVEST, looked)
         forget_old_plays()
     if not opens:
         log("nothing opened since the last harvest")
         return 0
-    tally = dict((outcome, 0) for outcome in PLAY_OUTCOMES)
-    for vid, when, by_the_bot in opens:
-        outcome, why = judge_one_open(vid, by_the_bot, args.dry_run)
-        tally[outcome] = tally.get(outcome, 0) + 1
-        log("  %s  %s  %s" % (when, vid, why or "marked watched"))
-        if not args.dry_run:
-            record_judged_open(vid, when, outcome, why)
-    log("%d opened, %d marked watched, %d were this bot's own fetches, "
+    log("%d opened, %d marked watched, %d were this bot's own writes, "
         "%d refused%s"
         % (len(opens), tally[WATCHED], tally[BOT], tally[REFUSED],
            " (dry run, nothing written)" if args.dry_run else ""))

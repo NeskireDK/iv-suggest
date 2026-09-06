@@ -18,6 +18,7 @@ import unittest
 from support import load
 
 ME = "andre@example.com"
+NOW = "2026-09-06 10:30:00.500000+00"
 HUMAN_OPEN = ("dQw4w9WgXcQ", "2026-09-06 10:04:00", "f")
 BOT_FETCH = ("AtijFP893Fo", "2026-09-06 03:41:12", "t")
 SECOND_HUMAN_OPEN = ("irTExR9_FRY", "2026-09-06 10:22:31", "f")
@@ -26,7 +27,7 @@ SECOND_HUMAN_OPEN = ("irTExR9_FRY", "2026-09-06 10:22:31", "f")
 class Instance:
     """The database and the history API, as the harvest reaches them."""
 
-    def __init__(self, opens=(), watermark="", refuse=None):
+    def __init__(self, opens=(), watermark=NOW, refuse=None):
         self.opens = list(opens)
         self.watermark = watermark
         self.refuse = refuse or {}
@@ -34,6 +35,7 @@ class Instance:
         self.pruned = False
         self.marked = []
         self.scan_sql = ""
+        self.watermark_sql = ""
         self.served = []
         self.dated = False
 
@@ -52,8 +54,11 @@ class Instance:
         self.mod.SESSION = "session-for-" + email
 
     def one(self, sql):
-        if "max(played)" in sql:
-            return str(self.watermark)
+        if "suggest.job_runs" in sql:
+            self.watermark_sql = sql
+            return self.watermark
+        if "now()" in sql:
+            return NOW
         return ""
 
     def query(self, sql):
@@ -137,11 +142,19 @@ class TheBotsOwnFetch(unittest.TestCase):
 
 
 class TheScanWindow(unittest.TestCase):
-    def test_a_first_run_looks_back_only_as_far_as_the_cache_lives(self):
-        inst = Instance(opens=[], watermark="")
-        _, mod = harvest(inst)
-        self.assertIn("interval '%d hours'" % mod.VIDEO_CACHE_LIFETIME_HOURS,
-                      inst.scan_sql)
+    def test_a_first_run_starts_from_now_rather_than_reaching_back(self):
+        """The fill before the upgrade left refreshes with no touch beside them."""
+        inst = Instance(opens=[])
+        harvest(inst)
+        self.assertIn("coalesce(max(at)::text, now()::text)",
+                      inst.watermark_sql)
+
+    def test_the_watermark_is_the_run_and_not_the_newest_judged_open(self):
+        """Read off the judged rows it would reset to now on every quiet run."""
+        inst = Instance(opens=[])
+        harvest(inst)
+        self.assertIn("suggest.job_runs", inst.watermark_sql)
+        self.assertNotIn("max(played)", inst.watermark_sql)
 
     def test_a_later_run_starts_where_the_last_one_stopped(self):
         inst = Instance(opens=[], watermark="2026-09-06 10:04:00.123456+00")
@@ -155,6 +168,12 @@ class TheScanWindow(unittest.TestCase):
         inst = Instance(opens=[], watermark="2026-09-06 10:04:00.123456+00")
         harvest(inst)
         self.assertIn(".123456", inst.scan_sql)
+
+    def test_a_refresh_already_judged_is_left_out(self):
+        """What makes a run that stopped part way through resumable."""
+        inst = Instance(opens=[])
+        harvest(inst)
+        self.assertIn("suggest.plays p", inst.scan_sql)
 
     def test_an_empty_scan_marks_nothing_but_still_dates_the_run(self):
         inst = Instance(opens=[])

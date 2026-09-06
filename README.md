@@ -159,6 +159,19 @@ which is the safe direction: miss a real play rather than invent one. A static
 test holds `api` to having exactly one caller, so a new call site cannot quietly
 start reading as somebody watching.
 
+`bot_touches` keeps **one row per touch**, not one per video. A lane fetches a
+video's metadata and adds it to the playlist minutes later, and that second call
+finds the cache row too fresh to rewrite — so one `updated` stands against two
+touches at different moments, and keeping only the newest would leave a gap the
+harvest would read as somebody watching.
+
+Its watermark is **the last run**, not the newest judged open. A night whose
+only refreshes were the engine's own judges nothing, and a watermark read off
+the judged rows would reset to now on every quiet run and never see anything
+again. A first run starts from now rather than reaching back over the cache
+lifetime, because the fill that ran before the upgrade left refreshes with no
+touch beside them.
+
 Every open it judges is written to `suggest.plays`, skipped ones included, and
 that log is also the watermark. Invidious deletes a cache row six hours after
 the last refresh, so the timer has to run more often than that or opens are lost

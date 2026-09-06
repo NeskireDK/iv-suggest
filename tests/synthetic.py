@@ -160,6 +160,11 @@ LANES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 CONSENSUS_LANES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                     "synthetic_consensus_lanes.yml")
 
+# Invidious refreshes a video's cache row only once it is this stale
+# (src/invidious/videos.cr:308), which is why two calls about one video minutes
+# apart leave a single `updated` and two touches.
+CACHE_STALE_AFTER = "10 minutes"
+
 # Column order and types as `\d` reports them on a live instance. Hand written
 # rather than dumped, so it can hold no real row. suggest.* is absent on purpose:
 # `iv-suggest init` creates that, so the fixture cannot drift from the migration.
@@ -380,11 +385,18 @@ class ApiStub:
 
     def _refresh_video_cache(self, vid):
         """What `get_video` does, and the reason a playlist add looks like a play.
-        Both routes reach it, so both rewrite the row a viewer's playback does."""
+
+        Both the metadata route and `insert_video_into_playlist` reach it, so
+        both rewrite the row a viewer's playback does. The staleness rule is
+        modelled too, at CACHE_STALE_AFTER of videos.cr:308: without it the
+        second call of a pair rewrites `updated` and the gap the harvest has to
+        survive never appears.
+        """
         self.db.psql(
             "INSERT INTO videos(id, info, updated) VALUES (%s, '{}', now()) "
-            "ON CONFLICT (id) DO UPDATE SET updated = now();"
-            % self.engine.lit(vid))
+            "ON CONFLICT (id) DO UPDATE SET updated = now() "
+            "WHERE videos.updated < now() - interval '%s';"
+            % (self.engine.lit(vid), CACHE_STALE_AFTER))
 
     def _video(self, vid):
         self._refresh_video_cache(vid)
@@ -622,12 +634,19 @@ class Instance:
         return self.engine.cmd_harvest_plays(Args(**over))
 
     def somebody_opens(self, vid):
-        """A viewer's playback: Invidious refreshes the row, nothing tells us who."""
+        """A viewer's playback, an hour after the fill last wrote that video.
+
+        Everything already recorded is aged rather than deleted. Clearing the
+        touch rows would remove the evidence the harvest exists to weigh, and
+        an hour is what makes the cache row stale enough to be rewritten.
+        """
+        lit = self.engine.lit
         self.db.psql(
+            "UPDATE suggest.bot_touches SET at = at - interval '1 hour'; "
+            "UPDATE videos SET updated = updated - interval '1 hour'; "
+            "UPDATE suggest.plays SET played = played - interval '1 hour'; "
             "INSERT INTO videos(id, info, updated) VALUES (%s, '{}', now()) "
-            "ON CONFLICT (id) DO UPDATE SET updated = now(); "
-            "DELETE FROM suggest.bot_touches WHERE vid = %s;"
-            % (self.engine.lit(vid), self.engine.lit(vid)))
+            "ON CONFLICT (id) DO UPDATE SET updated = now();" % lit(vid))
 
     def watched_by(self, email):
         """That account's watch history, oldest first, as Invidious stores it."""
