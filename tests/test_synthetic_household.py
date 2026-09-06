@@ -357,10 +357,11 @@ class TheFetchLog(unittest.TestCase):
         self.assertGreater(int(self.value(
             "SELECT count(*) FROM suggest.fetches WHERE upstream;") or 0), 0)
 
-    def test_a_playlist_write_is_not(self):
+    def test_a_playlist_read_or_delete_is_not(self):
+        """An add is: it reaches get_video, so it can go out to YouTube."""
         self.assertEqual(0, int(self.value(
-            "SELECT count(*) FROM suggest.fetches "
-            "WHERE upstream AND kind LIKE 'playlist%';") or 0))
+            "SELECT count(*) FROM suggest.fetches WHERE upstream "
+            "AND kind IN ('playlist_read', 'playlist_write', 'stats');") or 0))
 
     def test_every_row_carries_the_account_that_made_the_call(self):
         self.assertEqual(0, int(self.value(

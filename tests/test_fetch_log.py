@@ -13,6 +13,7 @@ read calls, so a run that writes nothing else must not write these either.
 
 import ast
 import pathlib
+import time
 import unittest
 import urllib.error
 
@@ -36,9 +37,11 @@ class WhatSortOfCallItWas(unittest.TestCase):
     def kind(self, method, path):
         return self.mod.kind_of_call(method, path)
 
-    def test_a_video_and_a_channel_listing_are_the_only_upstream_sorts(self):
-        """Everything else is answered from the Invidious database."""
-        self.assertEqual(("video", "channel_latest"), self.mod.UPSTREAM_KINDS)
+    def test_only_the_sorts_that_can_reach_youtube_are_marked_upstream(self):
+        """Adding a video reaches get_video too, so it can go out; a delete,
+        a read and a create never can."""
+        self.assertEqual(("video", "channel_latest", "playlist_add"),
+                         self.mod.UPSTREAM_KINDS)
 
     def test_it_names_each_sort(self):
         self.assertEqual("video", self.kind("GET", "/api/v1/videos/" + VID))
@@ -49,10 +52,12 @@ class WhatSortOfCallItWas(unittest.TestCase):
                          self.kind("POST", "/api/v1/auth/history/" + VID))
         self.assertEqual("playlist_read",
                          self.kind("GET", "/api/v1/auth/playlists/IVPLx"))
-        self.assertEqual("playlist_write",
+        self.assertEqual("playlist_add",
                          self.kind("POST", "/api/v1/auth/playlists/IVPLx/videos"))
         self.assertEqual("playlist_write",
                          self.kind("DELETE", "/api/v1/auth/playlists/IVPLx/videos/7"))
+        self.assertEqual("playlist_write",
+                         self.kind("POST", "/api/v1/auth/playlists"))
 
     def test_a_playlist_read_is_never_counted_as_a_request_to_youtube(self):
         for method, path in (("GET", "/api/v1/auth/playlists"),
@@ -135,24 +140,35 @@ class EveryCallIsLogged(unittest.TestCase):
     def test_a_call_that_answered_is_logged_as_200(self):
         mod = self.call(JOB="run")
         mod.bot_api("GET", "/api/v1/videos/" + VID)
-        self.assertEqual([(ME, "", "run", "video", VID, 200, 0)], mod.FETCH_LOG)
+        self.assertEqual([(ME, "", "run", "video", VID, 200, 0)],
+                         [row[1:] for row in mod.FETCH_LOG])
+
+    def test_it_is_dated_when_it_happened_and_not_when_it_is_written(self):
+        """A views batch spans ten minutes and flushes on one instant."""
+        mod = self.call(JOB="views")
+        before = time.time()
+        mod.bot_api("GET", "/api/v1/videos/" + VID)
+        self.assertGreaterEqual(mod.FETCH_LOG[0][0], before)
+        self.assertLessEqual(mod.FETCH_LOG[0][0], time.time())
 
     def test_the_job_is_carried_so_a_hand_run_is_not_read_as_the_nightly(self):
         mod = self.call(JOB="views")
         mod.bot_api("GET", "/api/v1/videos/" + VID)
-        self.assertEqual("views", mod.FETCH_LOG[0][2])
+        self.assertEqual("views", mod.FETCH_LOG[0][3])
 
     def test_a_refused_call_is_logged_with_its_status_and_still_raises(self):
         mod = self.call(raises=urllib.error.HTTPError("u", 429, "no", {}, None))
         with self.assertRaises(urllib.error.HTTPError):
             mod.bot_api("GET", "/api/v1/videos/" + VID)
-        self.assertEqual([(ME, "", "", "video", VID, 429, 0)], mod.FETCH_LOG)
+        self.assertEqual([(ME, "", "", "video", VID, 429, 0)],
+                         [row[1:] for row in mod.FETCH_LOG])
 
     def test_a_call_nothing_answered_is_logged_as_zero_and_still_raises(self):
         mod = self.call(raises=urllib.error.URLError("timed out"))
         with self.assertRaises(urllib.error.URLError):
             mod.bot_api("GET", "/api/v1/videos/" + VID)
-        self.assertEqual([(ME, "", "", "video", VID, 0, 0)], mod.FETCH_LOG)
+        self.assertEqual([(ME, "", "", "video", VID, 0, 0)],
+                         [row[1:] for row in mod.FETCH_LOG])
 
     def test_the_attempt_number_is_carried_so_a_retry_is_visible(self):
         mod = self.call()
@@ -162,20 +178,28 @@ class EveryCallIsLogged(unittest.TestCase):
     def test_the_lane_is_carried_so_the_cost_can_be_attributed(self):
         mod = self.call(LANE="autos")
         mod.bot_api("GET", "/api/v1/videos/" + VID)
-        self.assertEqual("autos", mod.FETCH_LOG[0][1])
+        self.assertEqual("autos", mod.FETCH_LOG[0][2])
 
     def test_the_buffer_is_flushed_before_it_can_grow_unbounded(self):
         """A command with no lane loop would otherwise lose the lot to a kill."""
         mod = self.call(JOB="views")
-        mod.FETCH_LOG[:] = [(ME, "", "views", "video", VID, 200, 0)] * (
+        mod.FETCH_LOG[:] = [(0.0, ME, "", "views", "video", VID, 200, 0)] * (
             mod.FETCH_LOG_BATCH - 1)
         mod.bot_api("GET", "/api/v1/videos/" + VID)
         self.assertEqual([], mod.FETCH_LOG)
 
-    def test_a_dry_run_logs_nothing(self):
-        """It makes real read calls; a run that wrote nothing must write none."""
-        mod = self.call(DRY=True)
+    def test_a_dry_run_is_logged_like_any_other(self):
+        """It makes the same real calls, and already fills the metadata cache."""
+        mod = self.call(JOB="run")
         mod.bot_api("GET", "/api/v1/videos/" + VID)
+        self.assertEqual(1, len(mod.FETCH_LOG))
+
+    def test_a_call_with_no_credential_is_not_logged_as_a_request(self):
+        """Aborted is raised before anything leaves the process."""
+        mod = self.call()
+        mod.api = lambda *a, **k: (_ for _ in ()).throw(mod.Aborted("no cred"))
+        with self.assertRaises(mod.Aborted):
+            mod.bot_api("GET", "/api/v1/videos/" + VID)
         self.assertEqual([], mod.FETCH_LOG)
 
 
@@ -188,21 +212,21 @@ class TheFlush(unittest.TestCase):
         self.mod.FETCH_LOG[:] = list(rows)
 
     def test_many_calls_cost_one_statement(self):
-        self.buffer((ME, "autos", "run", "video", VID, 200, 0),
-                    (ME, "autos", "run", "video", "abcdefghijk", 429, 1))
+        self.buffer((0.0, ME, "autos", "run", "video", VID, 200, 0),
+                    (1.0, ME, "autos", "run", "video", "abcdefghijk", 429, 1))
         self.mod.flush_fetch_log()
         self.assertEqual(1, len(self.recorded.written))
 
     def test_it_marks_only_the_upstream_sorts_as_upstream(self):
-        self.buffer((ME, "autos", "run", "video", VID, 200, 0),
-                    (ME, "autos", "run", "playlist_write", VID, 200, 0))
+        self.buffer((0.0, ME, "autos", "run", "video", VID, 200, 0),
+                    (0.0, ME, "autos", "run", "playlist_write", VID, 200, 0))
         self.mod.flush_fetch_log()
         written = self.recorded.written[0]
         self.assertIn("'video','%s',true" % VID, written)
         self.assertIn("'playlist_write','%s',false" % VID, written)
 
     def test_it_empties_the_buffer_so_nothing_is_written_twice(self):
-        self.buffer((ME, "", "run", "video", VID, 200, 0))
+        self.buffer((0.0, ME, "", "run", "video", VID, 200, 0))
         self.mod.flush_fetch_log()
         self.mod.flush_fetch_log()
         self.assertEqual(1, len(self.recorded.written))
@@ -215,7 +239,7 @@ class TheFlush(unittest.TestCase):
         said = []
         self.mod.log = said.append
         self.mod.execute = lambda sql: (_ for _ in ()).throw(RuntimeError("no table"))
-        self.buffer((ME, "", "run", "video", VID, 200, 0))
+        self.buffer((0.0, ME, "", "run", "video", VID, 200, 0))
         self.mod.flush_fetch_log()
         self.assertTrue(any("fetch log" in line for line in said))
         self.assertEqual([], self.mod.FETCH_LOG)

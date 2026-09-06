@@ -215,11 +215,23 @@ naming one lane for those would be a lie. It is the only place a request is date
 a count per lane per night and nothing finer, so before this table "how many
 requests reached YouTube in that hour, for whom, of what sort" had no answer.
 
-Only two sorts actually leave the machine, `video` and `channel_latest`, because
-Invidious's own video cache is short lived and a channel listing is not cached
-at all. Everything else the engine calls is answered from the Invidious
-database. That distinction is the `upstream` column rather than something a
-query has to know, so a dashboard never has to match on paths.
+`upstream` marks the calls that **can** reach YouTube, and it is a column rather
+than something each query works out from paths. `video` and `channel_latest`
+always do: the video cache is short lived and a channel listing is not cached at
+all. `playlist_add` can, because adding a video reaches `get_video` too — it
+goes out whenever that cache row has gone stale, which is the normal case for a
+compiled `mix` or `consensus` lane adding a video no lane fetched recently, and
+not the case for a fill adding a candidate it fetched a minute ago. So
+`WHERE upstream` is an upper bound; `WHERE kind IN ('video','channel_latest')`
+is the calls made *in order to* fetch. A playlist read, delete or create never
+leaves the machine.
+
+Rows are dated when the call happened, not when they are written — a `views`
+batch spans ten minutes at the default pacing and flushes in one statement, so
+the flush time would misdate every row in it. A **dry run is logged like any
+other**: it makes the same real calls, and `run --dry-run` already fills the
+metadata cache, so withholding these would hide requests that genuinely
+happened.
 
 ```sql
 -- requests to YouTube per hour, by account and sort
@@ -256,9 +268,16 @@ writes none of them**, because it writes nothing else either.
 Three metrics carry the same numbers into Prometheus for alerting:
 `iv_suggest_upstream_fetches_24h{kind}`,
 `iv_suggest_upstream_failures_24h{class}` — `rate_limited` rising is the one
-that means back off — and `iv_suggest_cache_hit_ratio_24h`. They are 24-hour
-gauges recomputed at scrape time, so use the SQL above for anything that needs
-a time or a longer window than Prometheus keeps.
+that means back off — and `iv_suggest_cache_hit_ratio_24h`.
+
+That last one is the share of **metadata questions** the cache answered, not
+fetches avoided per candidate: a genre lane asks twice about one video, once for
+its channel and again for its genre, and only the second can send the engine
+upstream. Both are real questions and both count, so the number is comparable
+between a genre lane and a plain one — it just is not a per-candidate hit rate.
+
+All three are 24-hour gauges recomputed at scrape time, so use the SQL above for
+anything that needs a time or a window longer than Prometheus keeps.
 
 ## More than one account
 

@@ -114,12 +114,12 @@ VID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 # account leaves whatever lane you were in, so both account helpers clear it.
 LANE = ""
 
-# Calls made and not yet written. A dry run makes real read calls, so DRY is
-# what keeps it from writing rows for a run that wrote nothing else. JOB is the
+# Calls made and not yet written. A dry run is logged like any other: it makes
+# the same real calls, and `run --dry-run` already fills the metadata cache, so
+# withholding these would hide requests that genuinely happened. JOB is the
 # subcommand, which is what tells the nightly fill's traffic apart from a
 # `views` run somebody started by hand.
 FETCH_LOG = []
-DRY = False
 JOB = ""
 
 # Flushed at this many rows as well as per lane, so a command with no lane loop
@@ -580,6 +580,8 @@ def bot_api(method, path, body=None, attempt=0):
     kind = kind_of_call(method, path)
     try:
         answer = api(method, path, body)
+    except Aborted:
+        raise
     except urllib.error.HTTPError as e:
         note_fetch(kind, target_of_call(path, body), e.code, attempt)
         raise
@@ -590,11 +592,14 @@ def bot_api(method, path, body=None, attempt=0):
     return answer
 
 
-# Only these two make Invidious go out to YouTube: its own video cache is
-# short lived, and a channel listing is never cached at all. Everything else
-# here is answered from the Invidious database, so counting it as a request to
-# YouTube would overstate the number several times over.
-UPSTREAM_KINDS = ("video", "channel_latest")
+# The calls that can make Invidious go out to YouTube. A metadata fetch and a
+# channel listing always do -- the video cache is short lived and a listing is
+# not cached at all. Adding a video to a playlist reaches `get_video` as well,
+# so it CAN, and does whenever that cache row has gone stale: the normal case
+# for a compiled lane adding a video no lane fetched recently, and not the case
+# for a fill adding a candidate it fetched a minute ago. Everything else is
+# answered from the Invidious database and never leaves the machine.
+UPSTREAM_KINDS = ("video", "channel_latest", "playlist_add")
 
 # A 429 means slow down, a 5xx means somebody upstream is having a bad minute,
 # and nothing at all means neither -- three different answers that used to end
@@ -626,7 +631,9 @@ def kind_of_call(method, path):
     if path.startswith("/api/v1/auth/history/"):
         return "history_write"
     if path.startswith("/api/v1/auth/playlists"):
-        return "playlist_read" if method == "GET" else "playlist_write"
+        if method == "GET":
+            return "playlist_read"
+        return "playlist_add" if path.endswith("/videos") else "playlist_write"
     return "other"
 
 
@@ -654,10 +661,9 @@ def for_job(name):
 
 
 def note_fetch(kind, target, status, attempt):
-    """Buffer one call. Buffered, or every call would cost a second psql."""
-    if DRY:
-        return
-    FETCH_LOG.append((ACCOUNT, LANE, JOB, kind, target, status, attempt))
+    """Buffer one call, dated now: the flush is minutes later and in one batch."""
+    FETCH_LOG.append((time.time(), ACCOUNT, LANE, JOB, kind, target, status,
+                      attempt))
     if len(FETCH_LOG) >= FETCH_LOG_BATCH:
         flush_fetch_log()
 
@@ -667,14 +673,14 @@ def flush_fetch_log():
     if not FETCH_LOG:
         return
     rows = ",".join(
-        "(%s,%s,%s,%s,%s,%s,%d,%d)"
-        % (lit(account), lit(lane), lit(job), lit(kind), lit(target),
+        "(to_timestamp(%.6f),%s,%s,%s,%s,%s,%s,%d,%d)"
+        % (at, lit(account), lit(lane), lit(job), lit(kind), lit(target),
            "true" if kind in UPSTREAM_KINDS else "false", status, attempt)
-        for account, lane, job, kind, target, status, attempt in FETCH_LOG)
+        for at, account, lane, job, kind, target, status, attempt in FETCH_LOG)
     del FETCH_LOG[:]
     try:
         execute("INSERT INTO suggest.fetches"
-                "(account,lane,job,kind,target,upstream,status,attempt) "
+                "(at,account,lane,job,kind,target,upstream,status,attempt) "
                 "VALUES %s;" % rows)
     except Exception as e:
         log("  WARNING: the fetch log for this lane was not written: %r" % e)
@@ -2219,7 +2225,7 @@ def cmd_run(args):
     log("cache holds %d videos; budget %d fetches at %d per minute%s%s"
         % (len(fetcher.meta), args.budget, args.rate,
            "; seeds capped at %d" % seed_override if seed_override else "",
-           "   [DRY RUN, nothing is written]" if args.dry_run else ""))
+           "   [DRY RUN, no playlist and no state]" if args.dry_run else ""))
     failed = 0
     for i, user in enumerate(users):
         fetcher.budget = fetcher.fetches + budget_slice(
@@ -2301,10 +2307,10 @@ def record_the_lane_run(lane_id, counts, error, cache_hits):
     fields = ["lane", "added", "removed", "kept", "fetches", "error"]
     values = [lit(lane_id), str(added), str(removed), str(kept), str(used),
               lit(error)]
-    if column_exists("runs", "cache_hits"):
-        fields.append("cache_hits")
-        values.append(str(cache_hits))
     try:
+        if column_exists("runs", "cache_hits"):
+            fields.append("cache_hits")
+            values.append(str(cache_hits))
         execute("INSERT INTO suggest.runs(account,%s) VALUES (%s,%s);"
                 % (",".join(fields), acct(), ",".join(values)))
         return True
@@ -2693,7 +2699,7 @@ def shuffle_account(user, all_lanes, args):
             return 0
     log("account %s: reordering %d lanes%s"
         % (ACCOUNT, len(lanes),
-           "   [DRY RUN, nothing is written]" if args.dry_run else ""))
+           "   [DRY RUN, no playlist and no state]" if args.dry_run else ""))
     orders, failed = {}, 0
     for lane in lanes:
         if not lane["shuffle"]["enabled"]:
@@ -3265,9 +3271,11 @@ def _instance_wide_metrics(metric, users):
            "non-answer. `rate_limited` rising is the one that means back off.",
            "gauge", failure_samples("at > now() - interval '1 day'"))
     metric("cache_hit_ratio_24h",
-           "Share of candidate lookups the permanent metadata cache answered "
-           "over the last day. Falling is the warning that a night is about to "
-           "cost far more fetches than the one before it.", "gauge",
+           "Share of metadata questions the permanent cache answered over the "
+           "last day, NOT fetches avoided per candidate: a genre lane asks "
+           "twice about one video, for its channel and then for its genre. "
+           "Falling is the warning that a night is about to cost far more "
+           "fetches than the one before it.", "gauge",
            [("", cache_hit_ratio("started > now() - interval '1 day'"))])
     metric("meta_rows", "Rows in the permanent metadata cache, shared by every "
            "account.", "gauge",
@@ -3338,8 +3346,6 @@ def main():
     s.add_argument("--lane")
     s.add_argument("--account", help="reorder only this account")
     args = p.parse_args()
-    global DRY
-    DRY = bool(getattr(args, "dry_run", False))
     command = {"init": cmd_init, "run": cmd_run, "status": cmd_status,
                "metrics": cmd_metrics, "dedupe": cmd_dedupe,
                "views": cmd_views, "shuffle": cmd_shuffle,
