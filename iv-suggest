@@ -217,6 +217,10 @@ ALTER TABLE suggest.video_meta ADD COLUMN IF NOT EXISTS genre_known boolean DEFA
 -- always printed both numbers and stored neither, and the journal it printed
 -- them to is thrown away with the container every night.
 ALTER TABLE suggest.runs ADD COLUMN IF NOT EXISTS cache_hits int;
+-- Both terms of the hit rate, because `fetches` is not the other one: it counts
+-- channel listings and every retry attempt, so a rate-limited night would move
+-- a ratio built on it while the cache did nothing different.
+ALTER TABLE suggest.runs ADD COLUMN IF NOT EXISTS lookups int;
 CREATE TABLE IF NOT EXISTS suggest.shuffles (
   ran timestamptz DEFAULT now(), account text, lane text, videos int, moved int,
   error text);
@@ -660,6 +664,16 @@ def for_job(name):
     JOB = name
 
 
+# The set `views` walks is de-duplicated across accounts, so a fetch of it is on
+# nobody's behalf in particular. Left alone, the label would be whichever
+# account the collection happened to serve last -- and `account_order` sorts by
+# last successful run, so which person got charged would flip between nights.
+def for_nobody_in_particular():
+    """Stop attributing calls to an account, for work done for all of them."""
+    global ACCOUNT
+    ACCOUNT = ""
+
+
 def note_fetch(kind, target, status, attempt):
     """Buffer one call, dated now: the flush is minutes later and in one batch."""
     FETCH_LOG.append((time.time(), ACCOUNT, LANE, JOB, kind, target, status,
@@ -741,6 +755,7 @@ class Fetcher:
         self.lane_cap = None
         self.lane_used = 0
         self.lane_cache_hits = 0
+        self.lane_lookups = 0
         self.dead = unfetchable_videos()
         self.meta = cached_video_meta()
 
@@ -756,7 +771,7 @@ class Fetcher:
         global LANE
         LANE = lane_id
         self.lane_cap, self.lane_used, self.fails = cap, 0, 0
-        self.lane_cache_hits = 0
+        self.lane_cache_hits, self.lane_lookups = 0, 0
 
     def _spend_one_fetch(self):
         """Charge one call upstream to the run budget and to the lane's share of it."""
@@ -936,6 +951,7 @@ class Fetcher:
 
     def known(self, vid):
         """Metadata without a network call, or None."""
+        self.lane_lookups += 1
         m = self.meta.get(vid)
         if m:
             self.cache_hits += 1
@@ -945,6 +961,7 @@ class Fetcher:
     def meta_of(self, vid):
         """Metadata including a real genre, from the cache or from one paced fetch.
         A `genre_known = false` row is a MISS, or a genre lane would never ask upstream."""
+        self.lane_lookups += 1
         m = self.meta.get(vid)
         if m and m.get("genre_known", True):
             self.cache_hits += 1
@@ -2226,7 +2243,7 @@ def cmd_run(args):
     log("cache holds %d videos; budget %d fetches at %d per minute%s%s"
         % (len(fetcher.meta), args.budget, args.rate,
            "; seeds capped at %d" % seed_override if seed_override else "",
-           "   [DRY RUN, no playlist and no state]" if args.dry_run else ""))
+           "   [DRY RUN, no playlist and no lane state]" if args.dry_run else ""))
     failed = 0
     for i, user in enumerate(users):
         fetcher.budget = fetcher.fetches + budget_slice(
@@ -2304,19 +2321,19 @@ def run_one_lane(lane, run):
 # A lane that raised reports all four counts as zero, so its cache hits have to
 # be zero too. Left real, the row reads `fetches=0, cache_hits=300` and the hit
 # ratio RISES on the nights lanes abort -- the opposite of the warning it is.
-def record_the_lane_run(lane_id, counts, error, cache_hits):
+def record_the_lane_run(lane_id, counts, error, cache_hits, lookups):
     """Write one lane's row in suggest.runs. False when it could not be written.
     The row is what the metrics and the account order read, so a lost one is a failed run."""
     removed, added, kept, used = counts
     if error:
-        cache_hits = 0
+        cache_hits, lookups = 0, 0
     fields = ["lane", "added", "removed", "kept", "fetches", "error"]
     values = [lit(lane_id), str(added), str(removed), str(kept), str(used),
               lit(error)]
     try:
-        if column_exists("runs", "cache_hits"):
-            fields.append("cache_hits")
-            values.append(str(cache_hits))
+        if column_exists("runs", "lookups"):
+            fields.extend(["cache_hits", "lookups"])
+            values.extend([str(cache_hits), str(lookups)])
         execute("INSERT INTO suggest.runs(account,%s) VALUES (%s,%s);"
                 % (",".join(fields), acct(), ",".join(values)))
         return True
@@ -2355,7 +2372,8 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
     for lane in lanes:
         counts, error = run_one_lane(lane, run)
         recorded = args.dry_run or record_the_lane_run(
-            lane["id"], counts, error, run.fetcher.lane_cache_hits)
+            lane["id"], counts, error, run.fetcher.lane_cache_hits,
+            run.fetcher.lane_lookups)
         flush_fetch_log()
         if error or not recorded:
             failed += 1
@@ -2468,6 +2486,7 @@ def cmd_views(args):
     for_job("views")
     vids = videos_across_every_lane(args)
     log("%d unique videos across every lane of every account" % len(vids))
+    for_nobody_in_particular()
 
     fetcher = Fetcher(rate_per_min=args.rate, budget=args.budget)
     updated = skipped_500 = dead = failed = 0
@@ -2705,7 +2724,7 @@ def shuffle_account(user, all_lanes, args):
             return 0
     log("account %s: reordering %d lanes%s"
         % (ACCOUNT, len(lanes),
-           "   [DRY RUN, no playlist and no state]" if args.dry_run else ""))
+           "   [DRY RUN, no playlist and no lane state]" if args.dry_run else ""))
     orders, failed = {}, 0
     for lane in lanes:
         if not lane["shuffle"]["enabled"]:
@@ -3240,12 +3259,11 @@ def failure_samples(window):
 
 def cache_hit_ratio(window):
     """Share of metadata questions the cache answered, None when none were asked."""
-    if not column_exists("runs", "cache_hits"):
+    if not column_exists("runs", "lookups"):
         return None
     got, asked = query(
-        "SELECT coalesce(sum(cache_hits),0), "
-        "coalesce(sum(cache_hits),0) + coalesce(sum(fetches),0) "
-        "FROM suggest.runs WHERE cache_hits IS NOT NULL AND %s;" % window)[0]
+        "SELECT coalesce(sum(cache_hits),0), coalesce(sum(lookups),0) "
+        "FROM suggest.runs WHERE lookups IS NOT NULL AND %s;" % window)[0]
     return round(float(got) / float(asked), 4) if float(asked) else None
 
 
@@ -3291,11 +3309,12 @@ def _instance_wide_metrics(metric, users):
            "non-answer. `rate_limited` rising is the one that means back off.",
            "gauge", failure_samples("at > now() - interval '1 day'"))
     metric("cache_hit_ratio_24h",
-           "Share of metadata questions the permanent cache answered over the "
-           "last day, NOT fetches avoided per candidate: a genre lane asks "
-           "twice about one video, for its channel and then for its genre. "
-           "Falling is the warning that a night is about to cost far more "
-           "fetches than the one before it.", "gauge",
+           "Share of metadata lookups the permanent cache answered over the "
+           "last day: hits over lookups, both counted where the lookup "
+           "happens. A genre lane asks twice about one video, for its channel "
+           "and then for its genre, and both are real lookups. Falling is the "
+           "warning that a night is about to cost far more fetches than the "
+           "one before it.", "gauge",
            cache_hit_samples("started > now() - interval '1 day'"))
     metric("meta_rows", "Rows in the permanent metadata cache, shared by every "
            "account.", "gauge",
@@ -3338,7 +3357,8 @@ def main():
                         "IV_SUGGEST_ACCOUNT")
     r = sub.add_parser("run")
     r.add_argument("--dry-run", action="store_true",
-                   help="write no playlist and no state; the metadata cache is still filled")
+                   help="write no playlist and no lane state; the metadata "
+                        "cache and the call log are still written")
     r.add_argument("--lane")
     r.add_argument("--account", help="fill only this account")
     r.add_argument("--seeds", type=int, default=0,

@@ -211,8 +211,10 @@ account, which lane, which job, what sort, what it was about, the HTTP status,
 and the attempt number. `job` is the subcommand, which is what tells the nightly
 fill's traffic from a `views` somebody started by hand. `lane` is set by the
 fill and left empty by every other job, `dedupe` included: only the fill's
-dispatcher starts a lane, and `views` walks a de-duplicated set across every
-lane, so naming one lane for those would be a lie. It is the only place a request is dated — `suggest.runs` carries
+dispatcher starts a lane. `views` leaves **`account` empty too**, because the
+set it walks is de-duplicated across accounts — one fetch serves everybody, and
+naming whichever account the collection happened to serve last would charge one
+person for the household. It is the only place a request is dated — `suggest.runs` carries
 a count per lane per night and nothing finer, so before this table "how many
 requests reached YouTube in that hour, for whom, of what sort" had no answer.
 
@@ -252,9 +254,8 @@ GROUP BY 1, 2 ORDER BY 1 DESC;
 
 -- the cache hit ratio per night, which the run used to only print
 SELECT date_trunc('day', started) AS day,
-       sum(cache_hits) AS from_cache, sum(fetches) AS from_youtube,
-       round(sum(cache_hits)::numeric
-             / nullif(sum(cache_hits) + sum(fetches), 0), 3) AS ratio
+       sum(cache_hits) AS answered, sum(lookups) AS asked,
+       round(sum(cache_hits)::numeric / nullif(sum(lookups), 0), 3) AS ratio
 FROM suggest.runs GROUP BY 1 ORDER BY 1 DESC;
 ```
 
@@ -270,11 +271,13 @@ Three metrics carry the same numbers into Prometheus for alerting:
 `iv_suggest_upstream_failures_24h{class}` — `rate_limited` rising is the one
 that means back off — and `iv_suggest_cache_hit_ratio_24h`.
 
-That last one is the share of **metadata questions** the cache answered, not
-fetches avoided per candidate: a genre lane asks twice about one video, once for
-its channel and again for its genre, and only the second can send the engine
-upstream. Both are real questions and both count, so the number is comparable
-between a genre lane and a plain one — it just is not a per-candidate hit rate.
+That last one is `cache_hits / lookups`, both counted at the point of lookup.
+It is deliberately not built on `fetches`, which counts channel listings and
+every retry attempt — a rate-limited night would move a ratio built on that
+while the cache did nothing different. A genre lane asks twice about one video,
+once for its channel and again for its genre; both are real lookups and both
+count, so the number stays comparable between a genre lane and a plain one. It
+is not a per-candidate hit rate.
 
 All three are 24-hour gauges recomputed at scrape time, so use the SQL above for
 anything that needs a time or a window longer than Prometheus keeps.

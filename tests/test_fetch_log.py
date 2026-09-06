@@ -282,6 +282,17 @@ class TheCacheHitRatio(unittest.TestCase):
     def test_it_is_the_share_the_cache_answered(self):
         self.assertEqual(0.9, self.answer(90, 100))
 
+    def test_it_divides_by_lookups_and_never_by_fetches(self):
+        """`fetches` counts channel listings and retries, so a rate-limited
+        night would move a ratio built on it while the cache did nothing."""
+        self.mod._COLUMNS_SEEN.clear()
+        self.mod.one = lambda sql: "t"
+        asked = []
+        self.mod.query = lambda sql: asked.append(sql) or [["9", "10"]]
+        self.mod.cache_hit_ratio("true")
+        self.assertIn("sum(lookups)", asked[0])
+        self.assertNotIn("sum(fetches)", asked[0])
+
     def test_a_window_nothing_was_asked_in_gets_no_sample_at_all(self):
         """0 would mean the cache answered nothing, which is the alarming one."""
         self.assertEqual([], self.samples(0, 0))
@@ -330,6 +341,21 @@ class TheCacheHitCount(unittest.TestCase):
         fetcher = self.fetcher()
         fetcher.known(VID)
         self.assertEqual(1, fetcher.lane_cache_hits)
+
+    def test_a_lookup_is_counted_whether_it_hits_or_misses(self):
+        """The hit rate's denominator, and the reason `fetches` is not it:
+        that counts channel listings and every retry attempt."""
+        fetcher = self.fetcher()
+        fetcher.known(VID)
+        fetcher.known("nothereatall")
+        self.assertEqual(2, fetcher.lane_lookups)
+        self.assertEqual(1, fetcher.lane_cache_hits)
+
+    def test_starting_a_lane_clears_the_lookups_too(self):
+        fetcher = self.fetcher()
+        fetcher.known(VID)
+        fetcher.begin_lane("autos", None)
+        self.assertEqual(0, fetcher.lane_lookups)
 
     def test_a_genre_lookup_counts_too(self):
         fetcher = self.fetcher()
@@ -380,16 +406,19 @@ class TheRunRow(unittest.TestCase):
         mod.execute = written.append
         mod.one = lambda sql: "t" if migrated else "f"
         mod._COLUMNS_SEEN.clear()
-        self.assertTrue(mod.record_the_lane_run("autos", (1, 2, 3, 4), "", 99))
+        self.assertTrue(
+            mod.record_the_lane_run("autos", (1, 2, 3, 4), "", 99, 120))
         return written[0]
 
-    def test_it_carries_the_cache_hits_once_the_column_is_there(self):
-        self.assertIn("cache_hits", self.record(migrated=True))
-        self.assertIn("99", self.record(migrated=True))
+    def test_it_carries_both_terms_of_the_ratio_once_the_columns_are_there(self):
+        written = self.record(migrated=True)
+        self.assertIn("cache_hits,lookups", written)
+        self.assertIn("99,120", written)
 
     def test_it_still_writes_the_row_when_the_column_is_not(self):
         written = self.record(migrated=False)
         self.assertNotIn("cache_hits", written)
+        self.assertNotIn("lookups", written)
         self.assertIn("INSERT INTO suggest.runs(account,lane", written)
 
     def test_the_column_is_looked_up_once_per_process(self):
@@ -399,7 +428,7 @@ class TheRunRow(unittest.TestCase):
         mod.execute = lambda sql: None
         mod._COLUMNS_SEEN.clear()
         for _ in range(5):
-            mod.record_the_lane_run("autos", (0, 0, 0, 0), "", 0)
+            mod.record_the_lane_run("autos", (0, 0, 0, 0), "", 0, 0)
         self.assertEqual(1, len(asked))
 
 
@@ -428,6 +457,25 @@ class TheRetention(unittest.TestCase):
         """Deploy before `init` would otherwise crash the harvest every half hour."""
         _, written = self.pruned(exists=False)
         self.assertEqual([], written)
+
+
+class WorkDoneForEverybody(unittest.TestCase):
+    """`views` walks a set de-duplicated across accounts."""
+
+    def test_it_stops_naming_an_account(self):
+        mod = engine()
+        mod.for_nobody_in_particular()
+        self.assertEqual("", mod.ACCOUNT)
+
+    def test_views_asks_for_that_before_it_fetches_anything(self):
+        text = (pathlib.Path(__file__).resolve().parent.parent
+                / "iv-suggest").read_text()
+        body = text[text.index("def cmd_views("):]
+        body = body[:body.index("\n\n\n")]
+        self.assertLess(body.index("for_nobody_in_particular()"),
+                        body.index("fetcher.video("),
+                        "the label has to be cleared before the first fetch, "
+                        "or those rows carry whichever account was served last")
 
 
 class TheLaneLabel(unittest.TestCase):

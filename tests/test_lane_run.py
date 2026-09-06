@@ -149,11 +149,13 @@ class Fetch:
         self.lane_used = 0
         self.lane_cap = None
         self.lane_cache_hits = 0
+        self.lane_lookups = 0
         self.buried = []
         self.remembered = []
 
     def begin_lane(self, lane_id, cap):
-        self.lane_cap, self.lane_used, self.lane_cache_hits = cap, 0, 0
+        self.lane_cap, self.lane_used = cap, 0
+        self.lane_cache_hits, self.lane_lookups = 0, 0
 
     def video(self, vid):
         self.fetches += 1

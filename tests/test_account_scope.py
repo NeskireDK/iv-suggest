@@ -20,6 +20,10 @@ VERB_RE = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE|JOIN)\b")
 SCOPED = ("suggest.lanes", "suggest.items", "suggest.cooldown",
           "suggest.runs", "suggest.shuffles", "suggest.fetches")
 
+# Retention is instance-wide, so these go through prune() and lose every
+# account's rows at once. That is right for a log and wrong for lane state.
+PRUNABLE = ("suggest.plays", "suggest.fetches", "suggest.bot_touches")
+
 # The two places a bare table name is right.
 ALLOWED = (
     # DDL: the schema and the migration define the account column, so of course
@@ -44,7 +48,6 @@ ALLOWED = (
     # `account` is a column on the table for the SQL that asks per person.
     "SELECT %s, count(*) FROM suggest.fetches WHERE %s GROUP BY 1;",
     "SELECT status, count(*) FROM suggest.fetches ",
-    "DELETE FROM suggest.fetches WHERE at < now() ",
 )
 
 
@@ -78,6 +81,21 @@ class AccountScope(unittest.TestCase):
         self.assertEqual([], offenders,
                          "SQL touching a per-account table without an account "
                          "filter:\n" + "\n".join(offenders))
+
+    def test_only_a_log_is_pruned_wholesale(self):
+        """`prune` interpolates its table name, so the scan above cannot see
+        it. Deleting every account's rows at once is right for a log and wrong
+        for anything a lane is built from, so the tables are named here."""
+        pruned = {call.args[0].value
+                  for call in ast.walk(ast.parse(open(SCRIPT).read()))
+                  if isinstance(call, ast.Call)
+                  and isinstance(call.func, ast.Name)
+                  and call.func.id == "prune"
+                  and call.args and isinstance(call.args[0], ast.Constant)}
+        self.assertTrue(pruned, "the scan found no prune call at all")
+        self.assertEqual(set(), pruned - set(PRUNABLE),
+                         "retention deletes every account's rows at once, so "
+                         "only a log may go through prune()")
 
     def test_upsert_conflict_targets_include_account(self):
         """ON CONFLICT (lane,vid) would collide across accounts."""
