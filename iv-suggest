@@ -216,7 +216,7 @@ CREATE TABLE IF NOT EXISTS suggest.host_events (
 -- is written too, with the reason: that is what moves the watermark past an
 -- open this bot caused itself, so it is never reconsidered.
 CREATE TABLE IF NOT EXISTS suggest.plays (
-  vid text, played timestamptz, account text, marked boolean, why text,
+  vid text, played timestamptz, account text, outcome text, why text,
   PRIMARY KEY (vid, played));
 """
 
@@ -2561,6 +2561,11 @@ BOT_FETCH_MATCH_SECONDS = 60
 # the table stays a log rather than a second watch history.
 PLAY_LOG_DAYS = 180
 
+# What became of one open. Stored rather than derived from the reason text,
+# because these are what the metrics are grouped by and a reason is prose.
+WATCHED, BOT, REFUSED = "watched", "bot", "refused"
+PLAY_OUTCOMES = (WATCHED, BOT, REFUSED)
+
 BOT_FETCHED_IT = "the bot fetched it, not a person"
 
 NIGHTLY_RECREATE = "nightly-recreate"
@@ -2637,18 +2642,30 @@ def mark_watched(vid):
     return 0
 
 
-def record_judged_open(vid, when, marked, why):
+def record_judged_open(vid, when, outcome, why):
     """Remember this open was judged, so the watermark moves past it either way."""
-    execute("INSERT INTO suggest.plays(vid, played, account, marked, why) "
+    execute("INSERT INTO suggest.plays(vid, played, account, outcome, why) "
             "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (vid, played) DO NOTHING;"
-            % (lit(vid), lit(when), acct(),
-               "true" if marked else "false", lit(why)))
+            % (lit(vid), lit(when), acct(), lit(outcome), lit(why)))
 
 
 def forget_old_plays():
     """Drop judged opens from past the point anyone would ask about them."""
     execute("DELETE FROM suggest.plays WHERE played < now() - interval '%d days';"
             % PLAY_LOG_DAYS)
+
+
+def judge_one_open(vid, by_the_bot, dry):
+    """What becomes of one open, and the reason when it does not become a watch.
+    A dry run reports the outcome it would have written without writing it."""
+    if by_the_bot:
+        return BOT, BOT_FETCHED_IT
+    if dry:
+        return WATCHED, "would mark watched"
+    status = mark_watched(vid)
+    if status:
+        return REFUSED, "history API said %d" % status
+    return WATCHED, ""
 
 
 def cmd_harvest_plays(args):
@@ -2658,32 +2675,24 @@ def cmd_harvest_plays(args):
     if not opens:
         log("nothing opened since the last harvest")
         return 0
-    marked, refused = 0, 0
+    tally = dict((outcome, 0) for outcome in PLAY_OUTCOMES)
     for vid, when, by_the_bot in opens:
-        if by_the_bot:
-            why = BOT_FETCHED_IT
-        elif args.dry_run:
-            why = "dry run"
-        else:
-            status = mark_watched(vid)
-            why = "history API said %d" % status if status else ""
-            if status:
-                refused += 1
-            else:
-                marked += 1
+        outcome, why = judge_one_open(vid, by_the_bot, args.dry_run)
+        tally[outcome] = tally.get(outcome, 0) + 1
         log("  %s  %s  %s" % (when, vid, why or "marked watched"))
         if not args.dry_run:
-            record_judged_open(vid, when, not why, why)
-    log("%d opened, %d marked watched, %d left alone%s"
-        % (len(opens), marked, len(opens) - marked,
+            record_judged_open(vid, when, outcome, why)
+    log("%d opened, %d marked watched, %d were this bot's own fetches, "
+        "%d refused%s"
+        % (len(opens), tally[WATCHED], tally[BOT], tally[REFUSED],
            " (dry run, nothing written)" if args.dry_run else ""))
     if not args.dry_run:
         forget_old_plays()
-    if refused:
+    if tally[REFUSED]:
         log("a refusal is Invidious declining to record it. 409 is the "
             "account's own watch_history preference being off, which no retry "
             "will fix.")
-    return 1 if refused else 0
+    return 1 if tally[REFUSED] else 0
 
 
 def cmd_sid_check(args):
@@ -2899,6 +2908,17 @@ def cmd_metrics(args):
     return 0
 
 
+def plays_samples(where):
+    """One zero filled sample per outcome, all zero before `init` made the table."""
+    counted = dict((outcome, 0) for outcome in PLAY_OUTCOMES)
+    if one("SELECT to_regclass('suggest.plays') IS NOT NULL;") == "t":
+        counted.update((outcome, int(rows)) for outcome, rows in query(
+            "SELECT outcome, count(*) FROM suggest.plays WHERE %s GROUP BY 1;"
+            % where))
+    return [('{outcome="%s"}' % outcome, counted.get(outcome, 0))
+            for outcome in PLAY_OUTCOMES]
+
+
 def _instance_wide_metrics(metric, users):
     """The series with no account label, because the budget and cache are shared.
     Unlabelled also keeps the alerts already written against them working."""
@@ -2928,18 +2948,30 @@ def _instance_wide_metrics(metric, users):
            "gauge",
            [("", one("SELECT count(*) FROM suggest.video_dead "
                      "WHERE until > now();") or 0)])
-    metric("plays_harvested_24h",
-           "Opens marked watched in the last day. Yattee reports no play at "
-           "all, so a day at 0 means the harvest stopped, not that nobody "
-           "watched anything.", "gauge",
-           [("", one("SELECT CASE WHEN to_regclass('suggest.plays') IS NULL "
-                     "THEN 0 ELSE (SELECT count(*) FROM suggest.plays WHERE "
-                     "marked AND played > now() - interval '1 day') END;") or 0)])
+    metric("plays_judged_24h",
+           "Opens judged in the last day, by what became of each. `bot` is "
+           "this engine's own metadata fetches, which must never be marked "
+           "watched: a rising bot share against a flat watched count is the "
+           "separation drifting.", "gauge",
+           plays_samples("played > now() - interval '1 day'"))
+    metric("plays_logged",
+           "Opens in the log, by what became of each. Pruned at %d days, so "
+           "this can go down." % PLAY_LOG_DAYS, "gauge",
+           plays_samples("true"))
     metric("last_play_harvest_timestamp_seconds",
            "Newest open the harvest has judged, marked or not.", "gauge",
            [("", one("SELECT CASE WHEN to_regclass('suggest.plays') IS NULL "
                      "THEN 0 ELSE (SELECT coalesce(extract(epoch FROM "
                      "max(played))::bigint, 0) FROM suggest.plays) END;") or 0)])
+    metric("plays_watermark_age_seconds",
+           "How long ago the newest judged open was. Invidious deletes a video "
+           "cache row %d hours after its last refresh, so past that the "
+           "harvest is losing opens with no trace." % VIDEO_CACHE_LIFETIME_HOURS,
+           "gauge",
+           [("", one("SELECT CASE WHEN to_regclass('suggest.plays') IS NULL "
+                     "THEN 0 ELSE (SELECT coalesce(extract(epoch FROM "
+                     "now() - max(played))::bigint, 0) FROM suggest.plays) "
+                     "END;") or 0)])
     metric("up", "1 when this exporter read the database.", "gauge",
            [("", 1)])
 

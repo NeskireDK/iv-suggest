@@ -159,6 +159,13 @@ with no trace anywhere; the shipped one runs twice an hour. It exits 1 when the
 history API refused an open — 409 is the account's own `watch_history`
 preference being off.
 
+Four series follow it: `iv_suggest_plays_judged_24h{outcome=}` and
+`iv_suggest_plays_logged{outcome=}` split every open into `watched`, `bot` or
+`refused`, and `iv_suggest_plays_watermark_age_seconds` is the one to alert on —
+past the six hour cache lifetime the harvest is losing opens with no trace. A
+rising `bot` share against a flat `watched` count is the separation drifting,
+which is the thing to watch as the fill's fetch volume changes.
+
 `sid-check` exits 0 when every login survived, 1 when one did not, and **2 when
 it cannot tell** — no recorded nightly, or one too old to be evidence. Two is
 not a pass and not a loss; it means the check is not watching anything, which is

@@ -100,12 +100,12 @@ class AHumanOpen(unittest.TestCase):
         harvest(inst)
         self.assertEqual([ME], inst.served)
 
-    def test_it_is_recorded_as_marked(self):
+    def test_it_is_recorded_with_the_watched_outcome(self):
         inst = Instance(opens=[HUMAN_OPEN])
         harvest(inst)
         rows = [s for s in inst.written if "INSERT INTO suggest.plays" in s]
         self.assertEqual(1, len(rows))
-        self.assertIn("true", rows[0])
+        self.assertIn("'watched'", rows[0])
 
 
 class TheBotsOwnFetch(unittest.TestCase):
@@ -122,7 +122,7 @@ class TheBotsOwnFetch(unittest.TestCase):
         harvest(inst)
         rows = [s for s in inst.written if "INSERT INTO suggest.plays" in s]
         self.assertEqual(1, len(rows))
-        self.assertIn("false", rows[0])
+        self.assertIn("'bot'", rows[0])
         self.assertIn("the bot fetched it", rows[0])
 
     def test_a_human_open_beside_it_is_still_marked(self):
@@ -173,12 +173,12 @@ class ARefusal(unittest.TestCase):
         code, _ = harvest(inst)
         self.assertEqual(1, code)
 
-    def test_it_is_recorded_as_not_marked_with_the_status(self):
+    def test_it_is_recorded_as_refused_with_the_status(self):
         inst = Instance(opens=[HUMAN_OPEN], refuse={"dQw4w9WgXcQ": 409})
         harvest(inst)
         rows = [s for s in inst.written if "INSERT INTO suggest.plays" in s]
         self.assertIn("409", rows[0])
-        self.assertIn("false", rows[0])
+        self.assertIn("'refused'", rows[0])
 
     def test_one_refusal_does_not_stop_the_next_open(self):
         inst = Instance(opens=[HUMAN_OPEN, SECOND_HUMAN_OPEN],
@@ -194,6 +194,37 @@ class TheLog(unittest.TestCase):
         inst = Instance(opens=[HUMAN_OPEN])
         harvest(inst)
         self.assertTrue(inst.pruned)
+
+    def test_every_open_is_recorded_under_one_of_the_three_outcomes(self):
+        inst = Instance(opens=[HUMAN_OPEN, BOT_FETCH, SECOND_HUMAN_OPEN],
+                        refuse={"irTExR9_FRY": 409})
+        _, mod = harvest(inst)
+        rows = [s for s in inst.written if "INSERT INTO suggest.plays" in s]
+        self.assertEqual(3, len(rows))
+        recorded = [outcome for outcome in mod.PLAY_OUTCOMES
+                    for row in rows if "'%s'" % outcome in row]
+        self.assertEqual(sorted(mod.PLAY_OUTCOMES), sorted(recorded))
+
+
+class TheMetricSamples(unittest.TestCase):
+    """A follow-the-trend gauge is useless if an outcome's series disappears."""
+
+    def test_every_outcome_gets_a_sample_even_at_zero(self):
+        inst = Instance()
+        mod = load(IV_SUGGEST_ACCOUNT=ME)
+        inst.install(mod)
+        mod.one = lambda sql: "t"
+        samples = mod.plays_samples("true")
+        self.assertEqual(len(mod.PLAY_OUTCOMES), len(samples))
+        for outcome in mod.PLAY_OUTCOMES:
+            self.assertIn(('{outcome="%s"}' % outcome, 0), samples)
+
+    def test_it_reads_zero_before_init_has_made_the_table(self):
+        inst = Instance()
+        mod = load(IV_SUGGEST_ACCOUNT=ME)
+        inst.install(mod)
+        mod.one = lambda sql: "f"
+        self.assertEqual([0, 0, 0], [rows for _, rows in mod.plays_samples("true")])
 
 
 if __name__ == "__main__":
