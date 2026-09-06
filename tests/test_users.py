@@ -253,6 +253,7 @@ class ASpentBudget(unittest.TestCase):
         self.mod.read_blocked = lambda: {}
         self.mod.watch_count = lambda email: 900
         self.mod.execute = lambda sql: self.written.append(sql)
+        self.mod.one = lambda sql: "t"
         self.written = []
         self.ran = []
         self.mod.run_one_lane = self.run_one_lane

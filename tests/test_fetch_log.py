@@ -133,21 +133,26 @@ class EveryCallIsLogged(unittest.TestCase):
         return self.mod
 
     def test_a_call_that_answered_is_logged_as_200(self):
-        mod = self.call()
+        mod = self.call(JOB="run")
         mod.bot_api("GET", "/api/v1/videos/" + VID)
-        self.assertEqual([(ME, "", "video", VID, 200, 0)], mod.FETCH_LOG)
+        self.assertEqual([(ME, "", "run", "video", VID, 200, 0)], mod.FETCH_LOG)
+
+    def test_the_job_is_carried_so_a_hand_run_is_not_read_as_the_nightly(self):
+        mod = self.call(JOB="views")
+        mod.bot_api("GET", "/api/v1/videos/" + VID)
+        self.assertEqual("views", mod.FETCH_LOG[0][2])
 
     def test_a_refused_call_is_logged_with_its_status_and_still_raises(self):
         mod = self.call(raises=urllib.error.HTTPError("u", 429, "no", {}, None))
         with self.assertRaises(urllib.error.HTTPError):
             mod.bot_api("GET", "/api/v1/videos/" + VID)
-        self.assertEqual([(ME, "", "video", VID, 429, 0)], mod.FETCH_LOG)
+        self.assertEqual([(ME, "", "", "video", VID, 429, 0)], mod.FETCH_LOG)
 
     def test_a_call_nothing_answered_is_logged_as_zero_and_still_raises(self):
         mod = self.call(raises=urllib.error.URLError("timed out"))
         with self.assertRaises(urllib.error.URLError):
             mod.bot_api("GET", "/api/v1/videos/" + VID)
-        self.assertEqual([(ME, "", "video", VID, 0, 0)], mod.FETCH_LOG)
+        self.assertEqual([(ME, "", "", "video", VID, 0, 0)], mod.FETCH_LOG)
 
     def test_the_attempt_number_is_carried_so_a_retry_is_visible(self):
         mod = self.call()
@@ -158,6 +163,14 @@ class EveryCallIsLogged(unittest.TestCase):
         mod = self.call(LANE="autos")
         mod.bot_api("GET", "/api/v1/videos/" + VID)
         self.assertEqual("autos", mod.FETCH_LOG[0][1])
+
+    def test_the_buffer_is_flushed_before_it_can_grow_unbounded(self):
+        """A command with no lane loop would otherwise lose the lot to a kill."""
+        mod = self.call(JOB="views")
+        mod.FETCH_LOG[:] = [(ME, "", "views", "video", VID, 200, 0)] * (
+            mod.FETCH_LOG_BATCH - 1)
+        mod.bot_api("GET", "/api/v1/videos/" + VID)
+        self.assertEqual([], mod.FETCH_LOG)
 
     def test_a_dry_run_logs_nothing(self):
         """It makes real read calls; a run that wrote nothing must write none."""
@@ -175,21 +188,21 @@ class TheFlush(unittest.TestCase):
         self.mod.FETCH_LOG[:] = list(rows)
 
     def test_many_calls_cost_one_statement(self):
-        self.buffer((ME, "autos", "video", VID, 200, 0),
-                    (ME, "autos", "video", "abcdefghijk", 429, 1))
+        self.buffer((ME, "autos", "run", "video", VID, 200, 0),
+                    (ME, "autos", "run", "video", "abcdefghijk", 429, 1))
         self.mod.flush_fetch_log()
         self.assertEqual(1, len(self.recorded.written))
 
     def test_it_marks_only_the_upstream_sorts_as_upstream(self):
-        self.buffer((ME, "autos", "video", VID, 200, 0),
-                    (ME, "autos", "playlist_write", VID, 200, 0))
+        self.buffer((ME, "autos", "run", "video", VID, 200, 0),
+                    (ME, "autos", "run", "playlist_write", VID, 200, 0))
         self.mod.flush_fetch_log()
         written = self.recorded.written[0]
         self.assertIn("'video','%s',true" % VID, written)
         self.assertIn("'playlist_write','%s',false" % VID, written)
 
     def test_it_empties_the_buffer_so_nothing_is_written_twice(self):
-        self.buffer((ME, "", "video", VID, 200, 0))
+        self.buffer((ME, "", "run", "video", VID, 200, 0))
         self.mod.flush_fetch_log()
         self.mod.flush_fetch_log()
         self.assertEqual(1, len(self.recorded.written))
@@ -202,7 +215,7 @@ class TheFlush(unittest.TestCase):
         said = []
         self.mod.log = said.append
         self.mod.execute = lambda sql: (_ for _ in ()).throw(RuntimeError("no table"))
-        self.buffer((ME, "", "video", VID, 200, 0))
+        self.buffer((ME, "", "run", "video", VID, 200, 0))
         self.mod.flush_fetch_log()
         self.assertTrue(any("fetch log" in line for line in said))
         self.assertEqual([], self.mod.FETCH_LOG)
@@ -297,6 +310,60 @@ class TheCacheHitCount(unittest.TestCase):
         fetcher.known(VID)
         fetcher.begin_lane("autos", None)
         self.assertEqual(0, fetcher.lane_cache_hits)
+
+
+class EveryCommandNamesItsJob(unittest.TestCase):
+    """Or a call logged by one is indistinguishable from the nightly fill's."""
+
+    def test_no_command_forgets(self):
+        text = (pathlib.Path(__file__).resolve().parent.parent
+                / "iv-suggest").read_text()
+        silent = []
+        for node in ast.walk(ast.parse(text)):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if not node.name.startswith("cmd_"):
+                continue
+            named = {call.func.id for call in ast.walk(node)
+                     if isinstance(call, ast.Call)
+                     and isinstance(call.func, ast.Name)}
+            if "for_job" not in named:
+                silent.append(node.name)
+        self.assertEqual([], silent,
+                         "a command that names no job logs its calls as the "
+                         "last one's: %s" % ", ".join(silent))
+
+
+class TheRunRow(unittest.TestCase):
+    """The nightly timer can fire before `init` has applied a new column."""
+
+    def record(self, migrated):
+        mod = engine()
+        written = []
+        mod.execute = written.append
+        mod.one = lambda sql: "t" if migrated else "f"
+        mod._COLUMNS_SEEN.clear()
+        self.assertTrue(mod.record_the_lane_run("autos", (1, 2, 3, 4), "", 99))
+        return written[0]
+
+    def test_it_carries_the_cache_hits_once_the_column_is_there(self):
+        self.assertIn("cache_hits", self.record(migrated=True))
+        self.assertIn("99", self.record(migrated=True))
+
+    def test_it_still_writes_the_row_when_the_column_is_not(self):
+        written = self.record(migrated=False)
+        self.assertNotIn("cache_hits", written)
+        self.assertIn("INSERT INTO suggest.runs(account,lane", written)
+
+    def test_the_column_is_looked_up_once_per_process(self):
+        mod = engine()
+        asked = []
+        mod.one = lambda sql: asked.append(sql) or "t"
+        mod.execute = lambda sql: None
+        mod._COLUMNS_SEEN.clear()
+        for _ in range(5):
+            mod.record_the_lane_run("autos", (0, 0, 0, 0), "", 0)
+        self.assertEqual(1, len(asked))
 
 
 class TheRetention(unittest.TestCase):

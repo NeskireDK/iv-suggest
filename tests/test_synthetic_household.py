@@ -367,10 +367,17 @@ class TheFetchLog(unittest.TestCase):
             "SELECT count(*) FROM suggest.fetches "
             "WHERE account IS NULL OR account = '';") or 0))
 
-    def test_an_upstream_call_carries_the_lane_that_wanted_it(self):
+    def test_a_fills_upstream_call_carries_the_lane_that_wanted_it(self):
+        """Scoped to the fill on purpose. `views` walks a de-duplicated set
+        across every lane, so naming one lane for those would be a lie."""
+        self.assertEqual(0, int(self.value(
+            "SELECT count(*) FROM suggest.fetches WHERE job = 'run' "
+            "AND upstream AND (lane IS NULL OR lane = '');") or 0))
+
+    def test_every_row_names_the_job_that_made_the_call(self):
         self.assertEqual(0, int(self.value(
             "SELECT count(*) FROM suggest.fetches "
-            "WHERE upstream AND (lane IS NULL OR lane = '');") or 0))
+            "WHERE job IS NULL OR job = '';") or 0))
 
     def test_the_question_it_exists_for_can_be_asked(self):
         """Requests to YouTube per hour, per account, per sort."""

@@ -115,9 +115,16 @@ VID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 LANE = ""
 
 # Calls made and not yet written. A dry run makes real read calls, so DRY is
-# what keeps it from writing rows for a run that wrote nothing else.
+# what keeps it from writing rows for a run that wrote nothing else. JOB is the
+# subcommand, which is what tells the nightly fill's traffic apart from a
+# `views` run somebody started by hand.
 FETCH_LOG = []
 DRY = False
+JOB = ""
+
+# Flushed at this many rows as well as per lane, so a command with no lane loop
+# cannot lose a whole run's log to the timeout that kills it.
+FETCH_LOG_BATCH = 200
 
 DEFAULTS = {
     "size": 30,
@@ -256,7 +263,7 @@ CREATE TABLE IF NOT EXISTS suggest.job_runs (
 -- no answer without this. An append log, no key: two identical calls a second
 -- apart are two facts.
 CREATE TABLE IF NOT EXISTS suggest.fetches (
-  at timestamptz NOT NULL DEFAULT now(), account text, lane text,
+  at timestamptz NOT NULL DEFAULT now(), account text, lane text, job text,
   kind text NOT NULL, target text, upstream boolean NOT NULL,
   status int, attempt int);
 CREATE INDEX IF NOT EXISTS fetches_at_idx ON suggest.fetches (at);
@@ -637,11 +644,22 @@ def target_of_call(path, body):
     return parts[1] if len(parts) > 1 else ""
 
 
+# Set by the command rather than by main(), because a command is also called
+# directly -- the synthetic harness drives cmd_run itself -- and a label only
+# the entry point sets is a label no test can check.
+def for_job(name):
+    """Name the job whose calls are being logged from here on."""
+    global JOB
+    JOB = name
+
+
 def note_fetch(kind, target, status, attempt):
     """Buffer one call. Buffered, or every call would cost a second psql."""
     if DRY:
         return
-    FETCH_LOG.append((ACCOUNT, LANE, kind, target, status, attempt))
+    FETCH_LOG.append((ACCOUNT, LANE, JOB, kind, target, status, attempt))
+    if len(FETCH_LOG) >= FETCH_LOG_BATCH:
+        flush_fetch_log()
 
 
 def flush_fetch_log():
@@ -649,14 +667,14 @@ def flush_fetch_log():
     if not FETCH_LOG:
         return
     rows = ",".join(
-        "(%s,%s,%s,%s,%s,%d,%d)"
-        % (lit(account), lit(lane), lit(kind), lit(target),
+        "(%s,%s,%s,%s,%s,%s,%d,%d)"
+        % (lit(account), lit(lane), lit(job), lit(kind), lit(target),
            "true" if kind in UPSTREAM_KINDS else "false", status, attempt)
-        for account, lane, kind, target, status, attempt in FETCH_LOG)
+        for account, lane, job, kind, target, status, attempt in FETCH_LOG)
     del FETCH_LOG[:]
     try:
         execute("INSERT INTO suggest.fetches"
-                "(account,lane,kind,target,upstream,status,attempt) "
+                "(account,lane,job,kind,target,upstream,status,attempt) "
                 "VALUES %s;" % rows)
     except Exception as e:
         log("  WARNING: the fetch log for this lane was not written: %r" % e)
@@ -2189,6 +2207,7 @@ def announce_the_build():
 
 def cmd_run(args):
     """Fill every managed account's lanes in one paced run: one timer, one budget."""
+    for_job("run")
     announce_the_build()
     all_lanes = load_config()
     warn_ignored_keys(all_lanes)
@@ -2279,12 +2298,15 @@ def record_the_lane_run(lane_id, counts, error, cache_hits):
     """Write one lane's row in suggest.runs. False when it could not be written.
     The row is what the metrics and the account order read, so a lost one is a failed run."""
     removed, added, kept, used = counts
+    fields = ["lane", "added", "removed", "kept", "fetches", "error"]
+    values = [lit(lane_id), str(added), str(removed), str(kept), str(used),
+              lit(error)]
+    if column_exists("runs", "cache_hits"):
+        fields.append("cache_hits")
+        values.append(str(cache_hits))
     try:
-        execute("INSERT INTO suggest.runs"
-                "(account,lane,added,removed,kept,fetches,error,cache_hits) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%d);"
-                % (acct(), lit(lane_id), added, removed, kept, used, lit(error),
-                   cache_hits))
+        execute("INSERT INTO suggest.runs(account,%s) VALUES (%s,%s);"
+                % (",".join(fields), acct(), ",".join(values)))
         return True
     except Exception as e:
         log("  WARNING: lane %s ran but its run row was not written: %r"
@@ -2330,6 +2352,7 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
 
 def cmd_dedupe(args):
     """Keep one upload per song per account and remove the rest. The next run refills."""
+    for_job("dedupe")
     for user in accounts_wanted(args):
         serve_account(user["email"])
         log("account %s" % user["email"])
@@ -2430,6 +2453,7 @@ def videos_across_every_lane(args):
 def cmd_views(args):
     """Refresh the recorded view counts of every video the bot's playlists hold.
     Ignores the metadata cache on purpose: the whole point is the CURRENT count."""
+    for_job("views")
     vids = videos_across_every_lane(args)
     log("%d unique videos across every lane of every account" % len(vids))
 
@@ -2651,6 +2675,7 @@ def shuffle_lane(lane, orders, dry):
 
 def cmd_shuffle(args):
     """Reorder every lane. Database only: no API call, no YouTube fetch."""
+    for_job("shuffle")
     announce_the_build()
     all_lanes = load_config()
     failed = 0
@@ -2691,6 +2716,7 @@ def shuffle_account(user, all_lanes, args):
 
 def cmd_init(args):
     """Prepare the schema, then every managed account. Idempotent, so safe to re-run."""
+    for_job("init")
     if not PRIMARY:
         sys.exit("set IV_SUGGEST_ACCOUNT: the migration needs to know which "
                  "account the rows written before multi-user belong to")
@@ -2888,6 +2914,7 @@ def judge_one_open(vid, by_the_bot, dry):
 
 def cmd_harvest_plays(args):
     """Mark as watched what somebody opened, because Yattee reports no play."""
+    for_job("harvest-plays")
     serve_account(PRIMARY)
     looked = one("SELECT now()::text;")
     opens = unjudged_opens(plays_watermark())
@@ -2911,6 +2938,7 @@ def cmd_harvest_plays(args):
 
 def cmd_sid_check(args):
     """Say whether each managed account's login survived the nightly recreate."""
+    for_job("sid-check")
     finished, hours_ago = nightly_finish()
     if not finished:
         log("the host has never recorded a nightly finish, so no session can "
@@ -2939,6 +2967,8 @@ def cmd_sid_check(args):
 
 
 def cmd_status(args):
+    """Print each account's lane sizes and its recent runs."""
+    for_job("status")
     policies = lane_policies()
     for user in accounts_wanted(args):
         use_account(user["email"])
@@ -3031,6 +3061,7 @@ def lane_facts():
 def cmd_metrics(args):
     """Print the Prometheus text form. Database only, never a YouTube fetch.
     Every per-lane series carries an `account` label, or two people's lanes collide."""
+    for_job("metrics")
     all_lanes = load_config()
     users = load_users()
     out = []
@@ -3122,11 +3153,17 @@ def cmd_metrics(args):
     return 0
 
 
+_COLUMNS_SEEN = {}
+
+
 def column_exists(table, column):
     """Whether the migration has added it. A table can exist without it."""
-    return one("SELECT EXISTS (SELECT 1 FROM information_schema.columns "
-               "WHERE table_schema='suggest' AND table_name=%s "
-               "AND column_name=%s);" % (lit(table), lit(column))) == "t"
+    if (table, column) not in _COLUMNS_SEEN:
+        _COLUMNS_SEEN[(table, column)] = one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema='suggest' AND table_name=%s "
+            "AND column_name=%s);" % (lit(table), lit(column))) == "t"
+    return _COLUMNS_SEEN[(table, column)]
 
 
 def table_exists(name):
@@ -3191,7 +3228,7 @@ def cache_hit_ratio(window):
     got, asked = query(
         "SELECT coalesce(sum(cache_hits),0), "
         "coalesce(sum(cache_hits),0) + coalesce(sum(fetches),0) "
-        "FROM suggest.runs WHERE %s;" % window)[0]
+        "FROM suggest.runs WHERE cache_hits IS NOT NULL AND %s;" % window)[0]
     return round(float(got) / float(asked), 4) if float(asked) else 0
 
 
