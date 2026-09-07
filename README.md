@@ -235,8 +235,15 @@ Three kinds can reach YouTube at all — `video`, `channel_latest` and
 `playlist_add` — and `CAN_REACH_KINDS` exists only to zero-fill the metric
 labels. A channel listing is always external: Invidious does not cache them, and
 three consecutive calls each took over half a second. A call that **failed** is
-external too, and that case has to be named, because the error path deletes the
-cache row and its absence must not read as a cache hit.
+external too where the failure proves it went out — a 404 on a video is
+Invidious reporting that upstream has lost it, which it had to ask to find out.
+That case has to be named, because the error path deletes the cache row and its
+absence must not read as a cache hit. A `playlist_add` refused 401, 403 or 404
+never reached `get_video` at all, so only a 5xx counts for those; and **nothing
+with a status of 0 is ever external**, because nothing answered, so the call
+never even reached Invidious. That last one is what the 05:00 container recreate
+produces, and a `urlopen` timeout takes 30 seconds, which would otherwise clear
+the duration test on its own.
 
 `ms` holds how long each call took, which is the other cache tell and is worth
 having on its own — it is where retry backoff and a slow night show up.
@@ -287,9 +294,15 @@ instead, so a timeout kill cannot take a whole run's log with it.
 
 Four metrics carry the same numbers into Prometheus for alerting:
 `iv_suggest_external_fetches_24h{kind}`,
-`iv_suggest_cache_served_calls_24h{kind}` — its other side —
-`iv_suggest_external_failures_24h{class}` and
+`iv_suggest_cache_served_calls_24h{kind}` — its other side, and clean answers
+only, or a night of refused sessions would read as a night of perfect cache
+hits — `iv_suggest_fetch_failures_24h{class}` and
 `iv_suggest_cache_hit_ratio_24h`.
+
+`fetch_failures_24h` counts failures among every call that *could* have reached
+YouTube, deliberately **not** narrowed to the ones that did: a refused call is
+precisely the one that did not go out, and it is the one worth knowing about. A
+`playlist_add` rate-limited to a 429 would otherwise be invisible.
 
 `rate_limited` rising means back off. `answered_an_error` is the one worth
 knowing about: Invidious answers **200 with an error in the body** when it cannot

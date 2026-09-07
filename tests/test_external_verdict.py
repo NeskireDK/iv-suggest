@@ -101,6 +101,25 @@ class AnyCall(Case, unittest.TestCase):
         self.assertEqual("f", self.verdict(
             "video", status=0, ms=30, error="URLError('timed out')"))
 
+    def test_a_call_that_timed_out_slowly_still_did_not_go_out(self):
+        """A urlopen timeout takes 30 seconds, which clears the duration test
+        on its own. Nothing answered, so nothing reached YouTube."""
+        self.assertEqual("f", self.verdict(
+            "video", status=0, ms=30000, error="URLError('timed out')"))
+
+    def test_a_channel_listing_nothing_answered_did_not_either(self):
+        """The 05:00 container recreate is when this happens."""
+        self.assertEqual("f", self.verdict(
+            "channel_latest", target="UCabc", status=0, ms=30000,
+            error="ConnectionRefusedError"))
+
+    def test_a_real_fetch_a_moment_earlier_does_not_lend_its_evidence(self):
+        """In a fill the metadata fetch and the playlist add of one video are a
+        fraction of a second apart; a wide window would count both."""
+        self.db.psql("INSERT INTO videos(id, info, updated) "
+                     "VALUES ('%s','{}', now() - interval '1 second');" % VID)
+        self.assertEqual("f", self.verdict("playlist_add"))
+
 
 class APlaylistAdd(Case, unittest.TestCase):
     """It reaches `get_video` too, so it is judged like a video -- except when

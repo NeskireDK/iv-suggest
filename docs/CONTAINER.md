@@ -217,7 +217,7 @@ error, just an expression that matches nothing.
 
 So a rename is two changes, and this one renamed two series:
 `iv_suggest_upstream_fetches_24h` → `external_fetches_24h`, and
-`upstream_failures_24h` → `external_failures_24h`. Check before deploying:
+`upstream_failures_24h` → `fetch_failures_24h`. Check before deploying:
 
 ```sh
 ssh root@192.168.1.99 'pct exec 103 -- grep -rn "iv_suggest_upstream" \

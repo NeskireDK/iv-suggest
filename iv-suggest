@@ -639,10 +639,13 @@ def error_in_the_answer(answer):
 # which labels the metrics zero-fill.
 CAN_REACH_KINDS = ("video", "channel_latest", "playlist_add")
 
-# Postgres and this container share a clock, so the slack is for rounding
-# rather than for drift -- but it is applied to BOTH ends of the window, since
-# skew the other way would turn a real fetch into a recorded cache hit.
-EXTERNAL_CLOCK_SLACK_MS = 2000
+# Postgres and this container share a clock, so this covers the rounding of
+# `ms` to whole milliseconds and nothing more. It has to stay small: the cache
+# row can only move DURING the call, so a generous lower bound would reach back
+# into the previous call about the same video -- and in a fill the metadata
+# fetch and the playlist add of one video are a fraction of a second apart, so
+# every add would inherit the fetch's evidence.
+CLOCK_SKEW_MS = 50
 
 # No cache answer has ever come close to this, and no real fetch has come near
 # it from the other side: measured 6, 6, 7 and 7ms for calls Invidious served
@@ -662,6 +665,11 @@ CACHE_ANSWER_CEILING_MS = 200
 # path DELETES the cache row, so its absence must not read as a cache hit.
 # Three sorts of evidence, and which of them counts depends on the call.
 #
+# Nothing answered at all is the first case, and it settles every kind: the
+# call never reached Invidious, so it cannot have reached YouTube either. A
+# thirty second timeout would otherwise clear the duration test on its own, and
+# a channel listing during the 05:00 recreate would count as a request.
+#
 # A refusal is only proof for a `video`: Invidious answers 404 or 410 there
 # after asking upstream, so it went out. A `playlist_add` refused 401, 403 or
 # 404 never reached `get_video` at all -- that is an expired session or a
@@ -671,6 +679,7 @@ CACHE_ANSWER_CEILING_MS = 200
 # string like any other failure, which is why the error alone cannot be the
 # test.
 EXTERNAL_SQL = """CASE
+  WHEN c.status = 0 THEN false
   WHEN c.kind = 'channel_latest' THEN true
   WHEN c.kind NOT IN ('video', 'playlist_add') THEN false
   ELSE c.ms > %d
@@ -681,8 +690,7 @@ EXTERNAL_SQL = """CASE
       SELECT 1 FROM videos v WHERE v.id = c.target
       AND v.updated >= c.at - %d * interval '1 millisecond'
       AND v.updated <= c.at + (c.ms + %d) * interval '1 millisecond')
-  END""" % (CACHE_ANSWER_CEILING_MS, EXTERNAL_CLOCK_SLACK_MS,
-            EXTERNAL_CLOCK_SLACK_MS)
+  END""" % (CACHE_ANSWER_CEILING_MS, CLOCK_SKEW_MS, CLOCK_SKEW_MS)
 
 # A 429 means slow down, a 5xx means somebody upstream is having a bad minute,
 # and nothing at all means neither -- three different answers that used to end
@@ -3342,8 +3350,9 @@ def failure_samples(window):
     if column_exists("fetches", "external"):
         for status, error, rows in query(
                 "SELECT status, coalesce(error,''), count(*) FROM "
-                "suggest.fetches WHERE external AND (status <> 200 OR "
-                "coalesce(error,'') <> '') AND %s GROUP BY 1, 2;" % window):
+                "suggest.fetches WHERE kind IN "
+                "('video','channel_latest','playlist_add') AND (status <> 200 "
+                "OR coalesce(error,'') <> '') AND %s GROUP BY 1, 2;" % window):
             counted[failure_class(int(status), error)] += int(rows)
     return [('{class="%s"}' % name, counted[name]) for name in FAILURE_CLASSES]
 
@@ -3397,18 +3406,22 @@ def _instance_wide_metrics(metric, users):
            fetch_samples("external AND at > now() - interval '1 day'",
                          "kind", CAN_REACH_KINDS))
     metric("cache_served_calls_24h",
-           "Calls in the last day that Invidious answered from its own video "
-           "cache, so they cost nothing upstream. The other side of "
-           "external_fetches_24h.", "gauge",
-           fetch_samples("NOT external AND kind IN ('video','playlist_add') "
+           "Calls in the last day that Invidious answered cleanly from its own "
+           "video cache, so they cost nothing upstream. A call that failed is "
+           "not one of these, or a night of refused sessions would read as a "
+           "night of perfect cache hits.", "gauge",
+           fetch_samples("NOT external AND status = 200 "
+                         "AND coalesce(error,'') = '' "
+                         "AND kind IN ('video','playlist_add') "
                          "AND at > now() - interval '1 day'",
                          "kind", ("video", "playlist_add")))
-    metric("external_failures_24h",
-           "Calls that left the machine in the last day and did not come "
-           "back clean, by "
-           "sort of failure. `rate_limited` rising means back off; "
-           "`answered_an_error` is a 200 carrying an error, which is what "
-           "buries a video for 30 days.",
+    metric("fetch_failures_24h",
+           "Calls in the last day that could have reached YouTube and did not "
+           "come back clean, by sort of failure. Deliberately not narrowed to "
+           "the ones that left the machine: a refused call is exactly the one "
+           "that did not, and it is the one worth knowing about. "
+           "`rate_limited` rising means back off; `answered_an_error` is a 200 "
+           "carrying an error, which is what buries a video for 30 days.",
            "gauge", failure_samples("at > now() - interval '1 day'"))
     metric("cache_hit_ratio_24h",
            "Share of metadata lookups the permanent cache answered over the "

@@ -274,14 +274,16 @@ class TheFlush(unittest.TestCase):
         self.assertIn("FROM videos v WHERE v.id = c.target", written)
         self.assertIn("v.updated >= c.at", written)
 
-    def test_the_clock_slack_is_applied_to_both_ends_of_the_window(self):
-        """Skew the other way would turn a real fetch into a cache hit."""
+    def test_the_window_allows_only_rounding_either_side(self):
+        """A generous lower bound would reach back into the previous call about
+        the same video, which in a fill is a fraction of a second earlier."""
         self.buffer((0.0, ME, "", "run", "video", VID, 200, 0, "", 2270))
         self.mod.flush_fetch_log()
         written = self.recorded.written[0]
-        slack = "%d * interval '1 millisecond'" % self.mod.EXTERNAL_CLOCK_SLACK_MS
-        self.assertIn("v.updated >= c.at - " + slack, written)
-        self.assertIn("(c.ms + %d)" % self.mod.EXTERNAL_CLOCK_SLACK_MS, written)
+        skew = "%d * interval '1 millisecond'" % self.mod.CLOCK_SKEW_MS
+        self.assertIn("v.updated >= c.at - " + skew, written)
+        self.assertIn("(c.ms + %d)" % self.mod.CLOCK_SKEW_MS, written)
+        self.assertGreater(200, self.mod.CLOCK_SKEW_MS)
 
     def test_it_empties_the_buffer_so_nothing_is_written_twice(self):
         self.buffer((0.0, ME, "", "run", "video", VID, 200, 0, "", 7))
