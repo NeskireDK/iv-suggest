@@ -268,9 +268,24 @@ CREATE TABLE IF NOT EXISTS suggest.job_runs (
 -- apart are two facts.
 CREATE TABLE IF NOT EXISTS suggest.fetches (
   at timestamptz NOT NULL DEFAULT now(), account text, lane text, job text,
-  kind text NOT NULL, target text, upstream boolean NOT NULL,
-  status int, attempt int, error text);
+  kind text NOT NULL, target text, status int, attempt int, error text,
+  ms int, external boolean);
 CREATE INDEX IF NOT EXISTS fetches_at_idx ON suggest.fetches (at);
+-- `upstream` said a call COULD reach YouTube, which counted every playlist add:
+-- 312 of them in one night against 169 real fetches, so the headline number
+-- read three times the truth. `external` says it DID, and is decided at write
+-- time from evidence rather than from the sort of call it was.
+ALTER TABLE suggest.fetches ADD COLUMN IF NOT EXISTS ms int;
+ALTER TABLE suggest.fetches ADD COLUMN IF NOT EXISTS external boolean;
+-- Rows written before this migration can only be judged where the kind settles
+-- it: a channel listing is never cached, and nothing outside those three kinds
+-- can leave the machine at all. A `video` or `playlist_add` from before stays
+-- NULL, because the evidence for it -- a `videos` row -- is deleted after six
+-- hours and is already gone. NULL matches neither `external` nor
+-- `NOT external`, which is the honest answer to "we cannot tell".
+UPDATE suggest.fetches SET external = (kind = 'channel_latest')
+ WHERE external IS NULL AND kind NOT IN ('video', 'playlist_add');
+ALTER TABLE suggest.fetches DROP COLUMN IF EXISTS upstream;
 """
 
 # Bring a single-account database up to the shape above. Everything that exists
@@ -582,23 +597,31 @@ def bot_api(method, path, body=None, attempt=0):
     transport is what lets a stubbed `api` still exercise the recording."""
     note_bot_touch(video_the_call_refreshes(path, body))
     kind = kind_of_call(method, path)
+    started, began = time.time(), time.monotonic()
     try:
         answer = api(method, path, body)
     except Aborted:
         raise
     except urllib.error.HTTPError as e:
-        note_fetch(kind, target_of_call(path, body), e.code, attempt)
+        note_fetch(started, kind, target_of_call(path, body), e.code, attempt,
+                   ms=since(began))
         raise
     except ValueError as e:
-        note_fetch(kind, target_of_call(path, body), 200, attempt,
-                   "unreadable answer: %s" % e)
+        note_fetch(started, kind, target_of_call(path, body), 200, attempt,
+                   "unreadable answer: %s" % e, since(began))
         raise
     except Exception as e:
-        note_fetch(kind, target_of_call(path, body), 0, attempt, repr(e))
+        note_fetch(started, kind, target_of_call(path, body), 0, attempt,
+                   repr(e), since(began))
         raise
-    note_fetch(kind, target_of_call(path, body), 200, attempt,
-               error_in_the_answer(answer))
+    note_fetch(started, kind, target_of_call(path, body), 200, attempt,
+               error_in_the_answer(answer), since(began))
     return answer
+
+
+def since(began):
+    """Whole milliseconds spent on the call, which is the other cache tell."""
+    return int((time.monotonic() - began) * 1000)
 
 
 # Invidious answers 200 with an error in the body when it cannot parse a video,
@@ -610,14 +633,88 @@ def error_in_the_answer(answer):
     return str(answer.get("error") or "") if isinstance(answer, dict) else ""
 
 
-# The calls that can make Invidious go out to YouTube. A metadata fetch and a
-# channel listing always do -- the video cache is short lived and a listing is
-# not cached at all. Adding a video to a playlist reaches `get_video` as well,
-# so it CAN, and does whenever that cache row has gone stale: the normal case
-# for a compiled lane adding a video no lane fetched recently, and not the case
-# for a fill adding a candidate it fetched a minute ago. Everything else is
-# answered from the Invidious database and never leaves the machine.
-UPSTREAM_KINDS = ("video", "channel_latest", "playlist_add")
+# The three sorts of call that reach `get_video` or a channel listing, and so
+# can leave the machine. Whether one actually did is decided per call, in
+# EXTERNAL_SQL; this list only says which kinds are worth asking about, and
+# which labels the metrics zero-fill.
+CAN_REACH_KINDS = ("video", "channel_latest", "playlist_add")
+
+# The two that reach `get_video`, and so leave a `videos` row to be judged by.
+GET_VIDEO_KINDS = ("video", "playlist_add")
+
+
+def kinds_sql(kinds):
+    """Those kinds as a SQL list, so no query spells the taxonomy out again."""
+    return ", ".join(lit(kind) for kind in kinds)
+
+# Postgres and this container share a clock, so this covers the rounding of
+# `ms` to whole milliseconds and nothing more. It has to stay small: the cache
+# row can only move DURING the call, so a generous lower bound would reach back
+# into the previous call about the same video -- and in a fill the metadata
+# fetch and the playlist add of one video are a fraction of a second apart, so
+# every add would inherit the fetch's evidence.
+CLOCK_SKEW_MS = 50
+
+# No cache answer has ever come close to this, and no real fetch has come near
+# it from the other side: measured 6, 6, 7 and 7ms for calls Invidious served
+# from its own cache against 530-680ms for a channel listing and 1648-2270ms
+# for a video it had to go and get. It is the second, independent tell, and it
+# is what keeps the verdict right when the cache row's evidence is unavailable
+# -- two calls about one video in a single batch leave only the later one's.
+CACHE_ANSWER_CEILING_MS = 200
+#
+# Measured on the box, 2026-09-07. A video call Invidious answered from its own
+# cache took 6ms and left `videos.updated` untouched; a real fetch took 2270ms
+# and rewrote it. So a moved `updated` inside the call's own window is proof the
+# call went out, and it settles a playlist add -- which reaches `get_video` too
+# -- without guessing from the kind. A channel listing is not cached at all:
+# three consecutive calls each took over half a second and all went out. A call
+# that failed also went out, and that case has to be named because the error
+# path DELETES the cache row, so its absence must not read as a cache hit.
+# Three sorts of evidence, and which of them counts depends on the call.
+#
+# How a failure proves the call went out, which depends on the call. Invidious
+# answers 404 or 410 on a video after asking upstream, and a 5xx there means it
+# tried and broke. A `playlist_add` refused 401, 403 or 404 never reached
+# `get_video` at all -- that is an expired session or a missing playlist -- so
+# only a 5xx counts for those. A 429 is Invidious refusing US, not YouTube
+# refusing Invidious, and `Fetcher.video` retries three times, so counting one
+# would log three calls that never happened. A status of 0 is never proof:
+# nothing answered, so nothing reached Invidious either.
+FAILED_OUTBOUND_SQL = """(c.status = 200 AND c.error <> '')
+    OR (c.kind = 'video' AND (c.status IN (404, 410) OR c.status >= 500))
+    OR (c.kind <> 'video' AND c.status >= 500)"""
+
+# A channel listing is never cached, so a clean answer always went out -- but
+# a refusal has to be read the same way as anywhere else, or a 429'd listing
+# retried three times logs three calls that never happened.
+#
+# Three sorts of evidence, ranked rather than simply OR'd. The duration is
+# consulted only for a call that came back CLEAN: a refusal the failure rules
+# deliberately exclude must not walk back in through it just because the call
+# was slow, and a refusal often is.
+#
+# A cache row that moved inside the call's own window is proof it went out. A
+# row that is OLDER than the call is proof it did not, and that has to outrank
+# the duration -- the 6ms measurement was taken at idle, and a cache hit under
+# load could cross the ceiling without going anywhere. The duration is only
+# consulted when no such row survives to say otherwise, which is the case a
+# second call about the same video creates: the row then holds the later move
+# and the earlier real fetch has nothing left to point at.
+EXTERNAL_SQL = """CASE
+  WHEN c.kind = 'channel_latest' THEN
+    (c.status = 200 AND c.error = '') OR c.status >= 500
+  WHEN c.kind NOT IN (%s) THEN false
+  ELSE %s
+    OR EXISTS (
+      SELECT 1 FROM videos v WHERE v.id = c.target
+      AND v.updated >= c.at - %d * interval '1 millisecond'
+      AND v.updated <= c.at + (c.ms + %d) * interval '1 millisecond')
+    OR (c.status = 200 AND c.error = '' AND c.ms > %d AND NOT EXISTS (
+      SELECT 1 FROM videos v WHERE v.id = c.target
+      AND v.updated < c.at - %d * interval '1 millisecond'))
+  END""" % (kinds_sql(GET_VIDEO_KINDS), FAILED_OUTBOUND_SQL, CLOCK_SKEW_MS,
+            CLOCK_SKEW_MS, CACHE_ANSWER_CEILING_MS, CLOCK_SKEW_MS)
 
 # A 429 means slow down, a 5xx means somebody upstream is having a bad minute,
 # and nothing at all means neither -- three different answers that used to end
@@ -691,10 +788,14 @@ def for_nobody_in_particular():
     ACCOUNT = ""
 
 
-def note_fetch(kind, target, status, attempt, error=""):
-    """Buffer one call, dated now: the flush is minutes later and in one batch."""
-    FETCH_LOG.append((time.time(), ACCOUNT, LANE, JOB, kind, target, status,
-                      attempt, error[:200]))
+# Dated from when the call STARTED, not when it returned. The flush is minutes
+# later, so it cannot supply the time -- and Invidious rewrites the cache row
+# during the call, so a row dated at the end sits after its own evidence and
+# every call reads as a cache hit.
+def note_fetch(started, kind, target, status, attempt, error="", ms=0):
+    """Buffer one call, dated when it began."""
+    FETCH_LOG.append((started, ACCOUNT, LANE, JOB, kind, target, status,
+                      attempt, error[:200], ms))
     if len(FETCH_LOG) >= FETCH_LOG_BATCH:
         flush_fetch_log()
 
@@ -705,17 +806,19 @@ def flush_fetch_log():
         return
     lost = len(FETCH_LOG)
     rows = ",".join(
-        "(to_timestamp(%.6f),%s,%s,%s,%s,%s,%s,%d,%d,%s)"
+        "(to_timestamp(%.6f),%s,%s,%s,%s,%s,%d,%d,%s,%d)"
         % (at, lit(account), lit(lane), lit(job), lit(kind), lit(target),
-           "true" if kind in UPSTREAM_KINDS else "false", status, attempt,
-           lit(error))
-        for at, account, lane, job, kind, target, status, attempt, error
+           status, attempt, lit(error), ms)
+        for at, account, lane, job, kind, target, status, attempt, error, ms
         in FETCH_LOG)
     del FETCH_LOG[:]
     try:
         execute("INSERT INTO suggest.fetches"
-                "(at,account,lane,job,kind,target,upstream,status,attempt,"
-                "error) VALUES %s;" % rows)
+                "(at,account,lane,job,kind,target,status,attempt,error,ms,"
+                "external) SELECT c.at, c.account, c.lane, c.job, c.kind, "
+                "c.target, c.status, c.attempt, c.error, c.ms, %s "
+                "FROM (VALUES %s) AS c(at,account,lane,job,kind,target,"
+                "status,attempt,error,ms);" % (EXTERNAL_SQL, rows))
     except Exception as e:
         log("  WARNING: %d logged calls were not written: %r" % (lost, e))
 
@@ -3257,7 +3360,7 @@ def plays_samples(where):
 def fetch_samples(where, column, wanted):
     """One zero filled sample per `wanted` value, all zero before `init` ran."""
     counted = dict((value, 0) for value in wanted)
-    if table_exists("suggest.fetches"):
+    if column_exists("fetches", "external"):
         counted.update((value, int(rows)) for value, rows in query(
             "SELECT %s, count(*) FROM suggest.fetches WHERE %s GROUP BY 1;"
             % (column, where)))
@@ -3265,14 +3368,19 @@ def fetch_samples(where, column, wanted):
             for value in wanted]
 
 
+# Guarded on the table and not the column, unlike its neighbour: it reads only
+# `kind` and `status`, both of which the previous tag's table already had. A
+# column guard here would publish a hard zero for every failure class during
+# the window between a tag pull and `init`.
 def failure_samples(window):
     """Failed upstream calls per class, read in Python so the buckets live once."""
     counted = dict((name, 0) for name in FAILURE_CLASSES)
     if table_exists("suggest.fetches"):
         for status, error, rows in query(
                 "SELECT status, coalesce(error,''), count(*) FROM "
-                "suggest.fetches WHERE upstream AND (status <> 200 OR "
-                "coalesce(error,'') <> '') AND %s GROUP BY 1, 2;" % window):
+                "suggest.fetches WHERE kind IN (%s) AND (status <> 200 "
+                "OR coalesce(error,'') <> '') AND %s GROUP BY 1, 2;"
+                % (kinds_sql(CAN_REACH_KINDS), window)):
             counted[failure_class(int(status), error)] += int(rows)
     return [('{class="%s"}' % name, counted[name]) for name in FAILURE_CLASSES]
 
@@ -3318,18 +3426,30 @@ def _instance_wide_metrics(metric, users):
            "budget is shared, so this is the number that matters.", "gauge",
            [("", one("SELECT coalesce(sum(fetches),0) FROM suggest.runs "
                      "WHERE started > now() - interval '1 day';") or 0)])
-    metric("upstream_fetches_24h",
-           "Calls in the last day that CAN reach YouTube, by sort -- an upper "
-           "bound: `playlist_add` only goes out when Invidious's ten minute "
-           "video cache has gone stale. Everything not counted here is always "
-           "answered from the Invidious database.", "gauge",
-           fetch_samples("upstream AND at > now() - interval '1 day'",
-                         "kind", UPSTREAM_KINDS))
-    metric("upstream_failures_24h",
-           "Upstream calls in the last day that did not come back clean, by "
-           "sort of failure. `rate_limited` rising means back off; "
-           "`answered_an_error` is a 200 carrying an error, which is what "
-           "buries a video for 30 days.",
+    metric("external_fetches_24h",
+           "Calls in the last day that really left the machine, by sort. A "
+           "call Invidious answered from its own video cache is not one, which "
+           "is decided per call from whether the cache row moved -- not from "
+           "the sort of call it was.", "gauge",
+           fetch_samples("external AND at > now() - interval '1 day'",
+                         "kind", CAN_REACH_KINDS))
+    metric("cache_served_calls_24h",
+           "Calls in the last day that Invidious answered cleanly from its own "
+           "video cache, so they cost nothing upstream. A call that failed is "
+           "not one of these, or a night of refused sessions would read as a "
+           "night of perfect cache hits.", "gauge",
+           fetch_samples("NOT external AND status = 200 "
+                         "AND coalesce(error,'') = '' AND kind IN (%s) "
+                         "AND at > now() - interval '1 day'"
+                         % kinds_sql(GET_VIDEO_KINDS),
+                         "kind", GET_VIDEO_KINDS))
+    metric("fetch_failures_24h",
+           "Calls in the last day that could have reached YouTube and did not "
+           "come back clean, by sort of failure. Deliberately not narrowed to "
+           "the ones that left the machine: a refused call is exactly the one "
+           "that did not, and it is the one worth knowing about. "
+           "`rate_limited` rising means back off; `answered_an_error` is a 200 "
+           "carrying an error, which is what buries a video for 30 days.",
            "gauge", failure_samples("at > now() - interval '1 day'"))
     metric("cache_hit_ratio_24h",
            "Share of metadata lookups the permanent cache answered over the "

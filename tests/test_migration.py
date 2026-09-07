@@ -66,8 +66,26 @@ def docker_works():
         return False
 
 
-@unittest.skipUnless(docker_works(), "docker is not available")
-class Migration(unittest.TestCase):
+# The call log exactly as the previous tag left it: `upstream`, and neither
+# `ms` nor `external`. This is the only destructive step in the whole schema --
+# a DROP COLUMN -- so the shape it will really meet is worth spelling out.
+YESTERDAYS_FETCHES_SQL = """
+CREATE SCHEMA IF NOT EXISTS suggest;
+CREATE TABLE suggest.fetches (
+  at timestamptz NOT NULL DEFAULT now(), account text, lane text, job text,
+  kind text NOT NULL, target text, upstream boolean NOT NULL,
+  status int, attempt int, error text);
+INSERT INTO suggest.fetches(account,lane,job,kind,target,upstream,status,attempt)
+VALUES ('a@b','autos','run','video','dQw4w9WgXcQ',true,200,0),
+       ('a@b','autos','run','playlist_add','dQw4w9WgXcQ',true,200,0),
+       ('a@b','autos','run','channel_latest','UCabc',true,200,0),
+       ('a@b','autos','run','playlist_read','IVPLx',false,200,0);
+"""
+
+
+class RealPostgres:
+    """A throwaway cluster per class. Not a TestCase, or every user of it would
+    re-run the others' cases."""
 
     @classmethod
     def setUpClass(cls):
@@ -106,6 +124,10 @@ class Migration(unittest.TestCase):
             capture_output=True, text=True)
         self.assertEqual(0, r.returncode, r.stderr)
         return [line for line in r.stdout.splitlines() if line]
+
+
+@unittest.skipUnless(docker_works(), "docker is not available")
+class Migration(RealPostgres, unittest.TestCase):
 
     def migrate(self):
         mod = self.mod
@@ -169,6 +191,53 @@ class Migration(unittest.TestCase):
         self.psql("DROP SCHEMA suggest CASCADE;")
         self.migrate()
         self.assertEqual(["0"], self.psql("SELECT count(*) FROM suggest.lanes;"))
+
+
+@unittest.skipUnless(docker_works(), "docker is not available")
+class TheOneDestructiveStep(RealPostgres, unittest.TestCase):
+    """`suggest.fetches.upstream` is dropped, which nothing else in the schema
+    does. It counted calls that COULD have gone to YouTube -- 312 playlist adds
+    against 169 real fetches on the first live night -- so it is replaced rather
+    than kept beside its successor."""
+
+    def setUp(self):
+        self.psql("DROP SCHEMA IF EXISTS suggest CASCADE;")
+        self.psql(YESTERDAYS_FETCHES_SQL)
+
+    def columns(self):
+        return set(self.psql("SELECT column_name FROM information_schema.columns "
+                             "WHERE table_schema='suggest' AND table_name='fetches';"))
+
+    def test_the_old_column_is_gone_and_the_new_ones_are_there(self):
+        self.psql(self.mod.SCHEMA_SQL)
+        columns = self.columns()
+        self.assertNotIn("upstream", columns)
+        self.assertIn("external", columns)
+        self.assertIn("ms", columns)
+
+    def test_not_one_row_is_lost(self):
+        self.psql(self.mod.SCHEMA_SQL)
+        self.assertEqual(["4"], self.psql("SELECT count(*) FROM suggest.fetches;"))
+
+    def test_the_kinds_that_settle_it_are_backfilled(self):
+        self.psql(self.mod.SCHEMA_SQL)
+        self.assertEqual(["t"], self.psql(
+            "SELECT external FROM suggest.fetches WHERE kind='channel_latest';"))
+        self.assertEqual(["f"], self.psql(
+            "SELECT external FROM suggest.fetches WHERE kind='playlist_read';"))
+
+    def test_the_ones_that_cannot_be_judged_stay_unknown(self):
+        """Their evidence is a `videos` row, and Invidious deletes those after
+        six hours, so it is already gone. NULL matches neither side."""
+        self.psql(self.mod.SCHEMA_SQL)
+        self.assertEqual(["2"], self.psql(
+            "SELECT count(*) FROM suggest.fetches WHERE external IS NULL;"))
+
+    def test_running_it_twice_changes_nothing(self):
+        self.psql(self.mod.SCHEMA_SQL)
+        self.psql(self.mod.SCHEMA_SQL)
+        self.assertNotIn("upstream", self.columns())
+        self.assertEqual(["4"], self.psql("SELECT count(*) FROM suggest.fetches;"))
 
 
 if __name__ == "__main__":

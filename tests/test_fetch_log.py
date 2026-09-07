@@ -38,11 +38,11 @@ class WhatSortOfCallItWas(unittest.TestCase):
     def kind(self, method, path):
         return self.mod.kind_of_call(method, path)
 
-    def test_only_the_sorts_that_can_reach_youtube_are_marked_upstream(self):
+    def test_only_three_sorts_can_reach_youtube_at_all(self):
         """Adding a video reaches get_video too, so it can go out; a delete,
-        a read and a create never can."""
+        a read and a create never can. Whether one DID is decided per call."""
         self.assertEqual(("video", "channel_latest", "playlist_add"),
-                         self.mod.UPSTREAM_KINDS)
+                         self.mod.CAN_REACH_KINDS)
 
     def test_it_names_each_sort(self):
         self.assertEqual("video", self.kind("GET", "/api/v1/videos/" + VID))
@@ -64,7 +64,7 @@ class WhatSortOfCallItWas(unittest.TestCase):
         for method, path in (("GET", "/api/v1/auth/playlists"),
                              ("PATCH", "/api/v1/auth/playlists/IVPLx"),
                              ("GET", "/api/v1/stats")):
-            self.assertNotIn(self.kind(method, path), self.mod.UPSTREAM_KINDS)
+            self.assertNotIn(self.kind(method, path), self.mod.CAN_REACH_KINDS)
 
 
 class WhatTheCallWasAbout(unittest.TestCase):
@@ -142,7 +142,13 @@ class EveryCallIsLogged(unittest.TestCase):
         mod = self.call(JOB="run")
         mod.bot_api("GET", "/api/v1/videos/" + VID)
         self.assertEqual([(ME, "", "run", "video", VID, 200, 0, "")],
-                         [row[1:] for row in mod.FETCH_LOG])
+                         [row[1:9] for row in mod.FETCH_LOG])
+
+    def test_the_time_the_call_took_is_recorded(self):
+        """The other cache tell: 6ms answered from cache, 2270ms went out."""
+        mod = self.call(JOB="run")
+        mod.bot_api("GET", "/api/v1/videos/" + VID)
+        self.assertIsInstance(mod.FETCH_LOG[0][9], int)
 
     def test_it_is_dated_when_it_happened_and_not_when_it_is_written(self):
         """A views batch spans ten minutes and flushes on one instant."""
@@ -162,7 +168,7 @@ class EveryCallIsLogged(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError):
             mod.bot_api("GET", "/api/v1/videos/" + VID)
         self.assertEqual([(ME, "", "", "video", VID, 429, 0, "")],
-                         [row[1:] for row in mod.FETCH_LOG])
+                         [row[1:9] for row in mod.FETCH_LOG])
 
     def test_a_call_nothing_answered_is_logged_as_zero_and_still_raises(self):
         mod = self.call(raises=urllib.error.URLError("timed out"))
@@ -191,7 +197,7 @@ class EveryCallIsLogged(unittest.TestCase):
     def test_the_buffer_is_flushed_before_it_can_grow_unbounded(self):
         """A command with no lane loop would otherwise lose the lot to a kill."""
         mod = self.call(JOB="views")
-        mod.FETCH_LOG[:] = [(0.0, ME, "", "views", "video", VID, 200, 0, "")] * (
+        mod.FETCH_LOG[:] = [(0.0, ME, "", "views", "video", VID, 200, 0, "", 7)] * (
             mod.FETCH_LOG_BATCH - 1)
         mod.bot_api("GET", "/api/v1/videos/" + VID)
         self.assertEqual([], mod.FETCH_LOG)
@@ -251,21 +257,36 @@ class TheFlush(unittest.TestCase):
         self.mod.FETCH_LOG[:] = list(rows)
 
     def test_many_calls_cost_one_statement(self):
-        self.buffer((0.0, ME, "autos", "run", "video", VID, 200, 0, ""),
-                    (1.0, ME, "autos", "run", "video", "abcdefghijk", 429, 1, ""))
+        self.buffer((0.0, ME, "autos", "run", "video", VID, 200, 0, "", 2270),
+                    (1.0, ME, "autos", "run", "video", "abcdefghijk", 429, 1, "", 90))
         self.mod.flush_fetch_log()
         self.assertEqual(1, len(self.recorded.written))
 
-    def test_it_marks_only_the_upstream_sorts_as_upstream(self):
-        self.buffer((0.0, ME, "autos", "run", "video", VID, 200, 0, ""),
-                    (0.0, ME, "autos", "run", "playlist_write", VID, 200, 0, ""))
+    def test_it_leaves_the_verdict_to_the_database(self):
+        """Whether a call went out is evidence, not something Python can assert
+        from the sort of call it was. What the expression decides is in
+        test_external_verdict.py, against a real PostgreSQL -- grepping it here
+        would prove nothing, and the first version had a clause that could
+        never be reached."""
+        self.buffer((0.0, ME, "autos", "run", "video", VID, 200, 0, "", 2270))
         self.mod.flush_fetch_log()
         written = self.recorded.written[0]
-        self.assertIn("'video','%s',true" % VID, written)
-        self.assertIn("'playlist_write','%s',false" % VID, written)
+        self.assertIn("FROM videos v WHERE v.id = c.target", written)
+        self.assertIn("v.updated >= c.at", written)
+
+    def test_the_window_allows_only_rounding_either_side(self):
+        """A generous lower bound would reach back into the previous call about
+        the same video, which in a fill is a fraction of a second earlier."""
+        self.buffer((0.0, ME, "", "run", "video", VID, 200, 0, "", 2270))
+        self.mod.flush_fetch_log()
+        written = self.recorded.written[0]
+        skew = "%d * interval '1 millisecond'" % self.mod.CLOCK_SKEW_MS
+        self.assertIn("v.updated >= c.at - " + skew, written)
+        self.assertIn("(c.ms + %d)" % self.mod.CLOCK_SKEW_MS, written)
+        self.assertGreater(200, self.mod.CLOCK_SKEW_MS)
 
     def test_it_empties_the_buffer_so_nothing_is_written_twice(self):
-        self.buffer((0.0, ME, "", "run", "video", VID, 200, 0, ""))
+        self.buffer((0.0, ME, "", "run", "video", VID, 200, 0, "", 7))
         self.mod.flush_fetch_log()
         self.mod.flush_fetch_log()
         self.assertEqual(1, len(self.recorded.written))
@@ -278,11 +299,68 @@ class TheFlush(unittest.TestCase):
         said = []
         self.mod.log = said.append
         self.mod.execute = lambda sql: (_ for _ in ()).throw(RuntimeError("no table"))
-        self.buffer((0.0, ME, "", "run", "video", VID, 200, 0, ""))
+        self.buffer((0.0, ME, "", "run", "video", VID, 200, 0, "", 7))
         self.mod.flush_fetch_log()
         self.assertTrue(any("logged calls were not written" in line
                             for line in said))
         self.assertEqual([], self.mod.FETCH_LOG)
+
+
+def mod_classes():
+    return engine().FAILURE_CLASSES
+
+
+class TheKindTaxonomy(unittest.TestCase):
+    """Named once. A fourth kind must not leave a query on the old three."""
+
+    def test_no_query_spells_the_kinds_out_for_itself(self):
+        text = (pathlib.Path(__file__).resolve().parent.parent
+                / "iv-suggest").read_text()
+        spelled = "'video', 'channel_latest', 'playlist_add'"
+        body = text[text.index("def kinds_sql("):]
+        self.assertNotIn(spelled.replace(", ", ","), body)
+        self.assertNotIn(spelled, body)
+
+    def test_it_renders_as_a_sql_list(self):
+        mod = engine()
+        self.assertEqual("'video', 'playlist_add'",
+                         mod.kinds_sql(mod.GET_VIDEO_KINDS))
+
+    def test_the_two_sets_agree_on_what_reaches_get_video(self):
+        mod = engine()
+        self.assertEqual(set(mod.GET_VIDEO_KINDS),
+                         set(mod.CAN_REACH_KINDS) - {"channel_latest"})
+
+
+class TheSamplersGuard(unittest.TestCase):
+    """The table survives a tag change; a new column does not. Each sampler
+    guards on whichever of the two it actually reads."""
+
+    def guarded(self, call, answer="f"):
+        mod = engine()
+        mod._COLUMNS_SEEN.clear()
+        asked = []
+        mod.one = lambda sql: asked.append(sql) or answer
+        mod.query = lambda sql: self.fail("read the table before the guard")
+        return call(mod), asked
+
+    def test_the_kind_counts_wait_for_the_column(self):
+        """They read `external`, and reading it too early takes the whole
+        exporter down with a psql error, not just these gauges."""
+        samples, asked = self.guarded(
+            lambda mod: mod.fetch_samples("true", "kind", ("video",)))
+        self.assertEqual([('{kind="video"}', 0)], samples)
+        self.assertIn("information_schema.columns", asked[0])
+
+    def test_the_failure_counts_wait_only_for_the_table(self):
+        """They read `kind` and `status`, which the previous tag's table
+        already had -- so a column guard would publish a hard zero for every
+        failure class in the window between a tag pull and `init`."""
+        samples, asked = self.guarded(lambda mod: mod.failure_samples("true"))
+        self.assertEqual([('{class="%s"}' % name, 0)
+                          for name in mod_classes()], samples)
+        self.assertIn("to_regclass", asked[0])
+        self.assertNotIn("information_schema", asked[0])
 
 
 class WhatSortOfNonAnswer(unittest.TestCase):

@@ -167,11 +167,11 @@ whether anything the image is built from has moved:
 git log --oneline <deployed-tag>..main -- iv-suggest Dockerfile
 ```
 
-## Upgrading to a tag that adds a table
+## Upgrading to a tag that changes the schema
 
 **Move the tag, pull, then run `init` before any timer fires.** `init` is
-idempotent and its whole job is `CREATE TABLE IF NOT EXISTS`, so it costs
-nothing on a deploy that adds none:
+idempotent and almost all of it is `CREATE TABLE IF NOT EXISTS`, so it costs
+nothing on a deploy that changes nothing:
 
 ```sh
 # on 109, in /root/docker/youtube, after editing IV_SUGGEST_IMAGE_TAG
@@ -185,6 +185,54 @@ makes, so a missing `suggest.bot_touches` raises inside the fetch loop, where
 growing backoff, budget spent on nothing, and the lane giving up after five
 consecutive failures. The run looks like a bad night upstream rather than a
 half-finished deploy.
+
+⚠️ **`init` is not purely additive any more, and that breaks the rollback.**
+One migration drops a column: `suggest.fetches.upstream`, replaced by `external`
+because the old one counted calls that *could* have gone to YouTube rather than
+the ones that did.
+
+Rolling the tag back past that point leaves the older code reading a column that
+is gone. Its fetch-log flush fails, which is caught and only warned — but its
+`metrics` command also queries `WHERE upstream`, and that runs under
+`ON_ERROR_STOP=1`, so `cmd_metrics` dies and the wrapper publishes
+`iv_suggest_up 0` and nothing else. **Every gauge disappears, not just the new
+ones**, and `IvSuggestMetricsBroken` fires.
+
+So a rollback across this tag needs the column put back by hand first:
+
+```sh
+docker compose exec -T invidious-db psql -U kemal -d invidious -c "
+  ALTER TABLE suggest.fetches ADD COLUMN IF NOT EXISTS upstream boolean;
+  UPDATE suggest.fetches SET upstream =
+    (kind IN ('video','channel_latest','playlist_add')) WHERE upstream IS NULL;"
+```
+
+The backfill is not optional. Added bare, the column is all NULL, so the older
+code's `WHERE upstream` matches nothing and its gauges read a quiet 0 for a day
+instead of breaking loudly — which is the worse failure of the two.
+
+Nothing else in the schema is ever dropped. Check this section before assuming
+a rollback is clean.
+
+## When a metric is renamed
+
+The Prometheus rules live outside this repository, in
+`/opt/monitoring/prometheus/rules/` on the monitoring host. A rule reading a
+series that no longer exists **never fires and never complains** — it is not an
+error, just an expression that matches nothing.
+
+So a rename is two changes, and this one renamed two series:
+`iv_suggest_upstream_fetches_24h` → `iv_suggest_external_fetches_24h`, and
+`iv_suggest_upstream_failures_24h` → `iv_suggest_fetch_failures_24h`. Check
+before deploying:
+
+```sh
+ssh root@192.168.1.99 'pct exec 103 -- grep -rn "iv_suggest_upstream" \
+  /opt/monitoring/prometheus/rules/'
+```
+
+Empty output means no rule read the old names. On the reference instance it was
+empty, so nothing had to move.
 
 ## Rolling back
 
