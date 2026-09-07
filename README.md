@@ -234,16 +234,21 @@ night, 13 adds went out and 8 were answered from cache.
 Three kinds can reach YouTube at all — `video`, `channel_latest` and
 `playlist_add` — and `CAN_REACH_KINDS` exists only to zero-fill the metric
 labels. A channel listing is always external: Invidious does not cache them, and
-three consecutive calls each took over half a second. A call that **failed** is
-external too where the failure proves it went out — a 404 on a video is
-Invidious reporting that upstream has lost it, which it had to ask to find out.
-That case has to be named, because the error path deletes the cache row and its
-absence must not read as a cache hit. A `playlist_add` refused 401, 403 or 404
-never reached `get_video` at all, so only a 5xx counts for those; and **nothing
-with a status of 0 is ever external**, because nothing answered, so the call
-never even reached Invidious. That last one is what the 05:00 container recreate
-produces, and a `urlopen` timeout takes 30 seconds, which would otherwise clear
-the duration test on its own.
+three consecutive calls each took over half a second. The evidence is **ranked**, not simply added up. A cache row that moved inside
+the call's own window proves it went out. A row *older* than the call proves it
+did not, and that outranks the duration — the 6 ms figure was measured at idle,
+and a cache hit under load could cross the ceiling without going anywhere. The
+duration only speaks when no such row survives, which is what a second call
+about the same video creates: the row then holds the later move and the earlier
+real fetch has nothing left to point at.
+
+A call that **failed** counts as external only where the failure itself proves
+it: 404, 410 or a 5xx on a video, because Invidious had to ask upstream to
+answer that. A `playlist_add` refused 401, 403 or 404 never reached `get_video`
+at all, so only a 5xx counts there. A **429 is Invidious refusing us**, not
+YouTube refusing Invidious — and `Fetcher.video` retries three times, so
+counting one would log three calls that never happened. And a **status of 0 is
+never proof**: nothing answered, so nothing reached Invidious either.
 
 `ms` holds how long each call took, which is the other cache tell and is worth
 having on its own — it is where retry backoff and a slow night show up.

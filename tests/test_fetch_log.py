@@ -306,6 +306,29 @@ class TheFlush(unittest.TestCase):
         self.assertEqual([], self.mod.FETCH_LOG)
 
 
+class TheKindTaxonomy(unittest.TestCase):
+    """Named once. A fourth kind must not leave a query on the old three."""
+
+    def test_no_query_spells_the_kinds_out_for_itself(self):
+        text = (pathlib.Path(__file__).resolve().parent.parent
+                / "iv-suggest").read_text()
+        mod = engine()
+        spelled = "'video', 'channel_latest', 'playlist_add'"
+        body = text[text.index("def kinds_sql("):]
+        self.assertNotIn(spelled.replace(", ", ","), body)
+        self.assertNotIn(spelled, body)
+
+    def test_it_renders_as_a_sql_list(self):
+        mod = engine()
+        self.assertEqual("'video', 'playlist_add'",
+                         mod.kinds_sql(mod.GET_VIDEO_KINDS))
+
+    def test_the_two_sets_agree_on_what_reaches_get_video(self):
+        mod = engine()
+        self.assertEqual(set(mod.GET_VIDEO_KINDS),
+                         set(mod.CAN_REACH_KINDS) - {"channel_latest"})
+
+
 class TheSamplersGuard(unittest.TestCase):
     """The table survives a tag change; a new column does not."""
 

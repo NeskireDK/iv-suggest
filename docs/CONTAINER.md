@@ -216,8 +216,9 @@ series that no longer exists **never fires and never complains** — it is not a
 error, just an expression that matches nothing.
 
 So a rename is two changes, and this one renamed two series:
-`iv_suggest_upstream_fetches_24h` → `external_fetches_24h`, and
-`upstream_failures_24h` → `fetch_failures_24h`. Check before deploying:
+`iv_suggest_upstream_fetches_24h` → `iv_suggest_external_fetches_24h`, and
+`iv_suggest_upstream_failures_24h` → `iv_suggest_fetch_failures_24h`. Check
+before deploying:
 
 ```sh
 ssh root@192.168.1.99 'pct exec 103 -- grep -rn "iv_suggest_upstream" \

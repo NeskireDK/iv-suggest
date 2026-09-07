@@ -88,7 +88,19 @@ class AnyCall(Case, unittest.TestCase):
         self.assertEqual("t", self.verdict("video"))
 
     def test_a_video_upstream_has_lost_went_out(self):
-        self.assertEqual("t", self.verdict("video", status=404))
+        for status in (404, 410, 500, 503):
+            self.db.psql("DELETE FROM suggest.fetches;")
+            self.assertEqual("t", self.verdict("video", status=status),
+                             "status %d" % status)
+
+    def test_a_video_invidious_itself_refused_did_not(self):
+        """A 429 is Invidious refusing us, not YouTube refusing Invidious --
+        and Fetcher.video retries three times, so counting one would log three
+        calls that never happened."""
+        for status in (401, 403, 429):
+            self.db.psql("DELETE FROM suggest.fetches;")
+            self.assertEqual("f", self.verdict("video", status=status, ms=12),
+                             "status %d" % status)
 
     def test_a_200_carrying_an_error_went_out(self):
         """Invidious asked, could not parse the answer, and deleted the row."""
@@ -112,6 +124,20 @@ class AnyCall(Case, unittest.TestCase):
         self.assertEqual("f", self.verdict(
             "channel_latest", target="UCabc", status=0, ms=30000,
             error="ConnectionRefusedError"))
+
+    def test_a_slow_call_off_an_untouched_row_was_still_the_cache(self):
+        """The 6ms measurement was taken at idle. A row older than the call is
+        direct proof, and it has to outrank the duration."""
+        self.cache_row_for(VID, moved=False)
+        self.assertEqual("f", self.verdict("video", ms=400))
+
+    def test_a_slow_call_whose_row_was_moved_by_a_later_one_still_went_out(self):
+        """The row holds one value per video, so a second call about the same
+        video in one batch leaves the earlier real fetch nothing to point at.
+        The duration is what still speaks for it."""
+        self.db.psql("INSERT INTO videos(id, info, updated) "
+                     "VALUES ('%s','{}', now() + interval '1 minute');" % VID)
+        self.assertEqual("t", self.verdict("video", ms=2270))
 
     def test_a_real_fetch_a_moment_earlier_does_not_lend_its_evidence(self):
         """In a fill the metadata fetch and the playlist add of one video are a
