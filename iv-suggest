@@ -683,9 +683,16 @@ CACHE_ANSWER_CEILING_MS = 200
 # nothing answered, so nothing reached Invidious either.
 FAILED_OUTBOUND_SQL = """(c.status = 200 AND c.error <> '')
     OR (c.kind = 'video' AND (c.status IN (404, 410) OR c.status >= 500))
-    OR (c.kind = 'playlist_add' AND c.status >= 500)"""
+    OR (c.kind <> 'video' AND c.status >= 500)"""
 
-# Three sorts of evidence, ranked rather than simply OR'd.
+# A channel listing is never cached, so a clean answer always went out -- but
+# a refusal has to be read the same way as anywhere else, or a 429'd listing
+# retried three times logs three calls that never happened.
+#
+# Three sorts of evidence, ranked rather than simply OR'd. The duration is
+# consulted only for a call that came back CLEAN: a refusal the failure rules
+# deliberately exclude must not walk back in through it just because the call
+# was slow, and a refusal often is.
 #
 # A cache row that moved inside the call's own window is proof it went out. A
 # row that is OLDER than the call is proof it did not, and that has to outrank
@@ -695,14 +702,15 @@ FAILED_OUTBOUND_SQL = """(c.status = 200 AND c.error <> '')
 # second call about the same video creates: the row then holds the later move
 # and the earlier real fetch has nothing left to point at.
 EXTERNAL_SQL = """CASE
-  WHEN c.kind = 'channel_latest' THEN c.status <> 0
+  WHEN c.kind = 'channel_latest' THEN
+    (c.status = 200 AND c.error = '') OR c.status >= 500
   WHEN c.kind NOT IN (%s) THEN false
   ELSE %s
     OR EXISTS (
       SELECT 1 FROM videos v WHERE v.id = c.target
       AND v.updated >= c.at - %d * interval '1 millisecond'
       AND v.updated <= c.at + (c.ms + %d) * interval '1 millisecond')
-    OR (c.status <> 0 AND c.ms > %d AND NOT EXISTS (
+    OR (c.status = 200 AND c.error = '' AND c.ms > %d AND NOT EXISTS (
       SELECT 1 FROM videos v WHERE v.id = c.target
       AND v.updated < c.at - %d * interval '1 millisecond'))
   END""" % (kinds_sql(GET_VIDEO_KINDS), FAILED_OUTBOUND_SQL, CLOCK_SKEW_MS,
@@ -3360,10 +3368,14 @@ def fetch_samples(where, column, wanted):
             for value in wanted]
 
 
+# Guarded on the table and not the column, unlike its neighbour: it reads only
+# `kind` and `status`, both of which the previous tag's table already had. A
+# column guard here would publish a hard zero for every failure class during
+# the window between a tag pull and `init`.
 def failure_samples(window):
     """Failed upstream calls per class, read in Python so the buckets live once."""
     counted = dict((name, 0) for name in FAILURE_CLASSES)
-    if column_exists("fetches", "external"):
+    if table_exists("suggest.fetches"):
         for status, error, rows in query(
                 "SELECT status, coalesce(error,''), count(*) FROM "
                 "suggest.fetches WHERE kind IN (%s) AND (status <> 200 "

@@ -306,13 +306,16 @@ class TheFlush(unittest.TestCase):
         self.assertEqual([], self.mod.FETCH_LOG)
 
 
+def mod_classes():
+    return engine().FAILURE_CLASSES
+
+
 class TheKindTaxonomy(unittest.TestCase):
     """Named once. A fourth kind must not leave a query on the old three."""
 
     def test_no_query_spells_the_kinds_out_for_itself(self):
         text = (pathlib.Path(__file__).resolve().parent.parent
                 / "iv-suggest").read_text()
-        mod = engine()
         spelled = "'video', 'channel_latest', 'playlist_add'"
         body = text[text.index("def kinds_sql("):]
         self.assertNotIn(spelled.replace(", ", ","), body)
@@ -330,23 +333,34 @@ class TheKindTaxonomy(unittest.TestCase):
 
 
 class TheSamplersGuard(unittest.TestCase):
-    """The table survives a tag change; a new column does not."""
+    """The table survives a tag change; a new column does not. Each sampler
+    guards on whichever of the two it actually reads."""
 
-    def test_they_wait_for_the_column_and_not_just_the_table(self):
-        """Reading it too early takes the whole exporter down with a psql
-        error, not just these gauges."""
+    def guarded(self, call, answer="f"):
         mod = engine()
         mod._COLUMNS_SEEN.clear()
         asked = []
-        mod.one = lambda sql: asked.append(sql) or "f"
-        mod.query = lambda sql: self.fail("read the table before the column")
-        self.assertEqual([('{kind="video"}', 0)],
-                         mod.fetch_samples("true", "kind", ("video",)))
+        mod.one = lambda sql: asked.append(sql) or answer
+        mod.query = lambda sql: self.fail("read the table before the guard")
+        return call(mod), asked
+
+    def test_the_kind_counts_wait_for_the_column(self):
+        """They read `external`, and reading it too early takes the whole
+        exporter down with a psql error, not just these gauges."""
+        samples, asked = self.guarded(
+            lambda mod: mod.fetch_samples("true", "kind", ("video",)))
+        self.assertEqual([('{kind="video"}', 0)], samples)
+        self.assertIn("information_schema.columns", asked[0])
+
+    def test_the_failure_counts_wait_only_for_the_table(self):
+        """They read `kind` and `status`, which the previous tag's table
+        already had -- so a column guard would publish a hard zero for every
+        failure class in the window between a tag pull and `init`."""
+        samples, asked = self.guarded(lambda mod: mod.failure_samples("true"))
         self.assertEqual([('{class="%s"}' % name, 0)
-                          for name in mod.FAILURE_CLASSES],
-                         mod.failure_samples("true"))
-        self.assertTrue(all("information_schema.columns" in sql
-                            for sql in asked))
+                          for name in mod_classes()], samples)
+        self.assertIn("to_regclass", asked[0])
+        self.assertNotIn("information_schema", asked[0])
 
 
 class WhatSortOfNonAnswer(unittest.TestCase):

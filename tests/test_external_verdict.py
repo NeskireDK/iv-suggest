@@ -69,8 +69,22 @@ class Case:
 
 class AnyCall(Case, unittest.TestCase):
 
-    def test_a_channel_listing_always_went_out(self):
+    def test_a_channel_listing_that_answered_went_out(self):
+        """Invidious does not cache them, so a clean answer always did."""
         self.assertEqual("t", self.verdict("channel_latest", target="UCabc"))
+
+    def test_a_channel_listing_invidious_refused_did_not(self):
+        """Retried three times, so counting one logs three that never
+        happened -- the same trap as the video path."""
+        for status in (403, 429):
+            self.db.psql("DELETE FROM suggest.fetches;")
+            self.assertEqual("f", self.verdict(
+                "channel_latest", target="UCabc", status=status, ms=400),
+                "status %d" % status)
+
+    def test_a_channel_listing_that_broke_upstream_did(self):
+        self.assertEqual("t", self.verdict(
+            "channel_latest", target="UCabc", status=503))
 
     def test_a_playlist_read_never_did(self):
         self.assertEqual("f", self.verdict("playlist_read", target="IVPLx"))
@@ -130,6 +144,15 @@ class AnyCall(Case, unittest.TestCase):
         direct proof, and it has to outrank the duration."""
         self.cache_row_for(VID, moved=False)
         self.assertEqual("f", self.verdict("video", ms=400))
+
+    def test_a_slow_refusal_does_not_walk_back_in_through_the_duration(self):
+        """A refusal the failure rules exclude must not count just because it
+        was slow, and a refusal often is."""
+        for kind, status in (("video", 429), ("playlist_add", 401),
+                             ("playlist_add", 404)):
+            self.db.psql("DELETE FROM suggest.fetches; DELETE FROM videos;")
+            self.assertEqual("f", self.verdict(kind, status=status, ms=400),
+                             "%s %d" % (kind, status))
 
     def test_a_slow_call_whose_row_was_moved_by_a_later_one_still_went_out(self):
         """The row holds one value per video, so a second call about the same

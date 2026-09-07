@@ -201,9 +201,15 @@ ones**, and `IvSuggestMetricsBroken` fires.
 So a rollback across this tag needs the column put back by hand first:
 
 ```sh
-docker compose exec -T invidious-db psql -U kemal -d invidious \
-  -c "ALTER TABLE suggest.fetches ADD COLUMN IF NOT EXISTS upstream boolean;"
+docker compose exec -T invidious-db psql -U kemal -d invidious -c "
+  ALTER TABLE suggest.fetches ADD COLUMN IF NOT EXISTS upstream boolean;
+  UPDATE suggest.fetches SET upstream =
+    (kind IN ('video','channel_latest','playlist_add')) WHERE upstream IS NULL;"
 ```
+
+The backfill is not optional. Added bare, the column is all NULL, so the older
+code's `WHERE upstream` matches nothing and its gauges read a quiet 0 for a day
+instead of breaking loudly — which is the worse failure of the two.
 
 Nothing else in the schema is ever dropped. Check this section before assuming
 a rollback is clean.
