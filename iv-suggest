@@ -277,6 +277,14 @@ CREATE INDEX IF NOT EXISTS fetches_at_idx ON suggest.fetches (at);
 -- time from evidence rather than from the sort of call it was.
 ALTER TABLE suggest.fetches ADD COLUMN IF NOT EXISTS ms int;
 ALTER TABLE suggest.fetches ADD COLUMN IF NOT EXISTS external boolean;
+-- Rows written before this migration can only be judged where the kind settles
+-- it: a channel listing is never cached, and nothing outside those three kinds
+-- can leave the machine at all. A `video` or `playlist_add` from before stays
+-- NULL, because the evidence for it -- a `videos` row -- is deleted after six
+-- hours and is already gone. NULL matches neither `external` nor
+-- `NOT external`, which is the honest answer to "we cannot tell".
+UPDATE suggest.fetches SET external = (kind = 'channel_latest')
+ WHERE external IS NULL AND kind NOT IN ('video', 'playlist_add');
 ALTER TABLE suggest.fetches DROP COLUMN IF EXISTS upstream;
 """
 
@@ -632,9 +640,17 @@ def error_in_the_answer(answer):
 CAN_REACH_KINDS = ("video", "channel_latest", "playlist_add")
 
 # Postgres and this container share a clock, so the slack is for rounding
-# rather than for drift.
+# rather than for drift -- but it is applied to BOTH ends of the window, since
+# skew the other way would turn a real fetch into a recorded cache hit.
 EXTERNAL_CLOCK_SLACK_MS = 2000
 
+# A status of 0 means nothing answered at all, so that call never reached
+# Invidious, let alone YouTube -- the 05:00 container recreate is when it
+# happens. Every other status IS from Invidious, because IV_SUGGEST_API points
+# at the container directly and there is no proxy in front to invent one: a 404
+# is Invidious telling us upstream has lost the video, which it had to ask to
+# find out.
+#
 # Measured on the box, 2026-09-07. A video call Invidious answered from its own
 # cache took 6ms and left `videos.updated` untouched; a real fetch took 2270ms
 # and rewrote it. So a moved `updated` inside the call's own window is proof the
@@ -646,11 +662,11 @@ EXTERNAL_CLOCK_SLACK_MS = 2000
 EXTERNAL_SQL = """CASE
   WHEN c.kind = 'channel_latest' THEN true
   WHEN c.kind IN ('video', 'playlist_add') THEN
-    c.status <> 200 OR c.error <> '' OR EXISTS (
+    c.status NOT IN (200, 0) OR c.error <> '' OR EXISTS (
       SELECT 1 FROM videos v WHERE v.id = c.target
-      AND v.updated >= c.at
+      AND v.updated >= c.at - %d * interval '1 millisecond'
       AND v.updated <= c.at + (c.ms + %d) * interval '1 millisecond')
-  ELSE false END""" % EXTERNAL_CLOCK_SLACK_MS
+  ELSE false END""" % (EXTERNAL_CLOCK_SLACK_MS, EXTERNAL_CLOCK_SLACK_MS)
 
 # A 429 means slow down, a 5xx means somebody upstream is having a bad minute,
 # and nothing at all means neither -- three different answers that used to end
@@ -3296,7 +3312,7 @@ def plays_samples(where):
 def fetch_samples(where, column, wanted):
     """One zero filled sample per `wanted` value, all zero before `init` ran."""
     counted = dict((value, 0) for value in wanted)
-    if table_exists("suggest.fetches"):
+    if column_exists("fetches", "external"):
         counted.update((value, int(rows)) for value, rows in query(
             "SELECT %s, count(*) FROM suggest.fetches WHERE %s GROUP BY 1;"
             % (column, where)))
@@ -3307,7 +3323,7 @@ def fetch_samples(where, column, wanted):
 def failure_samples(window):
     """Failed upstream calls per class, read in Python so the buckets live once."""
     counted = dict((name, 0) for name in FAILURE_CLASSES)
-    if table_exists("suggest.fetches"):
+    if column_exists("fetches", "external"):
         for status, error, rows in query(
                 "SELECT status, coalesce(error,''), count(*) FROM "
                 "suggest.fetches WHERE external AND (status <> 200 OR "

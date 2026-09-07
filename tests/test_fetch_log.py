@@ -278,13 +278,29 @@ class TheFlush(unittest.TestCase):
         self.assertIn("WHEN c.kind = 'channel_latest' THEN true", written)
         self.assertIn("ELSE false END", written)
 
-    def test_a_call_that_failed_counts_as_having_gone_out(self):
+    def test_a_call_invidious_refused_counts_as_having_gone_out(self):
         """The error path deletes the cache row, so its absence must not read
         as a cache hit."""
         self.buffer((0.0, ME, "", "run", "video", VID, 500, 0, "", 300))
         self.mod.flush_fetch_log()
-        self.assertIn("c.status <> 200 OR c.error <> ''",
+        self.assertIn("c.status NOT IN (200, 0) OR c.error <> ''",
                       self.recorded.written[0])
+
+    def test_a_call_nothing_answered_is_not_counted_as_having_gone_out(self):
+        """Status 0 never reached Invidious, let alone YouTube -- the 05:00
+        container recreate is when that happens."""
+        self.buffer((0.0, ME, "", "run", "video", VID, 0, 0, "boom", 30))
+        self.mod.flush_fetch_log()
+        self.assertIn("NOT IN (200, 0)", self.recorded.written[0])
+
+    def test_the_clock_slack_is_applied_to_both_ends_of_the_window(self):
+        """Skew the other way would turn a real fetch into a cache hit."""
+        self.buffer((0.0, ME, "", "run", "video", VID, 200, 0, "", 2270))
+        self.mod.flush_fetch_log()
+        written = self.recorded.written[0]
+        slack = "%d * interval '1 millisecond'" % self.mod.EXTERNAL_CLOCK_SLACK_MS
+        self.assertIn("v.updated >= c.at - " + slack, written)
+        self.assertIn("(c.ms + %d)" % self.mod.EXTERNAL_CLOCK_SLACK_MS, written)
 
     def test_it_empties_the_buffer_so_nothing_is_written_twice(self):
         self.buffer((0.0, ME, "", "run", "video", VID, 200, 0, "", 7))
@@ -305,6 +321,26 @@ class TheFlush(unittest.TestCase):
         self.assertTrue(any("logged calls were not written" in line
                             for line in said))
         self.assertEqual([], self.mod.FETCH_LOG)
+
+
+class TheSamplersGuard(unittest.TestCase):
+    """The table survives a tag change; a new column does not."""
+
+    def test_they_wait_for_the_column_and_not_just_the_table(self):
+        """Reading it too early takes the whole exporter down with a psql
+        error, not just these gauges."""
+        mod = engine()
+        mod._COLUMNS_SEEN.clear()
+        asked = []
+        mod.one = lambda sql: asked.append(sql) or "f"
+        mod.query = lambda sql: self.fail("read the table before the column")
+        self.assertEqual([('{kind="video"}', 0)],
+                         mod.fetch_samples("true", "kind", ("video",)))
+        self.assertEqual([('{class="%s"}' % name, 0)
+                          for name in mod.FAILURE_CLASSES],
+                         mod.failure_samples("true"))
+        self.assertTrue(all("information_schema.columns" in sql
+                            for sql in asked))
 
 
 class WhatSortOfNonAnswer(unittest.TestCase):

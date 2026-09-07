@@ -167,11 +167,11 @@ whether anything the image is built from has moved:
 git log --oneline <deployed-tag>..main -- iv-suggest Dockerfile
 ```
 
-## Upgrading to a tag that adds a table
+## Upgrading to a tag that changes the schema
 
 **Move the tag, pull, then run `init` before any timer fires.** `init` is
-idempotent and its whole job is `CREATE TABLE IF NOT EXISTS`, so it costs
-nothing on a deploy that adds none:
+idempotent and almost all of it is `CREATE TABLE IF NOT EXISTS`, so it costs
+nothing on a deploy that changes nothing:
 
 ```sh
 # on 109, in /root/docker/youtube, after editing IV_SUGGEST_IMAGE_TAG
@@ -185,6 +185,15 @@ makes, so a missing `suggest.bot_touches` raises inside the fetch loop, where
 growing backoff, budget spent on nothing, and the lane giving up after five
 consecutive failures. The run looks like a bad night upstream rather than a
 half-finished deploy.
+
+⚠️ **`init` is not purely additive any more.** One migration drops a column:
+`suggest.fetches.upstream`, replaced by `external` because the old one counted
+calls that *could* have gone to YouTube rather than the ones that did. That
+makes the tag-change rollback below **partial** for one thing only — the older
+code writes `upstream`, the column is gone, and its fetch-log flush fails. That
+failure is caught and warned, not fatal, so a rolled-back run still fills its
+lanes; it just records no calls. Nothing else in the schema is ever dropped, so
+check this section before assuming a rollback is clean.
 
 ## Rolling back
 
