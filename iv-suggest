@@ -644,12 +644,13 @@ CAN_REACH_KINDS = ("video", "channel_latest", "playlist_add")
 # skew the other way would turn a real fetch into a recorded cache hit.
 EXTERNAL_CLOCK_SLACK_MS = 2000
 
-# A status of 0 means nothing answered at all, so that call never reached
-# Invidious, let alone YouTube -- the 05:00 container recreate is when it
-# happens. Every other status IS from Invidious, because IV_SUGGEST_API points
-# at the container directly and there is no proxy in front to invent one: a 404
-# is Invidious telling us upstream has lost the video, which it had to ask to
-# find out.
+# No cache answer has ever come close to this, and no real fetch has come near
+# it from the other side: measured 6, 6, 7 and 7ms for calls Invidious served
+# from its own cache against 530-680ms for a channel listing and 1648-2270ms
+# for a video it had to go and get. It is the second, independent tell, and it
+# is what keeps the verdict right when the cache row's evidence is unavailable
+# -- two calls about one video in a single batch leave only the later one's.
+CACHE_ANSWER_CEILING_MS = 200
 #
 # Measured on the box, 2026-09-07. A video call Invidious answered from its own
 # cache took 6ms and left `videos.updated` untouched; a real fetch took 2270ms
@@ -659,14 +660,29 @@ EXTERNAL_CLOCK_SLACK_MS = 2000
 # three consecutive calls each took over half a second and all went out. A call
 # that failed also went out, and that case has to be named because the error
 # path DELETES the cache row, so its absence must not read as a cache hit.
+# Three sorts of evidence, and which of them counts depends on the call.
+#
+# A refusal is only proof for a `video`: Invidious answers 404 or 410 there
+# after asking upstream, so it went out. A `playlist_add` refused 401, 403 or
+# 404 never reached `get_video` at all -- that is an expired session or a
+# missing playlist -- so only a 5xx counts for those. A status of 0 is never
+# proof either way: nothing answered, so the call never even reached Invidious,
+# which is what the 05:00 container recreate produces. It carries an error
+# string like any other failure, which is why the error alone cannot be the
+# test.
 EXTERNAL_SQL = """CASE
   WHEN c.kind = 'channel_latest' THEN true
-  WHEN c.kind IN ('video', 'playlist_add') THEN
-    c.status NOT IN (200, 0) OR c.error <> '' OR EXISTS (
+  WHEN c.kind NOT IN ('video', 'playlist_add') THEN false
+  ELSE c.ms > %d
+    OR (c.status = 200 AND c.error <> '')
+    OR (c.kind = 'video' AND c.status >= 400)
+    OR (c.kind = 'playlist_add' AND c.status >= 500)
+    OR EXISTS (
       SELECT 1 FROM videos v WHERE v.id = c.target
       AND v.updated >= c.at - %d * interval '1 millisecond'
       AND v.updated <= c.at + (c.ms + %d) * interval '1 millisecond')
-  ELSE false END""" % (EXTERNAL_CLOCK_SLACK_MS, EXTERNAL_CLOCK_SLACK_MS)
+  END""" % (CACHE_ANSWER_CEILING_MS, EXTERNAL_CLOCK_SLACK_MS,
+            EXTERNAL_CLOCK_SLACK_MS)
 
 # A 429 means slow down, a 5xx means somebody upstream is having a bad minute,
 # and nothing at all means neither -- three different answers that used to end

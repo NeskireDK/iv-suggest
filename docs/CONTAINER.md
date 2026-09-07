@@ -186,14 +186,46 @@ growing backoff, budget spent on nothing, and the lane giving up after five
 consecutive failures. The run looks like a bad night upstream rather than a
 half-finished deploy.
 
-⚠️ **`init` is not purely additive any more.** One migration drops a column:
-`suggest.fetches.upstream`, replaced by `external` because the old one counted
-calls that *could* have gone to YouTube rather than the ones that did. That
-makes the tag-change rollback below **partial** for one thing only — the older
-code writes `upstream`, the column is gone, and its fetch-log flush fails. That
-failure is caught and warned, not fatal, so a rolled-back run still fills its
-lanes; it just records no calls. Nothing else in the schema is ever dropped, so
-check this section before assuming a rollback is clean.
+⚠️ **`init` is not purely additive any more, and that breaks the rollback.**
+One migration drops a column: `suggest.fetches.upstream`, replaced by `external`
+because the old one counted calls that *could* have gone to YouTube rather than
+the ones that did.
+
+Rolling the tag back past that point leaves the older code reading a column that
+is gone. Its fetch-log flush fails, which is caught and only warned — but its
+`metrics` command also queries `WHERE upstream`, and that runs under
+`ON_ERROR_STOP=1`, so `cmd_metrics` dies and the wrapper publishes
+`iv_suggest_up 0` and nothing else. **Every gauge disappears, not just the new
+ones**, and `IvSuggestMetricsBroken` fires.
+
+So a rollback across this tag needs the column put back by hand first:
+
+```sh
+docker compose exec -T invidious-db psql -U kemal -d invidious \
+  -c "ALTER TABLE suggest.fetches ADD COLUMN IF NOT EXISTS upstream boolean;"
+```
+
+Nothing else in the schema is ever dropped. Check this section before assuming
+a rollback is clean.
+
+## When a metric is renamed
+
+The Prometheus rules live outside this repository, in
+`/opt/monitoring/prometheus/rules/` on the monitoring host. A rule reading a
+series that no longer exists **never fires and never complains** — it is not an
+error, just an expression that matches nothing.
+
+So a rename is two changes, and this one renamed two series:
+`iv_suggest_upstream_fetches_24h` → `external_fetches_24h`, and
+`upstream_failures_24h` → `external_failures_24h`. Check before deploying:
+
+```sh
+ssh root@192.168.1.99 'pct exec 103 -- grep -rn "iv_suggest_upstream" \
+  /opt/monitoring/prometheus/rules/'
+```
+
+Empty output means no rule read the old names. On the reference instance it was
+empty, so nothing had to move.
 
 ## Rolling back
 

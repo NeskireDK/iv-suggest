@@ -263,35 +263,16 @@ class TheFlush(unittest.TestCase):
         self.assertEqual(1, len(self.recorded.written))
 
     def test_it_leaves_the_verdict_to_the_database(self):
-        """Whether a call went out is evidence, not something Python can
-        assert from the sort of call it was."""
+        """Whether a call went out is evidence, not something Python can assert
+        from the sort of call it was. What the expression decides is in
+        test_external_verdict.py, against a real PostgreSQL -- grepping it here
+        would prove nothing, and the first version had a clause that could
+        never be reached."""
         self.buffer((0.0, ME, "autos", "run", "video", VID, 200, 0, "", 2270))
         self.mod.flush_fetch_log()
         written = self.recorded.written[0]
         self.assertIn("FROM videos v WHERE v.id = c.target", written)
         self.assertIn("v.updated >= c.at", written)
-
-    def test_a_channel_listing_is_always_out_and_a_playlist_read_never(self):
-        self.buffer((0.0, ME, "", "run", "channel_latest", "UCx", 200, 0, "", 600))
-        self.mod.flush_fetch_log()
-        written = self.recorded.written[0]
-        self.assertIn("WHEN c.kind = 'channel_latest' THEN true", written)
-        self.assertIn("ELSE false END", written)
-
-    def test_a_call_invidious_refused_counts_as_having_gone_out(self):
-        """The error path deletes the cache row, so its absence must not read
-        as a cache hit."""
-        self.buffer((0.0, ME, "", "run", "video", VID, 500, 0, "", 300))
-        self.mod.flush_fetch_log()
-        self.assertIn("c.status NOT IN (200, 0) OR c.error <> ''",
-                      self.recorded.written[0])
-
-    def test_a_call_nothing_answered_is_not_counted_as_having_gone_out(self):
-        """Status 0 never reached Invidious, let alone YouTube -- the 05:00
-        container recreate is when that happens."""
-        self.buffer((0.0, ME, "", "run", "video", VID, 0, 0, "boom", 30))
-        self.mod.flush_fetch_log()
-        self.assertIn("NOT IN (200, 0)", self.recorded.written[0])
 
     def test_the_clock_slack_is_applied_to_both_ends_of_the_window(self):
         """Skew the other way would turn a real fetch into a cache hit."""
