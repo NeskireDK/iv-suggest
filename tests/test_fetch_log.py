@@ -38,11 +38,11 @@ class WhatSortOfCallItWas(unittest.TestCase):
     def kind(self, method, path):
         return self.mod.kind_of_call(method, path)
 
-    def test_only_the_sorts_that_can_reach_youtube_are_marked_upstream(self):
+    def test_only_three_sorts_can_reach_youtube_at_all(self):
         """Adding a video reaches get_video too, so it can go out; a delete,
-        a read and a create never can."""
+        a read and a create never can. Whether one DID is decided per call."""
         self.assertEqual(("video", "channel_latest", "playlist_add"),
-                         self.mod.UPSTREAM_KINDS)
+                         self.mod.CAN_REACH_KINDS)
 
     def test_it_names_each_sort(self):
         self.assertEqual("video", self.kind("GET", "/api/v1/videos/" + VID))
@@ -64,7 +64,7 @@ class WhatSortOfCallItWas(unittest.TestCase):
         for method, path in (("GET", "/api/v1/auth/playlists"),
                              ("PATCH", "/api/v1/auth/playlists/IVPLx"),
                              ("GET", "/api/v1/stats")):
-            self.assertNotIn(self.kind(method, path), self.mod.UPSTREAM_KINDS)
+            self.assertNotIn(self.kind(method, path), self.mod.CAN_REACH_KINDS)
 
 
 class WhatTheCallWasAbout(unittest.TestCase):
@@ -142,7 +142,13 @@ class EveryCallIsLogged(unittest.TestCase):
         mod = self.call(JOB="run")
         mod.bot_api("GET", "/api/v1/videos/" + VID)
         self.assertEqual([(ME, "", "run", "video", VID, 200, 0, "")],
-                         [row[1:] for row in mod.FETCH_LOG])
+                         [row[1:9] for row in mod.FETCH_LOG])
+
+    def test_the_time_the_call_took_is_recorded(self):
+        """The other cache tell: 6ms answered from cache, 2270ms went out."""
+        mod = self.call(JOB="run")
+        mod.bot_api("GET", "/api/v1/videos/" + VID)
+        self.assertIsInstance(mod.FETCH_LOG[0][9], int)
 
     def test_it_is_dated_when_it_happened_and_not_when_it_is_written(self):
         """A views batch spans ten minutes and flushes on one instant."""
@@ -162,7 +168,7 @@ class EveryCallIsLogged(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError):
             mod.bot_api("GET", "/api/v1/videos/" + VID)
         self.assertEqual([(ME, "", "", "video", VID, 429, 0, "")],
-                         [row[1:] for row in mod.FETCH_LOG])
+                         [row[1:9] for row in mod.FETCH_LOG])
 
     def test_a_call_nothing_answered_is_logged_as_zero_and_still_raises(self):
         mod = self.call(raises=urllib.error.URLError("timed out"))
@@ -191,7 +197,7 @@ class EveryCallIsLogged(unittest.TestCase):
     def test_the_buffer_is_flushed_before_it_can_grow_unbounded(self):
         """A command with no lane loop would otherwise lose the lot to a kill."""
         mod = self.call(JOB="views")
-        mod.FETCH_LOG[:] = [(0.0, ME, "", "views", "video", VID, 200, 0, "")] * (
+        mod.FETCH_LOG[:] = [(0.0, ME, "", "views", "video", VID, 200, 0, "", 7)] * (
             mod.FETCH_LOG_BATCH - 1)
         mod.bot_api("GET", "/api/v1/videos/" + VID)
         self.assertEqual([], mod.FETCH_LOG)
@@ -251,21 +257,37 @@ class TheFlush(unittest.TestCase):
         self.mod.FETCH_LOG[:] = list(rows)
 
     def test_many_calls_cost_one_statement(self):
-        self.buffer((0.0, ME, "autos", "run", "video", VID, 200, 0, ""),
-                    (1.0, ME, "autos", "run", "video", "abcdefghijk", 429, 1, ""))
+        self.buffer((0.0, ME, "autos", "run", "video", VID, 200, 0, "", 2270),
+                    (1.0, ME, "autos", "run", "video", "abcdefghijk", 429, 1, "", 90))
         self.mod.flush_fetch_log()
         self.assertEqual(1, len(self.recorded.written))
 
-    def test_it_marks_only_the_upstream_sorts_as_upstream(self):
-        self.buffer((0.0, ME, "autos", "run", "video", VID, 200, 0, ""),
-                    (0.0, ME, "autos", "run", "playlist_write", VID, 200, 0, ""))
+    def test_it_leaves_the_verdict_to_the_database(self):
+        """Whether a call went out is evidence, not something Python can
+        assert from the sort of call it was."""
+        self.buffer((0.0, ME, "autos", "run", "video", VID, 200, 0, "", 2270))
         self.mod.flush_fetch_log()
         written = self.recorded.written[0]
-        self.assertIn("'video','%s',true" % VID, written)
-        self.assertIn("'playlist_write','%s',false" % VID, written)
+        self.assertIn("FROM videos v WHERE v.id = c.target", written)
+        self.assertIn("v.updated >= c.at", written)
+
+    def test_a_channel_listing_is_always_out_and_a_playlist_read_never(self):
+        self.buffer((0.0, ME, "", "run", "channel_latest", "UCx", 200, 0, "", 600))
+        self.mod.flush_fetch_log()
+        written = self.recorded.written[0]
+        self.assertIn("WHEN c.kind = 'channel_latest' THEN true", written)
+        self.assertIn("ELSE false END", written)
+
+    def test_a_call_that_failed_counts_as_having_gone_out(self):
+        """The error path deletes the cache row, so its absence must not read
+        as a cache hit."""
+        self.buffer((0.0, ME, "", "run", "video", VID, 500, 0, "", 300))
+        self.mod.flush_fetch_log()
+        self.assertIn("c.status <> 200 OR c.error <> ''",
+                      self.recorded.written[0])
 
     def test_it_empties_the_buffer_so_nothing_is_written_twice(self):
-        self.buffer((0.0, ME, "", "run", "video", VID, 200, 0, ""))
+        self.buffer((0.0, ME, "", "run", "video", VID, 200, 0, "", 7))
         self.mod.flush_fetch_log()
         self.mod.flush_fetch_log()
         self.assertEqual(1, len(self.recorded.written))
@@ -278,7 +300,7 @@ class TheFlush(unittest.TestCase):
         said = []
         self.mod.log = said.append
         self.mod.execute = lambda sql: (_ for _ in ()).throw(RuntimeError("no table"))
-        self.buffer((0.0, ME, "", "run", "video", VID, 200, 0, ""))
+        self.buffer((0.0, ME, "", "run", "video", VID, 200, 0, "", 7))
         self.mod.flush_fetch_log()
         self.assertTrue(any("logged calls were not written" in line
                             for line in said))
