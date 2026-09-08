@@ -264,10 +264,12 @@ WHERE cache_row_moved
    OR (kind = 'channel_latest' AND status = 200 AND coalesce(error,'') = '')
 GROUP BY 1, 2, 3 ORDER BY 1 DESC;
 
--- what each lane of the nightly fill cost, and what the cache saved it
+-- what each lane of the nightly fill cost, and what the cache saved it.
+-- the p95 is over the fetches only, or it reports how warm the cache was
 SELECT lane, count(*) FILTER (WHERE cache_row_moved) AS fetched,
        count(*) FILTER (WHERE cache_row_moved IS FALSE) AS from_cache,
-       percentile_disc(0.95) WITHIN GROUP (ORDER BY ms) AS p95_ms
+       percentile_disc(0.95) WITHIN GROUP (ORDER BY ms)
+         FILTER (WHERE cache_row_moved) AS p95_ms
 FROM suggest.fetches
 WHERE kind IN ('video','playlist_add') AND job = 'run'
   AND at > now() - interval '7 days'

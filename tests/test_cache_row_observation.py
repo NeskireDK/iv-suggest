@@ -92,6 +92,46 @@ class Observation(unittest.TestCase):
         self.assertEqual("false", self.observed("video", ms=30000))
 
 
+class TheClockOffset(unittest.TestCase):
+    """`at` comes from this process, `videos.updated` from the database. The
+    window between them is 50ms wide, so they have to be on one clock."""
+
+    def setUp(self):
+        self.engine = HARNESS["engine"]
+        self.engine._CLOCK_OFFSET[:] = []
+
+    def test_it_is_measured_once_and_reused(self):
+        """A run is minutes long and two machines' clocks do not drift inside
+        it, so this must not cost a round trip per flush."""
+        asked = []
+        real = self.engine.one
+        self.engine.one = lambda sql: asked.append(sql) or real(sql)
+        try:
+            for _ in range(4):
+                self.engine.clock_offset()
+        finally:
+            self.engine.one = real
+        self.assertEqual(1, len(asked))
+        self.assertIn("clock_timestamp", asked[0])
+
+    def test_it_is_small_against_a_shared_clock(self):
+        """The synthetic database runs on this machine, so the only thing left
+        to measure is the transport, and half of it is corrected away."""
+        self.assertLess(abs(self.engine.clock_offset()), 0.5)
+
+    def test_it_does_not_charge_the_transport_to_the_offset(self):
+        """A naive `now() - to_timestamp(before)` measures the offset plus the
+        psql spawn and connect, all of it biased one way against a 50ms
+        window."""
+        real = self.engine.one
+        self.engine.one = lambda sql: (time.sleep(0.4), real(sql))[1]
+        try:
+            offset = self.engine.clock_offset()
+        finally:
+            self.engine.one = real
+        self.assertLess(abs(offset), 0.25)
+
+
 class TheLatencyPercentiles(unittest.TestCase):
     """Measured over the calls that went OUT, not over every call.
 

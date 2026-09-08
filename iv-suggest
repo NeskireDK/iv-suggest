@@ -501,6 +501,26 @@ def execute(sql):
     _psql(["-q"], sql)
 
 
+_CLOCK_OFFSET = []
+
+
+# The database's clock minus this process's. Every transport call spawns a psql
+# and opens a connection, so a naive `now() - to_timestamp(before)` measures
+# the offset PLUS that latency -- tens of milliseconds, against a 50ms window,
+# all of it biased one way. Halving the round trip is the usual correction and
+# is what the residual error is bounded by.
+#
+# Measured once: the offset between two machines' clocks does not move inside a
+# run, and a run is minutes long.
+def clock_offset():
+    """Seconds to add to this process's clock to land on the database's."""
+    if not _CLOCK_OFFSET:
+        before = time.time()
+        answered = float(one("SELECT extract(epoch FROM clock_timestamp());"))
+        _CLOCK_OFFSET.append(answered - (before + (time.time() - before) / 2))
+    return _CLOCK_OFFSET[0]
+
+
 def lit(value):
     if value is None:
         return "NULL"
@@ -677,10 +697,9 @@ CACHE_SERVED_SQL = ("cache_row_moved IS FALSE AND status = 200 "
 # fraction of a second apart.
 #
 # It is not a clock-difference allowance, because there is no clock difference
-# left to allow for: the flush measures the offset between this process's clock
-# and the database's and shifts every row by it, so `at` and `videos.updated`
-# are on one clock however far apart the two machines are. IV_SUGGEST_DB_HOST
-# is configurable, so they need not be the same machine at all.
+# left to allow for: `clock_offset()` measures it and every row is shifted onto
+# the database's clock. IV_SUGGEST_DB_HOST is configurable, so the two need not
+# be the same machine at all.
 CLOCK_SKEW_MS = 50
 
 # Whether Invidious rewrote this video's cache row while the call was in
@@ -807,16 +826,16 @@ def flush_fetch_log():
         in FETCH_LOG)
     del FETCH_LOG[:]
     try:
-        execute("WITH skew AS (SELECT now() - to_timestamp(%.6f) AS d), "
-                "c AS (SELECT v.at + skew.d AS at, v.account, v.lane, v.job, "
+        execute("WITH c AS (SELECT v.at + interval '%.6f seconds' AS at, "
+                "  v.account, v.lane, v.job, "
                 "  v.kind, v.target, v.status, v.attempt, v.error, v.ms "
                 "  FROM (VALUES %s) AS v(at,account,lane,job,kind,target,"
-                "  status,attempt,error,ms), skew) "
+                "  status,attempt,error,ms)) "
                 "INSERT INTO suggest.fetches"
                 "(at,account,lane,job,kind,target,status,attempt,error,ms,"
                 "cache_row_moved) SELECT c.at, c.account, c.lane, c.job, "
                 "c.kind, c.target, c.status, c.attempt, c.error, c.ms, %s "
-                "FROM c;" % (time.time(), rows, CACHE_ROW_MOVED_SQL))
+                "FROM c;" % (clock_offset(), rows, CACHE_ROW_MOVED_SQL))
     except Exception as e:
         log("  WARNING: %d logged calls were not written: %r" % (lost, e))
 

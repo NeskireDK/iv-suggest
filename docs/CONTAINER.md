@@ -206,12 +206,19 @@ So a rollback across this tag needs the column put back by hand first:
 # rolling back to a tag that reads `external`
 docker compose exec -T invidious-db psql -U kemal -d invidious -c "
   ALTER TABLE suggest.fetches ADD COLUMN IF NOT EXISTS external boolean;
-  UPDATE suggest.fetches SET external = coalesce(
-      cache_row_moved, kind = 'channel_latest')
-    WHERE external IS NULL;"
-# `coalesce` matters: cache_row_moved is NULL for a channel listing, which has
-# no cache row, and `external` counted those as having gone out. Without it
-# every listing in the history reads 0 under the restored tag.
+  UPDATE suggest.fetches SET external = CASE
+      WHEN kind = 'channel_latest' THEN
+        (status = 200 AND coalesce(error,'') = '') OR status >= 500
+      ELSE coalesce(cache_row_moved, false)
+        OR (status = 200 AND coalesce(error,'') <> '')
+        OR (kind = 'video' AND (status IN (404, 410) OR status >= 500))
+        OR (kind <> 'video' AND status >= 500)
+    END WHERE external IS NULL;"
+# Not a plain copy of cache_row_moved. `external` also counted a failure that
+# proved the call went out, and it read a channel listing from its status,
+# because there is no cache row to observe for one. A coalesce alone would
+# mark refused listings as having gone out -- the triple-count the old
+# expression was careful to avoid -- and would drop every failed video call.
 
 # rolling back further, to a tag that reads `upstream`
 docker compose exec -T invidious-db psql -U kemal -d invidious -c "

@@ -118,6 +118,10 @@ class Recorded:
     def install(self, mod):
         mod.execute = self.written.append
         mod.api = self.api
+        # The flush asks the database for its clock once, to put `at` and
+        # `videos.updated` on the same one.
+        mod._CLOCK_OFFSET[:] = []
+        mod.one = lambda sql: str(time.time())
         self.mod = mod
         return self
 
