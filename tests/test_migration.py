@@ -208,30 +208,25 @@ class TheOneDestructiveStep(RealPostgres, unittest.TestCase):
         return set(self.psql("SELECT column_name FROM information_schema.columns "
                              "WHERE table_schema='suggest' AND table_name='fetches';"))
 
-    def test_the_old_column_is_gone_and_the_new_ones_are_there(self):
+    def test_the_old_columns_are_gone_and_the_new_ones_are_there(self):
         self.psql(self.mod.SCHEMA_SQL)
         columns = self.columns()
         self.assertNotIn("upstream", columns)
-        self.assertIn("external", columns)
+        self.assertNotIn("external", columns)
+        self.assertIn("cache_row_moved", columns)
         self.assertIn("ms", columns)
 
     def test_not_one_row_is_lost(self):
         self.psql(self.mod.SCHEMA_SQL)
         self.assertEqual(["4"], self.psql("SELECT count(*) FROM suggest.fetches;"))
 
-    def test_the_kinds_that_settle_it_are_backfilled(self):
-        self.psql(self.mod.SCHEMA_SQL)
-        self.assertEqual(["t"], self.psql(
-            "SELECT external FROM suggest.fetches WHERE kind='channel_latest';"))
-        self.assertEqual(["f"], self.psql(
-            "SELECT external FROM suggest.fetches WHERE kind='playlist_read';"))
-
-    def test_the_ones_that_cannot_be_judged_stay_unknown(self):
-        """Their evidence is a `videos` row, and Invidious deletes those after
-        six hours, so it is already gone. NULL matches neither side."""
+    def test_nothing_is_claimed_for_a_kind_with_no_cache_row(self):
+        """`upstream` said a channel listing reached YouTube. That was true but
+        it is not an observation of a cache row, so it is not carried over."""
         self.psql(self.mod.SCHEMA_SQL)
         self.assertEqual(["2"], self.psql(
-            "SELECT count(*) FROM suggest.fetches WHERE external IS NULL;"))
+            "SELECT count(*) FROM suggest.fetches WHERE cache_row_moved IS NULL "
+            "AND kind NOT IN ('video','playlist_add');"))
 
     def test_running_it_twice_changes_nothing(self):
         self.psql(self.mod.SCHEMA_SQL)

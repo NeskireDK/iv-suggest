@@ -187,9 +187,11 @@ consecutive failures. The run looks like a bad night upstream rather than a
 half-finished deploy.
 
 ⚠️ **`init` is not purely additive any more, and that breaks the rollback.**
-One migration drops a column: `suggest.fetches.upstream`, replaced by `external`
-because the old one counted calls that *could* have gone to YouTube rather than
-the ones that did.
+Two migrations drop a column from `suggest.fetches`, in the same place and for
+the same reason: `upstream` counted calls that *could* have reached YouTube, and
+`external` claimed to know which ones did. Both are replaced by
+`cache_row_moved`, which records only what was observed, and the count itself
+moved to `suggest.upstream_samples`.
 
 Rolling the tag back past that point leaves the older code reading a column that
 is gone. Its fetch-log flush fails, which is caught and only warned — but its
@@ -201,6 +203,24 @@ ones**, and `IvSuggestMetricsBroken` fires.
 So a rollback across this tag needs the column put back by hand first:
 
 ```sh
+# rolling back to a tag that reads `external`
+docker compose exec -T invidious-db psql -U kemal -d invidious -c "
+  ALTER TABLE suggest.fetches ADD COLUMN IF NOT EXISTS external boolean;
+  UPDATE suggest.fetches SET external = CASE
+      WHEN kind = 'channel_latest' THEN
+        (status = 200 AND coalesce(error,'') = '') OR status >= 500
+      ELSE coalesce(cache_row_moved, false)
+        OR (status = 200 AND coalesce(error,'') <> '')
+        OR (kind = 'video' AND (status IN (404, 410) OR status >= 500))
+        OR (kind <> 'video' AND status >= 500)
+    END WHERE external IS NULL;"
+# Not a plain copy of cache_row_moved. `external` also counted a failure that
+# proved the call went out, and it read a channel listing from its status,
+# because there is no cache row to observe for one. A coalesce alone would
+# mark refused listings as having gone out -- the triple-count the old
+# expression was careful to avoid -- and would drop every failed video call.
+
+# rolling back further, to a tag that reads `upstream`
 docker compose exec -T invidious-db psql -U kemal -d invidious -c "
   ALTER TABLE suggest.fetches ADD COLUMN IF NOT EXISTS upstream boolean;
   UPDATE suggest.fetches SET upstream =
@@ -221,15 +241,25 @@ The Prometheus rules live outside this repository, in
 series that no longer exists **never fires and never complains** — it is not an
 error, just an expression that matches nothing.
 
-So a rename is two changes, and this one renamed two series:
-`iv_suggest_upstream_fetches_24h` → `iv_suggest_external_fetches_24h`, and
-`iv_suggest_upstream_failures_24h` → `iv_suggest_fetch_failures_24h`. Check
-before deploying:
+So a rename is two changes. Series that have moved or gone, newest first:
+
+| Was | Is |
+|---|---|
+| `iv_suggest_external_fetches_24h` | `iv_suggest_bot_fetches_24h`, plus `iv_suggest_upstream_videos_24h` for the real total |
+| `iv_suggest_upstream_fetches_24h` | (gone before it, same replacement) |
+| `iv_suggest_upstream_failures_24h` | `iv_suggest_fetch_failures_24h` |
+
+Check before deploying:
 
 ```sh
-ssh root@192.168.1.99 'pct exec 103 -- grep -rn "iv_suggest_upstream" \
+ssh root@192.168.1.99 'pct exec 103 -- grep -rnE \
+  "iv_suggest_(upstream_fetches|upstream_failures|external_fetches)" \
   /opt/monitoring/prometheus/rules/'
 ```
+
+⚠️ The Grafana dashboard reads the *tables*, not these series, so a column
+rename breaks it separately and silently — its panels just read `No data`.
+`/opt/monitoring/grafana/dashboards/iv-suggest.json` on the monitoring host.
 
 Empty output means no rule read the old names. On the reference instance it was
 empty, so nothing had to move.

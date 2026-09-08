@@ -118,6 +118,10 @@ class Recorded:
     def install(self, mod):
         mod.execute = self.written.append
         mod.api = self.api
+        # The flush asks the database for its clock once, to put `at` and
+        # `videos.updated` on the same one.
+        mod._CLOCK_OFFSET[:] = []
+        mod.one = lambda sql: str(time.time())
         self.mod = mod
         return self
 
@@ -263,11 +267,11 @@ class TheFlush(unittest.TestCase):
         self.assertEqual(1, len(self.recorded.written))
 
     def test_it_leaves_the_verdict_to_the_database(self):
-        """Whether a call went out is evidence, not something Python can assert
-        from the sort of call it was. What the expression decides is in
-        test_external_verdict.py, against a real PostgreSQL -- grepping it here
-        would prove nothing, and the first version had a clause that could
-        never be reached."""
+        """What the cache row shows is an observation the database makes, not
+        something Python can assert from the sort of call it was. What the
+        expression decides is in test_cache_row_observation.py, against a real
+        PostgreSQL -- grepping it here would prove nothing, and two earlier
+        versions of it had clauses that could never be reached."""
         self.buffer((0.0, ME, "autos", "run", "video", VID, 200, 0, "", 2270))
         self.mod.flush_fetch_log()
         written = self.recorded.written[0]
@@ -564,11 +568,13 @@ class TheRetention(unittest.TestCase):
         mod.forget_the_far_past()
         return mod, written
 
-    def test_the_call_log_is_pruned_with_the_others(self):
+    def test_every_log_is_pruned_together(self):
         _, written = self.pruned()
-        tables = [sql.split("FROM ")[1].split(" ")[0] for sql in written]
+        tables = [sql.split("FROM ")[1].split(" ")[0] for sql in written
+                  if sql.startswith("DELETE FROM")]
         self.assertEqual(["suggest.plays", "suggest.fetches",
-                          "suggest.bot_touches"], tables)
+                          "suggest.upstream_samples", "suggest.bot_touches"],
+                         tables)
 
     def test_the_two_logs_share_one_retention_knob(self):
         mod, written = self.pruned()
