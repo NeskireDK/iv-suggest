@@ -127,13 +127,6 @@ class Sampling(unittest.TestCase):
         self.assertEqual(rows, int(self.db.value(
             "SELECT count(*) FROM suggest.upstream_samples;")))
 
-    def test_the_gap_never_reads_below_zero(self):
-        self.sample()
-        self.invidious_fetches("aaaaaaaaaaa")
-        self.sample()
-        self.assertGreaterEqual(
-            int(self.engine.upstream_sample_gap("1 hour")[0][1]), 0)
-
     def test_it_survives_the_table_not_existing_yet(self):
         """A tag pull lands before `init`, and the harvest fires every half
         hour in between."""
@@ -160,50 +153,18 @@ class TheReportedTotal(unittest.TestCase):
             "(now(), now() - interval '10 min', 5);")
         self.assertEqual([("", "17")], self.engine.upstream_sampled("1 day"))
 
-    def test_a_harvest_that_stopped_is_reported_as_a_gap(self):
-        """Otherwise a stopped harvest and a quiet night are the same number."""
-        self.db.psql(
-            "INSERT INTO suggest.upstream_samples(at, since, videos) VALUES "
-            "(now() - interval '50 minutes', now() - interval '2 hours', 3);")
-        gap = int(self.engine.upstream_sample_gap("1 hour")[0][1])
-        self.assertAlmostEqual(50 * 60, gap, delta=60)
-
-    def test_a_fresh_instance_reports_no_gap_it_could_not_have_covered(self):
-        """The window starts at the first sample, or an alert written from the
-        help text fires for a day after every `init`."""
-        self.db.psql(
-            "INSERT INTO suggest.upstream_samples(at, since, videos) VALUES "
-            "(now(), now() - interval '10 minutes', 3);")
-        self.assertEqual(0, int(self.engine.upstream_sample_gap("1 day")[0][1]))
-
-    def test_a_fully_covered_window_has_no_gap(self):
-        self.db.psql(
-            "INSERT INTO suggest.upstream_samples(at, since, videos) VALUES "
-            "(now(), now() - interval '2 hours', 3);")
-        self.assertEqual(0, int(self.engine.upstream_sample_gap("1 hour")[0][1]))
-
-    def test_the_longest_span_survives_the_gap_healing(self):
-        """The gap says sampling is broken now; the longest span says how much
-        was lost, and only one of those two survives a recovery."""
+    def test_the_longest_span_is_what_says_something_was_lost(self):
+        """It survives the harvest coming back, which is the whole point: a
+        span past the cache lifetime means Invidious deleted rows inside it."""
         self.db.psql(
             "INSERT INTO suggest.upstream_samples(at, since, videos) VALUES "
             "(now() - interval '20 min', now() - interval '9 hours', 3),"
             "(now(), now() - interval '20 min', 1);")
-        self.assertEqual(0, int(self.engine.upstream_sample_gap("1 hour")[0][1]))
         longest = int(self.engine.upstream_longest_span("1 day")[0][1])
         self.assertAlmostEqual(9 * 3600 - 20 * 60, longest, delta=60)
 
     def test_no_span_at_all_is_zero_not_missing(self):
         self.assertEqual(0, int(self.engine.upstream_longest_span("1 day")[0][1]))
-
-    def test_a_sampler_that_has_never_written_is_the_whole_window(self):
-        """Not clipped away: the table exists and holds nothing, which means
-        sampling has never once succeeded. A harvest can run and still fail
-        here, and then nothing else would say so. The alert's 30 minute `for:`
-        is what keeps a fresh instance from firing on it."""
-        gap = int(self.engine.upstream_sample_gap("1 hour")[0][1])
-        self.assertAlmostEqual(3600, gap, delta=60)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -295,17 +295,16 @@ failed write warns rather than raising. A command with no lane loop — `views` 
 the one that makes real numbers of calls — flushes every `FETCH_LOG_BATCH` rows
 instead, so a timeout kill cannot take a whole run's log with it.
 
-Eight metrics carry these into Prometheus for alerting:
+Seven metrics carry these into Prometheus for alerting:
 
 - `iv_suggest_upstream_videos_24h` — the headline. Videos Invidious fetched,
   from its own record, everyone's included.
-- `iv_suggest_upstream_sample_gap_seconds` — how much of the day no sample
-  covers. Without it, a stopped harvest and a quiet night are the same number.
-- `iv_suggest_upstream_longest_span_seconds` — the gap heals the moment
-  sampling resumes, because a late sample's span covers the outage it spent.
-  That is right for "is sampling broken now" and wrong for "was anything
-  lost", so this sits beside it: a span past six hours means Invidious deleted
-  rows inside it and those fetches are in no count and never will be.
+- `iv_suggest_upstream_longest_span_seconds` — the longest single sample in
+  the day. Past six hours means Invidious deleted cache rows inside that span,
+  so the fetches in it are in no count and never will be. It is the one that
+  says something was *lost*; liveness is
+  `iv_suggest_last_play_harvest_timestamp_seconds`, since the harvest is what
+  takes the samples.
 - `iv_suggest_bot_fetches_24h{kind}` — this engine's share, attributable, and
   the slight undercount described above.
 - `iv_suggest_cache_served_calls_24h{kind}` — the other side of it. Clean

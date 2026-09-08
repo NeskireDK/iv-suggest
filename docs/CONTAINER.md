@@ -206,7 +206,12 @@ So a rollback across this tag needs the column put back by hand first:
 # rolling back to a tag that reads `external`
 docker compose exec -T invidious-db psql -U kemal -d invidious -c "
   ALTER TABLE suggest.fetches ADD COLUMN IF NOT EXISTS external boolean;
-  UPDATE suggest.fetches SET external = cache_row_moved WHERE external IS NULL;"
+  UPDATE suggest.fetches SET external = coalesce(
+      cache_row_moved, kind = 'channel_latest')
+    WHERE external IS NULL;"
+# `coalesce` matters: cache_row_moved is NULL for a channel listing, which has
+# no cache row, and `external` counted those as having gone out. Without it
+# every listing in the history reads 0 under the restored tag.
 
 # rolling back further, to a tag that reads `upstream`
 docker compose exec -T invidious-db psql -U kemal -d invidious -c "
