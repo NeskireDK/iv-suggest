@@ -86,6 +86,10 @@ REVISION = setting("IV_SUGGEST_REVISION", "unknown")
 # migration backfills every pre-multi-user row to.
 PRIMARY = setting("IV_SUGGEST_ACCOUNT")
 ACCOUNT = PRIMARY
+# The Grafana dashboards read the log tables straight out of Postgres, as a role
+# with no rights of its own. `init` is what grants it, so the reference install
+# names it here rather than somewhere a hand-run GRANT can be forgotten.
+DASHBOARD_ROLE = setting("IV_SUGGEST_DASHBOARD_ROLE", "grafana_ro").strip()
 
 
 def use_account(email):
@@ -342,6 +346,79 @@ BEGIN
   END LOOP;
 END $$;
 """
+
+# What the dashboard role may read. An allowlist, and GRANT_SQL revokes it from
+# every suggest table not named here -- because a GRANT on the whole schema
+# would be one line and would hand out suggest.accounts, which holds a live
+# Invidious session id per account. That is a login, and anyone who can open a
+# dashboard could read it. Naming the tables instead leaves a new one private
+# until somebody decides otherwise, which is the right default for a table
+# nobody has looked at yet.
+READABLE_BY_DASHBOARD = (
+    "bot_touches", "cooldown", "fetches", "host_events", "items", "job_runs",
+    "lanes", "plays", "runs", "shuffles", "upstream_samples", "video_dead",
+    "video_meta")
+
+# Withheld on purpose, and named rather than merely left out: a table absent
+# from both lists is a table nobody has decided about, and test_dashboard_reads
+# fails until somebody does.
+PRIVATE_FROM_DASHBOARD = ("accounts",)
+
+# Re-applied by every `init` rather than run once by hand. The one-off GRANT
+# this replaces was made before suggest.upstream_samples existed, so the two
+# Grafana panels written for that table answered `permission denied for table
+# upstream_samples` at every time range for a day -- and a panel that errors at
+# every range reads as a broken datasource, not as a missing grant.
+GRANT_SQL = """
+DO $$
+DECLARE
+  readable text[] := ARRAY[__READABLE__];
+  reader text := __ROLE__;
+  t text;
+BEGIN
+  EXECUTE format('GRANT USAGE ON SCHEMA suggest TO %I', reader);
+  FOR t IN SELECT c.relname FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+           WHERE n.nspname = 'suggest' AND c.relkind = 'r'
+  LOOP
+    IF t = ANY (readable) THEN
+      EXECUTE format('GRANT SELECT ON suggest.%I TO %I', t, reader);
+    ELSE
+      EXECUTE format('REVOKE ALL ON suggest.%I FROM %I', t, reader);
+    END IF;
+  END LOOP;
+END $$;
+"""
+
+
+def dashboard_role_is_grantable():
+    """Whether there is a dashboard role to grant to, and it is not us."""
+    if not DASHBOARD_ROLE or DASHBOARD_ROLE == DB_USER:
+        return False
+    return one("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s);"
+               % lit(DASHBOARD_ROLE)) == "t"
+
+
+def tables_the_dashboard_can_read():
+    """The suggest tables that role can SELECT from right now, read back from Postgres."""
+    return one("SELECT coalesce(string_agg(c.relname, ' ' ORDER BY c.relname), 'none') "
+               "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+               "WHERE n.nspname = 'suggest' AND c.relkind = 'r' "
+               "AND has_table_privilege(%s, c.oid, 'SELECT');"
+               % lit(DASHBOARD_ROLE))
+
+
+def grant_dashboard_reads():
+    """Let the dashboard role read the log tables and nothing else, then say what it got."""
+    if not dashboard_role_is_grantable():
+        log("no dashboard role %r here, so nothing was granted" % DASHBOARD_ROLE)
+        return
+    execute(GRANT_SQL
+            .replace("__READABLE__",
+                     ", ".join(lit(name) for name in READABLE_BY_DASHBOARD))
+            .replace("__ROLE__", lit(DASHBOARD_ROLE)))
+    log("%s reads: %s" % (DASHBOARD_ROLE, tables_the_dashboard_can_read()))
+
 
 # The hourly reorder. Membership is the nightly run's job; this only decides
 # what sits at the top, and it never touches YouTube.
@@ -2892,6 +2969,7 @@ def cmd_init(args):
                  "account the rows written before multi-user belong to")
     execute(SCHEMA_SQL)
     execute(MIGRATE_SQL.replace("__ACCOUNT__", lit(PRIMARY)))
+    grant_dashboard_reads()
     log("schema suggest is ready (rows without an account belong to %s)" % PRIMARY)
     users = load_users() if args.all_users else [
         u for u in load_users() if u["email"] == PRIMARY]
