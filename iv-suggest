@@ -279,38 +279,24 @@ CREATE TABLE IF NOT EXISTS suggest.upstream_samples (
   at timestamptz PRIMARY KEY DEFAULT now(), since timestamptz NOT NULL,
   videos int NOT NULL);
 CREATE INDEX IF NOT EXISTS fetches_at_idx ON suggest.fetches (at);
--- `upstream` said a call COULD reach YouTube, which counted every playlist add:
--- 312 of them in one night against 169 real fetches, so the headline number
--- read three times the truth. `external` says it DID, and is decided at write
--- time from evidence rather than from the sort of call it was.
+-- How long each call took, which is the other tell and is published as a
+-- percentile rather than used as a threshold.
 ALTER TABLE suggest.fetches ADD COLUMN IF NOT EXISTS ms int;
--- `external` claimed to know whether a call reached YouTube. It could not: the
--- client cannot see what Invidious did downstream, and every attempt to infer
--- it counted calls that never left the machine. The column it becomes records
--- only what was observed.
+-- `cache_row_moved` records what was seen. Its two predecessors both claimed
+-- to know whether a call reached YouTube, and neither could: the client
+-- cannot see what Invidious did downstream. `upstream` guessed from the sort
+-- of call, counting 312 playlist adds against 169 real fetches in one night;
+-- `external` guessed from ranked evidence and was wrong eleven different ways.
 ALTER TABLE suggest.fetches
   ADD COLUMN IF NOT EXISTS cache_row_moved boolean;
--- Guarded, because on a fresh database the CREATE above already made the new
--- shape and there is no `external` to read: an unguarded reference to it would
--- fail the whole schema step rather than skip one backfill.
-DO $$
-BEGIN
-  IF EXISTS (SELECT 1 FROM information_schema.columns
-             WHERE table_schema = 'suggest' AND table_name = 'fetches'
-               AND column_name = 'external') THEN
-    UPDATE suggest.fetches SET cache_row_moved = external
-     WHERE cache_row_moved IS NULL AND external IS NOT NULL
-       AND kind IN ('video', 'playlist_add');
-  END IF;
-END $$;
-ALTER TABLE suggest.fetches DROP COLUMN IF EXISTS external;
--- Rows written before this migration can only be judged where the kind settles
--- it: a channel listing is never cached, and nothing outside those three kinds
--- can leave the machine at all. A `video` or `playlist_add` from before stays
--- NULL, because the evidence for it -- a `videos` row -- is deleted after six
--- hours and is already gone. NULL matches neither `external` nor
--- `NOT external`, which is the honest answer to "we cannot tell".
+-- Neither is backfilled into it, deliberately. `external` counted a failure as
+-- having gone out -- a 404 set it true because Invidious had to ask upstream to
+-- answer -- but the error path DELETES the cache row, so nothing moved.
+-- Copying that across would put a false observation in the one column whose
+-- point is that it records only what was observed. Rows from before the change
+-- stay NULL, which is what "not observed" means everywhere else here.
 ALTER TABLE suggest.fetches DROP COLUMN IF EXISTS upstream;
+ALTER TABLE suggest.fetches DROP COLUMN IF EXISTS external;
 """
 
 # Bring a single-account database up to the shape above. Everything that exists
@@ -3026,6 +3012,12 @@ def prune(table, dated_by, days):
 # Carried by the harvest because it is the only job that runs oftener than
 # Invidious deletes a cache row, which is what bounds how long a sample can
 # wait. A gap longer than that loses fetches with no trace anywhere.
+#
+# The spans must not overlap, or one is counted twice and the reported gap goes
+# negative -- which reads healthier than a real gap. Two harvests can race for
+# the same span, the timer against a hand run, so the insert refuses when a
+# sample newer than its own `since` already exists. The loser writes nothing;
+# the winner's span already covers what it would have counted.
 def sample_upstream_fetches():
     """Count the videos Invidious refreshed since the last sample."""
     if not table_exists("suggest.upstream_samples"):
@@ -3035,7 +3027,9 @@ def sample_upstream_fetches():
             "  (SELECT count(*) FROM videos WHERE updated > w.since) "
             "FROM (SELECT coalesce(max(at), now()) AS since "
             "      FROM suggest.upstream_samples) w "
-            "ON CONFLICT (at) DO NOTHING;")
+            "WHERE NOT EXISTS (SELECT 1 FROM suggest.upstream_samples s "
+            "                  WHERE s.at > w.since) "
+            "ON CONFLICT DO NOTHING;")
 
 
 def note_job_run(job, at):
@@ -3348,6 +3342,9 @@ def newest_judged_open():
                "FROM suggest.plays;") or 0
 
 
+# A sample straddling the window's start is counted whole, because a count of
+# videos cannot be pro-rated across a span. So this is the window plus at most
+# one sample's worth -- half an hour when sampling is healthy.
 def upstream_sampled(window):
     """Videos Invidious fetched over the window, summed from its own record."""
     if not table_exists("suggest.upstream_samples"):
@@ -3368,9 +3365,25 @@ def upstream_sample_gap(window):
         "WITH w AS (SELECT now() - interval '%s' AS from_t, now() AS to_t), "
         "covered AS (SELECT greatest(since, w.from_t) AS a, at AS b "
         "            FROM suggest.upstream_samples, w WHERE at > w.from_t) "
-        "SELECT round(extract(epoch FROM (SELECT to_t - from_t FROM w)) "
+        "SELECT greatest(round(extract(epoch FROM "
+        "    (SELECT to_t - from_t FROM w)) "
         "  - coalesce((SELECT sum(extract(epoch FROM (b - a))) FROM covered "
-        "              WHERE b > a), 0))::bigint;" % window) or 0)]
+        "              WHERE b > a), 0)), 0)::bigint;" % window) or 0)]
+
+
+# The gap heals the moment sampling resumes, because a late sample's span
+# covers the outage it spent. That is the right behaviour for "is sampling
+# broken now" and the wrong one for "was anything lost", so the longest span
+# is published beside it: a span past the cache lifetime means Invidious
+# deleted rows inside it and those fetches are not in any count.
+def upstream_longest_span(window):
+    """The longest single sample span in the window, in seconds."""
+    if not table_exists("suggest.upstream_samples"):
+        return []
+    return [("", one("SELECT coalesce(round(max(extract(epoch FROM "
+                     "(at - since))))::bigint, 0) FROM "
+                     "suggest.upstream_samples WHERE at > now() - interval "
+                     "'%s';" % window) or 0)]
 
 
 def latency_samples(window):
@@ -3403,7 +3416,7 @@ def plays_samples(where):
 def fetch_samples(where, column, wanted):
     """One zero filled sample per `wanted` value, all zero before `init` ran."""
     counted = dict((value, 0) for value in wanted)
-    if column_exists("fetches", "external"):
+    if column_exists("fetches", "cache_row_moved"):
         counted.update((value, int(rows)) for value, rows in query(
             "SELECT %s, count(*) FROM suggest.fetches WHERE %s GROUP BY 1;"
             % (column, where)))
@@ -3475,6 +3488,12 @@ def _instance_wide_metrics(metric, users):
            "EVERYONE's fetches, this bot's and the household's, which is the "
            "number that matters for how hard the instance leans on YouTube.",
            "gauge", upstream_sampled("1 day"))
+    metric("upstream_longest_span_seconds",
+           "The longest single sample in the last day. Past %d hours means "
+           "Invidious deleted cache rows inside that span, so the fetches in "
+           "it are in no count and never will be -- unlike the gap, which "
+           "heals as soon as sampling resumes." % VIDEO_CACHE_LIFETIME_HOURS,
+           "gauge", upstream_longest_span("1 day"))
     metric("upstream_sample_gap_seconds",
            "How much of the last day no sample covers. Above 0 for long means "
            "the harvest stopped and fetches went by uncounted; above %d hours "
@@ -3486,7 +3505,9 @@ def _instance_wide_metrics(metric, users):
            "cache row it moved, or a channel listing, which Invidious never "
            "caches. Attributable, unlike upstream_videos_24h, and a slight "
            "UNDERCOUNT -- two calls about one video leave only the later "
-           "one's move.", "gauge",
+           "one's move -- and so is a fetch that FAILED, because the error "
+           "path deletes the row there was to move. Both undercounts pull the "
+           "same way on the worst nights.", "gauge",
            fetch_samples("at > now() - interval '1 day' AND (cache_row_moved "
                          "OR (kind = 'channel_latest' AND status = 200 "
                          "AND coalesce(error,'') = ''))",

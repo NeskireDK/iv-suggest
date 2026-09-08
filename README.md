@@ -253,17 +253,23 @@ metadata cache, so withholding these would hide requests that genuinely
 happened.
 
 ```sql
--- requests that really reached YouTube, per hour, by account and sort
+-- what Invidious actually fetched per hour, everyone's included
+SELECT date_trunc('hour', at) AS hour, sum(videos) AS fetched
+FROM suggest.upstream_samples GROUP BY 1 ORDER BY 1 DESC;
+
+-- this engine's share of it, per hour, by account and sort
 SELECT date_trunc('hour', at) AS hour, account, kind, count(*)
-FROM suggest.fetches WHERE external
+FROM suggest.fetches
+WHERE cache_row_moved
+   OR (kind = 'channel_latest' AND status = 200 AND coalesce(error,'') = '')
 GROUP BY 1, 2, 3 ORDER BY 1 DESC;
 
 -- what each lane of the nightly fill cost, and what the cache saved it
-SELECT lane, count(*) FILTER (WHERE external) AS went_out,
-       count(*) FILTER (WHERE NOT external) AS from_cache,
-       round(avg(ms) FILTER (WHERE external)) AS avg_ms
+SELECT lane, count(*) FILTER (WHERE cache_row_moved) AS fetched,
+       count(*) FILTER (WHERE cache_row_moved IS FALSE) AS from_cache,
+       percentile_disc(0.95) WITHIN GROUP (ORDER BY ms) AS p95_ms
 FROM suggest.fetches
-WHERE kind IN ('video','channel_latest','playlist_add') AND job = 'run'
+WHERE kind IN ('video','playlist_add') AND job = 'run'
   AND at > now() - interval '7 days'
 GROUP BY 1 ORDER BY 2 DESC;
 
@@ -271,7 +277,8 @@ GROUP BY 1 ORDER BY 2 DESC;
 SELECT date_trunc('day', at) AS day, status, left(error, 40) AS answered,
        count(*)
 FROM suggest.fetches
-WHERE external AND (status <> 200 OR coalesce(error, '') <> '')
+WHERE kind IN ('video','channel_latest','playlist_add')
+  AND (status <> 200 OR coalesce(error, '') <> '')
 GROUP BY 1, 2, 3 ORDER BY 1 DESC;
 
 -- the cache hit ratio per night, which the run used to only print
@@ -294,6 +301,11 @@ Six metrics carry these into Prometheus for alerting:
   from its own record, everyone's included.
 - `iv_suggest_upstream_sample_gap_seconds` — how much of the day no sample
   covers. Without it, a stopped harvest and a quiet night are the same number.
+- `iv_suggest_upstream_longest_span_seconds` — the gap heals the moment
+  sampling resumes, because a late sample's span covers the outage it spent.
+  That is right for "is sampling broken now" and wrong for "was anything
+  lost", so this sits beside it: a span past six hours means Invidious deleted
+  rows inside it and those fetches are in no count and never will be.
 - `iv_suggest_bot_fetches_24h{kind}` — this engine's share, attributable, and
   the slight undercount described above.
 - `iv_suggest_cache_served_calls_24h{kind}` — the other side of it. Clean

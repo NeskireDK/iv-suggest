@@ -101,6 +101,39 @@ class Sampling(unittest.TestCase):
         self.invidious_fetches("aaaaaaaaaaa")
         self.assertEqual(1, self.sample())
 
+    def test_no_two_spans_ever_overlap(self):
+        """Overlap counts one span twice and drives the reported gap below
+        zero, which reads healthier than a real gap does."""
+        for _ in range(5):
+            self.invidious_fetches("aaaaaaaaaaa")
+            self.sample()
+        spans = self.spans()
+        for earlier, later in zip(spans, spans[1:]):
+            self.assertLessEqual(earlier[1], later[0])
+
+    def test_a_sample_whose_span_is_already_covered_writes_nothing(self):
+        """What a racing second harvest would try: its `since` is behind a
+        sample that already exists."""
+        self.sample()
+        self.invidious_fetches("aaaaaaaaaaa")
+        self.sample()
+        rows = int(self.db.value("SELECT count(*) FROM suggest.upstream_samples;"))
+        stale = self.db.value("SELECT min(since)::text FROM suggest.upstream_samples;")
+        self.db.psql(
+            "INSERT INTO suggest.upstream_samples(at, since, videos) "
+            "SELECT now(), '%s'::timestamptz, 99 WHERE NOT EXISTS ("
+            "  SELECT 1 FROM suggest.upstream_samples s "
+            "  WHERE s.at > '%s'::timestamptz);" % (stale, stale))
+        self.assertEqual(rows, int(self.db.value(
+            "SELECT count(*) FROM suggest.upstream_samples;")))
+
+    def test_the_gap_never_reads_below_zero(self):
+        self.sample()
+        self.invidious_fetches("aaaaaaaaaaa")
+        self.sample()
+        self.assertGreaterEqual(
+            int(self.engine.upstream_sample_gap("1 hour")[0][1]), 0)
+
     def test_it_survives_the_table_not_existing_yet(self):
         """A tag pull lands before `init`, and the harvest fires every half
         hour in between."""
@@ -140,6 +173,20 @@ class TheReportedTotal(unittest.TestCase):
             "INSERT INTO suggest.upstream_samples(at, since, videos) VALUES "
             "(now(), now() - interval '2 hours', 3);")
         self.assertEqual(0, int(self.engine.upstream_sample_gap("1 hour")[0][1]))
+
+    def test_the_longest_span_survives_the_gap_healing(self):
+        """The gap says sampling is broken now; the longest span says how much
+        was lost, and only one of those two survives a recovery."""
+        self.db.psql(
+            "INSERT INTO suggest.upstream_samples(at, since, videos) VALUES "
+            "(now() - interval '20 min', now() - interval '9 hours', 3),"
+            "(now(), now() - interval '20 min', 1);")
+        self.assertEqual(0, int(self.engine.upstream_sample_gap("1 hour")[0][1]))
+        longest = int(self.engine.upstream_longest_span("1 day")[0][1])
+        self.assertAlmostEqual(9 * 3600 - 20 * 60, longest, delta=60)
+
+    def test_no_span_at_all_is_zero_not_missing(self):
+        self.assertEqual(0, int(self.engine.upstream_longest_span("1 day")[0][1]))
 
     def test_no_samples_at_all_is_the_whole_window(self):
         gap = int(self.engine.upstream_sample_gap("1 hour")[0][1])
