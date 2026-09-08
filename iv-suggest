@@ -678,8 +678,13 @@ CLOCK_SKEW_MS = 50
 #
 # The undercount: the row holds one value per video, so two calls about the
 # same video inside one flush leave only the later one's move, and the earlier
-# real fetch reads as a cache answer. The sampler does not have that problem,
-# which is why it and not this is the number to quote.
+# real fetch reads as a cache answer. A fetch that FAILED is missed too,
+# because the error path deletes the row there was to move.
+#
+# `suggest.upstream_samples` is the number to quote instead -- not because it
+# is complete, since one row per video costs it a re-fetch inside a span the
+# same way, but because it is right about what it does see without having to
+# correlate anything with our calls.
 CACHE_ROW_MOVED_SQL = """CASE WHEN c.kind IN (%s) THEN EXISTS (
     SELECT 1 FROM videos v WHERE v.id = c.target
     AND v.updated >= c.at - %d * interval '1 millisecond'
@@ -3006,32 +3011,37 @@ def prune(table, dated_by, days):
             % (table, dated_by, days))
 
 
-# Dated from when the run looked, not from when it finished, so nothing
-# refreshed while it worked is missed. Called at the end, because a metric
-# saying the job ran must not be set by a run that then died.
 # Carried by the harvest because it is the only job that runs oftener than
 # Invidious deletes a cache row, which is what bounds how long a sample can
 # wait. A gap longer than that loses fetches with no trace anywhere.
 #
-# The spans must not overlap, or one is counted twice and the reported gap goes
-# negative -- which reads healthier than a real gap. Two harvests can race for
-# the same span, the timer against a hand run, so the insert refuses when a
-# sample newer than its own `since` already exists. The loser writes nothing;
-# the winner's span already covers what it would have counted.
+# The spans must not overlap, or one is counted twice and the reported gap
+# goes negative -- which reads healthier than a real gap does. Two harvests can
+# race for the same span, the timer against a hand run, and read-then-insert is
+# not atomic by itself: both would read the same `max(at)`.
+#
+# So it takes a lock. No WHERE clause can do this job, and the obvious one is
+# worse than useless: "refuse if a sample newer than my `since` exists" is a
+# TAUTOLOGY, because `since` is `max(at)` and nothing is newer than the
+# maximum. It reads like a guard and refuses nothing.
 def sample_upstream_fetches():
     """Count the videos Invidious refreshed since the last sample."""
     if not table_exists("suggest.upstream_samples"):
         return
-    execute("INSERT INTO suggest.upstream_samples(at, since, videos) "
+    execute("BEGIN; "
+            "SELECT pg_advisory_xact_lock(hashtext('iv-suggest upstream')); "
+            "INSERT INTO suggest.upstream_samples(at, since, videos) "
             "SELECT now(), w.since, "
             "  (SELECT count(*) FROM videos WHERE updated > w.since) "
             "FROM (SELECT coalesce(max(at), now()) AS since "
             "      FROM suggest.upstream_samples) w "
-            "WHERE NOT EXISTS (SELECT 1 FROM suggest.upstream_samples s "
-            "                  WHERE s.at > w.since) "
-            "ON CONFLICT DO NOTHING;")
+            "ON CONFLICT DO NOTHING; "
+            "COMMIT;")
 
 
+# Dated from when the run looked, not from when it finished, so nothing
+# refreshed while it worked is missed. Called at the end, because a metric
+# saying the job ran must not be set by a run that then died.
 def note_job_run(job, at):
     """Record that this job ran, for a metric that can say it stopped."""
     execute("INSERT INTO suggest.job_runs(job, at) VALUES (%s, %s) "
@@ -3357,12 +3367,17 @@ def upstream_sampled(window):
 # Every sample covers `since`..`at`, so what no sample covers is the window
 # minus the union of those spans. Reported rather than silently ignored: a
 # missing hour and a quiet hour are the same number of fetches otherwise.
+# The window starts at the first sample when that is later, so a fresh
+# instance does not report a whole day of gap it could not have covered -- and
+# an alert written from the help text does not fire for a day after every init.
 def upstream_sample_gap(window):
-    """Seconds of the window no sample accounts for."""
+    """Seconds since the first sample, within the window, that no sample covers."""
     if not table_exists("suggest.upstream_samples"):
         return []
     return [("", one(
-        "WITH w AS (SELECT now() - interval '%s' AS from_t, now() AS to_t), "
+        "WITH w AS (SELECT greatest(now() - interval '%s', "
+        "    (SELECT min(since) FROM suggest.upstream_samples)) AS from_t, "
+        "    now() AS to_t), "
         "covered AS (SELECT greatest(since, w.from_t) AS a, at AS b "
         "            FROM suggest.upstream_samples, w WHERE at > w.from_t) "
         "SELECT greatest(round(extract(epoch FROM "

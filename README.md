@@ -295,7 +295,7 @@ failed write warns rather than raising. A command with no lane loop — `views` 
 the one that makes real numbers of calls — flushes every `FETCH_LOG_BATCH` rows
 instead, so a timeout kill cannot take a whole run's log with it.
 
-Six metrics carry these into Prometheus for alerting:
+Eight metrics carry these into Prometheus for alerting:
 
 - `iv_suggest_upstream_videos_24h` — the headline. Videos Invidious fetched,
   from its own record, everyone's included.
@@ -320,6 +320,11 @@ Six metrics carry these into Prometheus for alerting:
   refusing; a failure counter says nothing until then. A mean would hide it —
   ninety cache answers and ten real fetches average to 233 ms, which looks like
   neither.
+- `iv_suggest_cache_hit_ratio_24h` — the engine's own metadata cache, which is
+  a different cache from Invidious'. `cache_hits / lookups`, both counted where
+  the lookup happens; a genre lane asks twice about one video, for its channel
+  and then for its genre, and both are real lookups. Falling is the warning
+  that the next night will cost far more fetches than the last.
 
 `rate_limited` rising means back off. `answered_an_error` is the one worth
 knowing about: Invidious answers **200 with an error in the body** when it cannot

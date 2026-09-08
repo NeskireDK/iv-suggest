@@ -263,11 +263,11 @@ class TheFlush(unittest.TestCase):
         self.assertEqual(1, len(self.recorded.written))
 
     def test_it_leaves_the_verdict_to_the_database(self):
-        """Whether a call went out is evidence, not something Python can assert
-        from the sort of call it was. What the expression decides is in
-        test_external_verdict.py, against a real PostgreSQL -- grepping it here
-        would prove nothing, and the first version had a clause that could
-        never be reached."""
+        """What the cache row shows is an observation the database makes, not
+        something Python can assert from the sort of call it was. What the
+        expression decides is in test_cache_row_observation.py, against a real
+        PostgreSQL -- grepping it here would prove nothing, and two earlier
+        versions of it had clauses that could never be reached."""
         self.buffer((0.0, ME, "autos", "run", "video", VID, 200, 0, "", 2270))
         self.mod.flush_fetch_log()
         written = self.recorded.written[0]
