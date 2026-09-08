@@ -111,21 +111,19 @@ class Sampling(unittest.TestCase):
         for earlier, later in zip(spans, spans[1:]):
             self.assertLessEqual(earlier[1], later[0])
 
-    def test_a_sample_whose_span_is_already_covered_writes_nothing(self):
-        """What a racing second harvest would try: its `since` is behind a
-        sample that already exists."""
-        self.sample()
-        self.invidious_fetches("aaaaaaaaaaa")
-        self.sample()
-        rows = int(self.db.value("SELECT count(*) FROM suggest.upstream_samples;"))
-        stale = self.db.value("SELECT min(since)::text FROM suggest.upstream_samples;")
-        self.db.psql(
-            "INSERT INTO suggest.upstream_samples(at, since, videos) "
-            "SELECT now(), '%s'::timestamptz, 99 WHERE NOT EXISTS ("
-            "  SELECT 1 FROM suggest.upstream_samples s "
-            "  WHERE s.at > '%s'::timestamptz);" % (stale, stale))
-        self.assertEqual(rows, int(self.db.value(
-            "SELECT count(*) FROM suggest.upstream_samples;")))
+    def test_every_span_runs_forwards(self):
+        """`now()` is the TRANSACTION time, fixed at BEGIN and so before the
+        advisory lock is granted: a run that began earlier and won the lock
+        later would stamp a row whose `at` precedes its own `since`. The
+        sampler reads clock_timestamp() instead, after the wait."""
+        for _ in range(4):
+            self.sample()
+        spans = self.spans()
+        for since, at in spans:
+            self.assertLessEqual(since, at,
+                                 "%s .. %s runs backwards" % (since, at))
+        for since, at in spans[1:]:
+            self.assertLess(since, at, "only the first span is zero length")
 
     def test_it_survives_the_table_not_existing_yet(self):
         """A tag pull lands before `init`, and the harvest fires every half
@@ -165,6 +163,72 @@ class TheReportedTotal(unittest.TestCase):
 
     def test_no_span_at_all_is_zero_not_missing(self):
         self.assertEqual(0, int(self.engine.upstream_longest_span("1 day")[0][1]))
+
+class TheBotsOwnShare(unittest.TestCase):
+    """`bot_fetches_24h` and `cache_served_calls_24h`, which carry the one
+    inference left in the metrics: a channel listing that answered cleanly went
+    out, because Invidious never caches them. It used to be tested where the
+    verdict lived, and that module is gone."""
+
+    def setUp(self):
+        self.engine = HARNESS["engine"]
+        self.db = HARNESS["db"]
+        self.db.psql("DELETE FROM suggest.fetches;")
+
+    def call(self, kind, moved="NULL", status=200):
+        self.db.psql("INSERT INTO suggest.fetches"
+                     "(at,account,job,kind,target,status,attempt,error,ms,"
+                     "cache_row_moved) VALUES "
+                     "(now(), 'a@b', 'run', '%s', 'x', %d, 0, '', 9, %s);"
+                     % (kind, status, moved))
+
+    def counted(self, sampler, kind):
+        return dict(sampler).get('{kind="%s"}' % kind)
+
+    def bot(self):
+        """The gauge's own clause, not a copy of it: a copy would keep passing
+        after the gauge changed."""
+        return self.engine.fetch_samples(
+            self.engine.WENT_OUT_SQL, "kind", self.engine.CAN_REACH_KINDS)
+
+    def served(self):
+        return self.engine.fetch_samples(
+            self.engine.CACHE_SERVED_SQL, "kind", self.engine.GET_VIDEO_KINDS)
+
+    def test_a_video_whose_row_moved_counts_as_a_fetch(self):
+        self.call("video", moved="true")
+        self.assertEqual(1, self.counted(self.bot(), "video"))
+        self.assertEqual(0, self.counted(self.served(), "video"))
+
+    def test_a_video_the_cache_answered_counts_the_other_way(self):
+        self.call("video", moved="false")
+        self.assertEqual(0, self.counted(self.bot(), "video"))
+        self.assertEqual(1, self.counted(self.served(), "video"))
+
+    def test_a_clean_channel_listing_counts_as_a_fetch(self):
+        self.call("channel_latest")
+        self.assertEqual(1, self.counted(self.bot(), "channel_latest"))
+
+    def test_a_refused_channel_listing_does_not(self):
+        """Retried three times, so counting one would log three fetches that
+        never happened."""
+        for status in (403, 429):
+            self.db.psql("DELETE FROM suggest.fetches;")
+            self.call("channel_latest", status=status)
+            self.assertEqual(0, self.counted(self.bot(), "channel_latest"),
+                             "status %d" % status)
+
+    def test_a_failed_video_call_counts_as_neither(self):
+        """The error path deletes the row, so nothing moved -- and a failure
+        must not read as a clean cache answer either."""
+        self.call("video", moved="false", status=500)
+        self.assertEqual(0, self.counted(self.bot(), "video"))
+        self.assertEqual(0, self.counted(self.served(), "video"))
+
+    def test_a_playlist_read_is_in_neither(self):
+        self.call("playlist_read")
+        self.assertIsNone(self.counted(self.bot(), "playlist_read"))
+
 
 if __name__ == "__main__":
     unittest.main()

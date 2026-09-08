@@ -314,11 +314,12 @@ Seven metrics carry these into Prometheus for alerting:
   did: a refused call is precisely the one that did not go out, and it is the
   one worth knowing about. A `playlist_add` rate-limited to a 429 would
   otherwise be invisible.
-- `iv_suggest_fetch_ms{kind,quantile}` — p50 and p95. A rising p95 on `video`
-  is YouTube getting slow, which is the warning that arrives *before* it starts
-  refusing; a failure counter says nothing until then. A mean would hide it —
-  ninety cache answers and ten real fetches average to 233 ms, which looks like
-  neither.
+- `iv_suggest_fetch_ms{kind,quantile}` — p50 and p95 **of the calls that went
+  out**. A rising p95 on `video` is YouTube getting slow, which is the warning
+  that arrives *before* it starts refusing; a failure counter says nothing
+  until then. Measured over every call it would track the cache hit ratio
+  instead: a thousand calls with ten real fetches at 5000 ms puts p95 at 7 ms,
+  so the warning would vanish exactly when the cache is warm.
 - `iv_suggest_cache_hit_ratio_24h` — the engine's own metadata cache, which is
   a different cache from Invidious'. `cache_hits / lookups`, both counted where
   the lookup happens; a genre lane asks twice about one video, for its channel

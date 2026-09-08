@@ -93,46 +93,55 @@ class Observation(unittest.TestCase):
 
 
 class TheLatencyPercentiles(unittest.TestCase):
-    """Published as p50 and p95 rather than a mean, and used as a signal rather
-    than a threshold: a rising p95 on `video` is YouTube getting slow, which
-    arrives before it starts refusing."""
+    """Measured over the calls that went OUT, not over every call.
+
+    Percentiled over all of them it would track the cache hit ratio instead of
+    YouTube: a thousand calls with ten real fetches at 5000ms puts p95 at 7ms,
+    so the warning it exists to give disappears exactly when the cache is warm.
+    """
 
     def setUp(self):
         self.engine = HARNESS["engine"]
         self.db = HARNESS["db"]
         self.db.psql("DELETE FROM suggest.fetches;")
 
-    def calls(self, kind, *durations):
-        rows = ",".join("(now(), 'a@b', 'run', '%s', 'x', 200, 0, '', %d)"
-                        % (kind, ms) for ms in durations)
+    def calls(self, kind, moved, *durations):
+        rows = ",".join(
+            "(now(), 'a@b', 'run', '%s', 'x', 200, 0, '', %d, %s)"
+            % (kind, ms, moved) for ms in durations)
         self.db.psql("INSERT INTO suggest.fetches"
-                     "(at,account,job,kind,target,status,attempt,error,ms) "
-                     "VALUES %s;" % rows)
+                     "(at,account,job,kind,target,status,attempt,error,ms,"
+                     "cache_row_moved) VALUES %s;" % rows)
 
     def sample(self, kind, quantile):
         wanted = '{kind="%s",quantile="%s"}' % (kind, quantile)
         return dict(self.engine.latency_samples("1 day")).get(wanted)
 
     def test_the_median_and_the_tail_are_both_published(self):
-        self.calls("video", *([7] * 90 + [2270] * 10))
-        self.assertEqual("7", self.sample("video", "0.5"))
-        self.assertEqual("2270", self.sample("video", "0.95"))
+        self.calls("video", "true", *([900] * 90 + [5000] * 10))
+        self.assertEqual("900", self.sample("video", "0.5"))
+        self.assertEqual("5000", self.sample("video", "0.95"))
 
-    def test_the_tail_is_what_a_mean_would_hide(self):
-        """Ninety cache answers and ten real fetches average to 233ms, which
-        looks like neither."""
-        self.calls("video", *([7] * 90 + [2270] * 10))
-        self.assertGreater(int(self.sample("video", "0.95")), 1000)
-        self.assertLess(int(self.sample("video", "0.5")), 100)
+    def test_a_cache_answer_is_not_measured_at_all(self):
+        """The dilution this exists to avoid: ninety of them would drag p95
+        down to a number that says nothing about YouTube."""
+        self.calls("video", "false", *([7] * 90))
+        self.calls("video", "true", *([5000] * 10))
+        self.assertEqual("5000", self.sample("video", "0.5"))
+
+    def test_a_channel_listing_is_measured_because_it_always_goes_out(self):
+        """Invidious does not cache them, so there is no row to have moved."""
+        self.calls("channel_latest", "NULL", 600, 650, 700)
+        self.assertEqual("650", self.sample("channel_latest", "0.5"))
 
     def test_each_sort_is_measured_separately(self):
-        self.calls("video", 2270)
-        self.calls("channel_latest", 600)
+        self.calls("video", "true", 2270)
+        self.calls("channel_latest", "NULL", 600)
         self.assertEqual("2270", self.sample("video", "0.5"))
         self.assertEqual("600", self.sample("channel_latest", "0.5"))
 
     def test_a_sort_that_never_leaves_the_machine_is_not_measured(self):
-        self.calls("playlist_read", 14)
+        self.calls("playlist_read", "NULL", 14)
         self.assertIsNone(self.sample("playlist_read", "0.5"))
 
 

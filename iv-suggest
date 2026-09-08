@@ -657,11 +657,30 @@ def kinds_sql(kinds):
     """Those kinds as a SQL list, so no query spells the taxonomy out again."""
     return ", ".join(lit(kind) for kind in kinds)
 
-# Postgres and this container share a clock, so this covers the rounding of
-# `ms` to whole milliseconds and nothing more. It has to stay small: the cache
-# row can only move DURING the call, so a generous lower bound would reach back
-# into the previous call about the same video -- and in a fill the metadata
-# fetch and the playlist add of one video are a fraction of a second apart.
+
+# The one inference left in the metrics, named here so the gauge and its test
+# read the same words: a channel listing that answered cleanly went out,
+# because Invidious never caches them. A refused one did not, and the fetcher
+# retries three times, so counting it would log three fetches that never were.
+WENT_OUT_SQL = ("(cache_row_moved OR (kind = 'channel_latest' "
+                "AND status = 200 AND coalesce(error,'') = ''))")
+
+# The other side, and clean answers only: a failure deletes the row there was
+# to move, so it must not read as the cache having served the call.
+CACHE_SERVED_SQL = ("cache_row_moved IS FALSE AND status = 200 "
+                    "AND coalesce(error,'') = ''")
+
+# Covers the rounding of `ms` to whole milliseconds and nothing else. It has
+# to stay small: the cache row can only move DURING the call, so a generous
+# lower bound would reach back into the previous call about the same video --
+# and in a fill the metadata fetch and the playlist add of one video are a
+# fraction of a second apart.
+#
+# It is not a clock-difference allowance, because there is no clock difference
+# left to allow for: the flush measures the offset between this process's clock
+# and the database's and shifts every row by it, so `at` and `videos.updated`
+# are on one clock however far apart the two machines are. IV_SUGGEST_DB_HOST
+# is configurable, so they need not be the same machine at all.
 CLOCK_SKEW_MS = 50
 
 # Whether Invidious rewrote this video's cache row while the call was in
@@ -788,12 +807,16 @@ def flush_fetch_log():
         in FETCH_LOG)
     del FETCH_LOG[:]
     try:
-        execute("INSERT INTO suggest.fetches"
+        execute("WITH skew AS (SELECT now() - to_timestamp(%.6f) AS d), "
+                "c AS (SELECT v.at + skew.d AS at, v.account, v.lane, v.job, "
+                "  v.kind, v.target, v.status, v.attempt, v.error, v.ms "
+                "  FROM (VALUES %s) AS v(at,account,lane,job,kind,target,"
+                "  status,attempt,error,ms), skew) "
+                "INSERT INTO suggest.fetches"
                 "(at,account,lane,job,kind,target,status,attempt,error,ms,"
                 "cache_row_moved) SELECT c.at, c.account, c.lane, c.job, "
                 "c.kind, c.target, c.status, c.attempt, c.error, c.ms, %s "
-                "FROM (VALUES %s) AS c(at,account,lane,job,kind,target,"
-                "status,attempt,error,ms);" % (CACHE_ROW_MOVED_SQL, rows))
+                "FROM c;" % (time.time(), rows, CACHE_ROW_MOVED_SQL))
     except Exception as e:
         log("  WARNING: %d logged calls were not written: %r" % (lost, e))
 
@@ -3025,10 +3048,12 @@ def prune(table, dated_by, days):
 # TAUTOLOGY, because `since` is `max(at)` and nothing is newer than the
 # maximum. It reads like a guard and refuses nothing.
 #
-# `updated <= now()` is the span's own upper bound. `now()` is the transaction
-# time, fixed at BEGIN and so before the lock was granted -- without the bound,
-# a refresh that happened while this waited for the lock would be counted here
-# and again in the next sample.
+# `clock_timestamp()` and not `now()`, which is the TRANSACTION time: fixed at
+# BEGIN, before the lock was granted. A transaction that began earlier and won
+# the lock later would stamp a row whose `at` precedes its own `since` -- a
+# negative span. `clock_timestamp()` is read after the wait, so the span is
+# always forwards, and it bounds the count as well, or a refresh during the
+# wait would be counted here and again in the next sample.
 def sample_upstream_fetches():
     """Count the videos Invidious refreshed since the last sample."""
     if not table_exists("suggest.upstream_samples"):
@@ -3036,12 +3061,12 @@ def sample_upstream_fetches():
     execute("BEGIN; "
             "SELECT pg_advisory_xact_lock(hashtext('iv-suggest upstream')); "
             "INSERT INTO suggest.upstream_samples(at, since, videos) "
-            "SELECT now(), w.since, "
+            "SELECT w.taken, w.since, "
             "  (SELECT count(*) FROM videos "
-            "   WHERE updated > w.since AND updated <= now()) "
-            "FROM (SELECT coalesce(max(at), now()) AS since "
-            "      FROM suggest.upstream_samples) w "
-            "ON CONFLICT DO NOTHING; "
+            "   WHERE updated > w.since AND updated <= w.taken) "
+            "FROM (SELECT coalesce(max(at), clock_timestamp()) AS since, "
+            "             clock_timestamp() AS taken "
+            "      FROM suggest.upstream_samples) w; "
             "COMMIT;")
 
 
@@ -3395,9 +3420,13 @@ def upstream_longest_span(window):
                      "'%s';" % window) or 0)]
 
 
+# Only the calls that went out. Percentiled over every call of a kind, this
+# would track the cache hit ratio instead of YouTube: a thousand calls with ten
+# real fetches at 5000ms puts p95 at 7ms, so the warning it exists to give
+# disappears exactly when the cache is warm.
 def latency_samples(window):
-    """p50 and p95 of the call duration per sort, from the calls themselves."""
-    if not column_exists("fetches", "ms"):
+    """p50 and p95 of the duration of the calls that left the machine."""
+    if not column_exists("fetches", "cache_row_moved"):
         return []
     return [('{kind="%s",quantile="%s"}' % (kind, quantile), value)
             for kind, quantile, value in query(
@@ -3405,10 +3434,9 @@ def latency_samples(window):
                 "  round(percentile_disc(q.quantile) WITHIN GROUP "
                 "        (ORDER BY ms))::bigint "
                 "FROM suggest.fetches, (VALUES (0.5), (0.95)) AS q(quantile) "
-                "WHERE ms IS NOT NULL AND kind IN (%s) "
+                "WHERE ms IS NOT NULL AND %s "
                 "  AND at > now() - interval '%s' "
-                "GROUP BY 1, 2 ORDER BY 1, 2;"
-                % (kinds_sql(CAN_REACH_KINDS), window))]
+                "GROUP BY 1, 2 ORDER BY 1, 2;" % (WENT_OUT_SQL, window))]
 
 
 def plays_samples(where):
@@ -3511,18 +3539,18 @@ def _instance_wide_metrics(metric, users):
            "one's move -- and so is a fetch that FAILED, because the error "
            "path deletes the row there was to move. Both undercounts pull the "
            "same way on the worst nights.", "gauge",
-           fetch_samples("at > now() - interval '1 day' AND (cache_row_moved "
-                         "OR (kind = 'channel_latest' AND status = 200 "
-                         "AND coalesce(error,'') = ''))",
+           fetch_samples("at > now() - interval '1 day' AND " + WENT_OUT_SQL,
                          "kind", CAN_REACH_KINDS))
     metric("cache_served_calls_24h",
            "Calls in the last day Invidious answered cleanly from its own "
            "video cache, so they cost nothing upstream. A call that failed is "
            "not one of these, or a night of refused sessions would read as a "
-           "night of perfect cache hits.", "gauge",
-           fetch_samples("cache_row_moved IS FALSE AND status = 200 "
-                         "AND coalesce(error,'') = '' "
-                         "AND at > now() - interval '1 day'",
+           "night of perfect cache hits. It carries the mirror image of "
+           "bot_fetches_24h's undercount: a real fetch whose row-move a later "
+           "call claimed lands here instead, so one lost observation moves "
+           "both gauges the reassuring way.", "gauge",
+           fetch_samples(CACHE_SERVED_SQL +
+                         " AND at > now() - interval '1 day'",
                          "kind", GET_VIDEO_KINDS))
     metric("fetch_ms",
            "How long a call took, by sort. A rising p95 on `video` is YouTube "
