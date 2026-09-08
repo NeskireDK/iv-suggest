@@ -22,7 +22,8 @@ SCOPED = ("suggest.lanes", "suggest.items", "suggest.cooldown",
 
 # Retention is instance-wide, so these go through prune() and lose every
 # account's rows at once. That is right for a log and wrong for lane state.
-PRUNABLE = ("suggest.plays", "suggest.fetches", "suggest.bot_touches")
+PRUNABLE = ("suggest.plays", "suggest.fetches", "suggest.bot_touches",
+            "suggest.upstream_samples")
 
 # The two places a bare table name is right.
 ALLOWED = (
@@ -47,7 +48,8 @@ ALLOWED = (
     # and budgeted for the instance, not per person, so these count everybody --
     # `account` is a column on the table for the SQL that asks per person.
     "SELECT %s, count(*) FROM suggest.fetches WHERE %s GROUP BY 1;",
-    "SELECT status, coalesce(error,''), count(*) FROM "
+    "SELECT status, coalesce(error,''), count(*) FROM ",
+    "SELECT kind, q.quantile, ",
 )
 
 

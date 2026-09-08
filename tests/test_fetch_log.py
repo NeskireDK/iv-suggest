@@ -564,11 +564,13 @@ class TheRetention(unittest.TestCase):
         mod.forget_the_far_past()
         return mod, written
 
-    def test_the_call_log_is_pruned_with_the_others(self):
+    def test_every_log_is_pruned_together(self):
         _, written = self.pruned()
-        tables = [sql.split("FROM ")[1].split(" ")[0] for sql in written]
+        tables = [sql.split("FROM ")[1].split(" ")[0] for sql in written
+                  if sql.startswith("DELETE FROM")]
         self.assertEqual(["suggest.plays", "suggest.fetches",
-                          "suggest.bot_touches"], tables)
+                          "suggest.upstream_samples", "suggest.bot_touches"],
+                         tables)
 
     def test_the_two_logs_share_one_retention_knob(self):
         mod, written = self.pruned()

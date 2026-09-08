@@ -218,40 +218,31 @@ person for the household. It is the only place a request is dated — `suggest.r
 a count per lane per night and nothing finer, so before this table "how many
 requests reached YouTube in that hour, for whom, of what sort" had no answer.
 
-`external` marks the calls that **really left the machine**, decided per call
-from evidence rather than from the sort of call it was. Invidious rewrites
-`videos.updated` only when it actually fetches, so a moved row inside the call's
-own window is proof it went out. Measured on the reference instance: a call
-Invidious answered from its own cache took **6 ms** and left `updated` alone; a
-real fetch took **2270 ms** and rewrote it.
+**The count of what reached YouTube does not come from this table.** It comes
+from `suggest.upstream_samples`, which reads Invidious' own record:
+`videos.updated` is when it last went and got that video, so the rows that moved
+since the previous sample *are* the fetches over that span. The harvest takes a
+sample every half hour — the only job that runs oftener than Invidious deletes a
+row, which is what bounds how long a sample can wait.
 
-That matters because guessing from the kind was badly wrong. `playlist_add`
-reaches `get_video` too, so it *can* go out — but one real night logged **312
-adds against 169 actual fetches**, so counting them all made the headline number
-nearly three times the truth. Deciding per call splits them properly: in a test
-night, 13 adds went out and 8 were answered from cache.
+That count includes **everyone's** fetches, the household's browsing as well as
+this engine's, which is the point: it answers how hard the instance leans on
+YouTube, and that is what the rate limit is about.
 
-Three kinds can reach YouTube at all — `video`, `channel_latest` and
-`playlist_add` — and `CAN_REACH_KINDS` exists only to zero-fill the metric
-labels. A channel listing is always external: Invidious does not cache them, and
-three consecutive calls each took over half a second. The evidence is **ranked**, not simply added up. A cache row that moved inside
-the call's own window proves it went out. A row *older* than the call proves it
-did not, and that outranks the duration — the 6 ms figure was measured at idle,
-and a cache hit under load could cross the ceiling without going anywhere. The
-duration only speaks when no such row survives, which is what a second call
-about the same video creates: the row then holds the later move and the earlier
-real fetch has nothing left to point at.
+The call log records one observation instead of a verdict: `cache_row_moved`,
+true when Invidious rewrote that video's cache row while the call was in flight,
+false when it did not, and NULL for a kind that has no such row. It is
+attributable — which lane and account caused it — and it carries one known
+undercount, because the row holds a single value and two calls about one video
+inside a flush leave only the later one's move. Quote the sampler, attribute
+with the log.
 
-A call that **failed** counts as external only where the failure itself proves
-it: 404, 410 or a 5xx on a video, because Invidious had to ask upstream to
-answer that. A `playlist_add` refused 401, 403 or 404 never reached `get_video`
-at all, so only a 5xx counts there. A **429 is Invidious refusing us**, not
-YouTube refusing Invidious — and `Fetcher.video` retries three times, so
-counting one would log three calls that never happened. And a **status of 0 is
-never proof**: nothing answered, so nothing reached Invidious either.
-
-`ms` holds how long each call took, which is the other cache tell and is worth
-having on its own — it is where retry backoff and a slow night show up.
+An earlier column here tried to be the verdict, ranking the cache row against
+the call duration, a latency ceiling and a per-kind reading of every failure
+status. Eleven review rounds found eleven ways for that to be wrong, all of them
+counting a call that never left the machine. The client cannot see what Invidious
+did downstream; measuring it where it happens is not a refinement of that
+approach but a replacement for it.
 
 Rows are dated from when the call **started**, not when it returned and not
 when it was written. The flush is minutes later, so it cannot supply the time —
@@ -297,17 +288,26 @@ failed write warns rather than raising. A command with no lane loop — `views` 
 the one that makes real numbers of calls — flushes every `FETCH_LOG_BATCH` rows
 instead, so a timeout kill cannot take a whole run's log with it.
 
-Four metrics carry the same numbers into Prometheus for alerting:
-`iv_suggest_external_fetches_24h{kind}`,
-`iv_suggest_cache_served_calls_24h{kind}` — its other side, and clean answers
-only, or a night of refused sessions would read as a night of perfect cache
-hits — `iv_suggest_fetch_failures_24h{class}` and
-`iv_suggest_cache_hit_ratio_24h`.
+Six metrics carry these into Prometheus for alerting:
 
-`fetch_failures_24h` counts failures among every call that *could* have reached
-YouTube, deliberately **not** narrowed to the ones that did: a refused call is
-precisely the one that did not go out, and it is the one worth knowing about. A
-`playlist_add` rate-limited to a 429 would otherwise be invisible.
+- `iv_suggest_upstream_videos_24h` — the headline. Videos Invidious fetched,
+  from its own record, everyone's included.
+- `iv_suggest_upstream_sample_gap_seconds` — how much of the day no sample
+  covers. Without it, a stopped harvest and a quiet night are the same number.
+- `iv_suggest_bot_fetches_24h{kind}` — this engine's share, attributable, and
+  the slight undercount described above.
+- `iv_suggest_cache_served_calls_24h{kind}` — the other side of it. Clean
+  answers only, or a night of refused sessions reads as perfect cache hits.
+- `iv_suggest_fetch_failures_24h{class}` — failures among every call that
+  *could* have reached YouTube, deliberately **not** narrowed to the ones that
+  did: a refused call is precisely the one that did not go out, and it is the
+  one worth knowing about. A `playlist_add` rate-limited to a 429 would
+  otherwise be invisible.
+- `iv_suggest_fetch_ms{kind,quantile}` — p50 and p95. A rising p95 on `video`
+  is YouTube getting slow, which is the warning that arrives *before* it starts
+  refusing; a failure counter says nothing until then. A mean would hide it —
+  ninety cache answers and ten real fetches average to 233 ms, which looks like
+  neither.
 
 `rate_limited` rising means back off. `answered_an_error` is the one worth
 knowing about: Invidious answers **200 with an error in the body** when it cannot

@@ -38,6 +38,7 @@ class Instance:
         self.watermark_sql = ""
         self.served = []
         self.dated = False
+        self.sampled = False
 
     def install(self, mod):
         mod.one = self.one
@@ -75,6 +76,9 @@ class Instance:
             return
         if "suggest.job_runs" in sql:
             self.dated = True
+            return
+        if "suggest.upstream_samples" in sql:
+            self.sampled = True
             return
         self.written.append(sql)
 
@@ -185,6 +189,18 @@ class TheScanWindow(unittest.TestCase):
         self.assertEqual([], inst.marked)
         self.assertTrue(inst.dated)
         self.assertTrue(inst.pruned)
+
+    def test_it_samples_what_invidious_fetched_whether_or_not_anyone_watched(self):
+        """It is the only job that runs oftener than Invidious deletes a cache
+        row, so it is the one that has to carry the sampling."""
+        inst = Instance(opens=[])
+        harvest(inst)
+        self.assertTrue(inst.sampled)
+
+    def test_a_dry_run_samples_nothing(self):
+        inst = Instance(opens=[])
+        harvest(inst, dry_run=True)
+        self.assertFalse(inst.sampled)
 
 
 class ADryRun(unittest.TestCase):

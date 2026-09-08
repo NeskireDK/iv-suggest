@@ -353,27 +353,41 @@ class TheFetchLog(unittest.TestCase):
         self.assertGreater(int(self.value(
             "SELECT count(*) FROM suggest.fetches;") or 0), 0)
 
-    def test_a_call_that_really_left_the_machine_is_marked_external(self):
+    def test_a_video_call_that_moved_the_cache_row_is_recorded_as_such(self):
         self.assertGreater(int(self.value(
-            "SELECT count(*) FROM suggest.fetches WHERE external;") or 0), 0)
+            "SELECT count(*) FROM suggest.fetches WHERE cache_row_moved;")
+            or 0), 0)
 
-    def test_a_call_the_cache_answered_is_not(self):
-        """The stub models Invidious's ten minute staleness rule, so a second
+    def test_a_call_the_cache_answered_is_recorded_as_such(self):
+        """The stub models Invidious' ten minute staleness rule, so a second
         call about one video really does leave `videos.updated` alone."""
         self.assertGreater(int(self.value(
             "SELECT count(*) FROM suggest.fetches "
-            "WHERE NOT external AND kind = 'playlist_add';") or 0), 0)
+            "WHERE cache_row_moved IS FALSE AND kind = 'playlist_add';")
+            or 0), 0)
 
-    def test_no_playlist_read_or_delete_ever_left_the_machine(self):
-        self.assertEqual(0, int(self.value(
-            "SELECT count(*) FROM suggest.fetches WHERE external "
-            "AND kind IN ('playlist_read', 'playlist_write', 'stats');") or 0))
-
-    def test_every_channel_listing_left_the_machine(self):
-        """Invidious does not cache them: three calls in a row all went out."""
+    def test_a_kind_with_no_cache_row_claims_nothing_either_way(self):
+        """A channel listing is not cached and a playlist read never leaves the
+        machine, so neither has a row to observe."""
         self.assertEqual(0, int(self.value(
             "SELECT count(*) FROM suggest.fetches "
-            "WHERE kind = 'channel_latest' AND NOT external;") or 0))
+            "WHERE cache_row_moved IS NOT NULL AND kind NOT IN "
+            "('video','playlist_add');") or 0))
+
+    def test_a_fills_fetch_carries_the_lane_that_wanted_it(self):
+        """Scoped to the fill on purpose. `views` walks a de-duplicated set
+        across every lane, so naming one lane for those would be a lie."""
+        self.assertEqual(0, int(self.value(
+            "SELECT count(*) FROM suggest.fetches WHERE job = 'run' "
+            "AND cache_row_moved AND (lane IS NULL OR lane = '');") or 0))
+
+    def test_the_question_it_exists_for_can_be_asked(self):
+        """Fetches per hour, per account, per sort."""
+        rows = HARNESS["instance"].db.rows(
+            "SELECT date_trunc('hour', at), account, kind, count(*) "
+            "FROM suggest.fetches WHERE cache_row_moved "
+            "GROUP BY 1, 2, 3 ORDER BY 1;")
+        self.assertTrue(rows)
 
     def test_the_time_each_call_took_is_recorded(self):
         self.assertEqual(0, int(self.value(
@@ -392,24 +406,10 @@ class TheFetchLog(unittest.TestCase):
             "SELECT DISTINCT job FROM suggest.fetches;")}
         self.assertEqual({"init", "run"}, jobs)
 
-    def test_a_fills_external_call_carries_the_lane_that_wanted_it(self):
-        """Scoped to the fill on purpose. `views` walks a de-duplicated set
-        across every lane, so naming one lane for those would be a lie."""
-        self.assertEqual(0, int(self.value(
-            "SELECT count(*) FROM suggest.fetches WHERE job = 'run' "
-            "AND external AND (lane IS NULL OR lane = '');") or 0))
-
     def test_every_row_names_the_job_that_made_the_call(self):
         self.assertEqual(0, int(self.value(
             "SELECT count(*) FROM suggest.fetches "
             "WHERE job IS NULL OR job = '';") or 0))
-
-    def test_the_question_it_exists_for_can_be_asked(self):
-        """Requests to YouTube per hour, per account, per sort."""
-        rows = HARNESS["instance"].db.rows(
-            "SELECT date_trunc('hour', at), account, kind, count(*) "
-            "FROM suggest.fetches WHERE external GROUP BY 1, 2, 3 ORDER BY 1;")
-        self.assertTrue(rows)
 
     def test_the_run_rows_carry_the_cache_hits_the_log_only_printed(self):
         self.assertGreater(int(self.value(
