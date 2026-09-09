@@ -51,6 +51,30 @@ defaults:
     jitter: 0.08
     diversity: true
     round_robin_top: true
+    # Upload age. `recency_halflife` above counts hours since a video entered
+    # the lane, so a five year old upload added last night used to take the
+    # full boost. Measured on the live home page before this: median 22 days
+    # and 13 of 54 slots over a year old. 21 days halves the weight, and the
+    # floor is what still lets a genuinely good old video reach the top.
+    published_halflife_days: 21
+    published_floor: 0.15
+    # Hours in the lane again, downwards and on a scale of days. Matched to
+    # stale_after_active_days below: the decay demotes inside the window and
+    # the sweep clears it at the end of it.
+    unwatched_halflife_days: 3
+    unwatched_floor: 0.25
+
+  # Days of use, not calendar days: a fortnight away would empty every lane at
+  # once and cost a whole night of fetches to refill. Three days of watching is
+  # long enough to say the answer was no. `ttl_days` above is still the
+  # calendar backstop under it.
+  stale_after_active_days: 3
+
+  # The recommendation graph mostly answers with old videos, so every lane that
+  # expands through it discounts a candidate by its upload age. A discount, not
+  # a cap: `recommend_max_age_days` is the cap and only `new-for-you` uses it.
+  recommend_age_halflife_days: 21
+  recommend_age_floor: 0.15
 
 lanes:
   - id: suggested
@@ -60,19 +84,6 @@ lanes:
     refresh_per_day: 5          # ~6 day rotation of the whole 30
     sample_pool: 40
     keep_min: 20                # never rotate below this, even on a thin night
-    # Half the front page comes from here, and the recommendation graph mostly
-    # answers with old videos: measured over the live lane, median 22 days and
-    # 13 of home-mix's 54 slots over a year old. 21 days halves a candidate's
-    # sampling weight, so a week old still competes and a year old has to be
-    # good rather than merely recommended. Not a cap: `new-for-you` is the
-    # capped version of this lane and this one still reads the whole graph.
-    recommend_age_halflife_days: 21
-    stale_after_active_days: 3
-    shuffle:
-      published_halflife_days: 21
-      # 3 days, matching stale_after_active_days: the decay does the demoting
-      # inside the window and the sweep finishes the job at the end of it.
-      unwatched_halflife_days: 3
 
   # last_played holds the N most recently PLAYED, so it reads none of the
   # candidate rules: no ttl, no exclude_watched, no per-channel cap. Setting
@@ -85,7 +96,11 @@ lanes:
     fetch_cap: 150              # fills over about 3 nights, then costs nothing
     # 100 videos competing for 10 visible slots churn the top far harder than a
     # 30 lane; a proportionally wider window brings it back to ~3.7/hour.
-    shuffle: {visible: 40}
+    #
+    # Both age decays off. This lane holds what somebody played on purpose, so
+    # an old recording is the content rather than a stale suggestion, and
+    # "still here unwatched" cannot mean anything in a lane of watched videos.
+    shuffle: {visible: 40, published_halflife_days: 0, unwatched_halflife_days: 0}
 
   - id: music-discover
     title: "Music: discover"
@@ -102,6 +117,13 @@ lanes:
     rotate_cooldown_days: 14    # the Music candidate pool is small, recycle sooner
     sample_pool: 30
     keep_min: 20
+    # Upload age off, both ends. This lane's median upload is 2418 days old, so
+    # a 21 day halflife puts the whole lane on the floor: every song equally
+    # discounted is no ranking at all, just jitter. A song is not stale for
+    # being from 1998. Being skipped for three days still counts against it,
+    # which is why the two rules below stay on.
+    recommend_age_halflife_days: 0
+    shuffle: {published_halflife_days: 0}
 
   # Channels watched but never subscribed to. Everything else in this file
   # recycles videos that already existed; this lane reads what those channels
@@ -120,12 +142,6 @@ lanes:
     # listing now takes: at 20 the cap bound mid-lane on a rate-limited night
     # and the lane read about half its channels.
     fetch_cap: 30
-    # No publish decay here: max_age_days 30 plus the 0.93-per-day candidate
-    # score already keep this lane at a 6 day median. Only the ignored ones
-    # need demoting.
-    stale_after_active_days: 3
-    shuffle:
-      unwatched_halflife_days: 3
 
   # The 5 biggest things the subscriptions put out in the last 48 hours. Every
   # other lane excludes subscribed channels; this one is the deliberate
@@ -189,6 +205,10 @@ lanes:
     # underfilled floor without the repeats.
     max_per_channel: 1
     dedupe_songs: false
+    # Supply bound, not demand bound: only 35 of the 75 channels ever stream
+    # and the lane already sits at 9 of 10. Retiring what nobody watched would
+    # empty it with nothing to refill from.
+    stale_after_active_days: 0
 
   # Interest lanes, same shape as music-discover. Playlists only — none of these
   # feed the front page.
