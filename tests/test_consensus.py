@@ -394,7 +394,7 @@ class Redrawing(unittest.TestCase):
                      "shuffle": dict(self.mod.SHUFFLE_DEFAULTS)}, **over)
         self.mod.lane_plid = lambda account, lane_id: "PL_feed"
         self.mod.read_order = lambda plid, lane_id: [
-            [n + 1, vid, "UC", 1.0, 0, 1.0, 1.0, vid]
+            [n + 1, vid, "UC", 1.0, 0, 1.0, 1.0, vid, 1.0]
             for n, vid in enumerate(["a", "b", "c"])]
         self.mod.permute_playlist_index = lambda plid, ordered: None
         self.mod.execute = lambda sql: None

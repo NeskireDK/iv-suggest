@@ -114,13 +114,14 @@ only**. `init` and `run` name any inert key a lane sets:
 | `privacy` | `unlisted` | `unlisted` \| `public` \| `private`. Only `private` breaks `/feed/playlist/<plid>`. **Applied when the playlist is created and never again** — changing a live lane is a database edit |
 | `filter` | `{}` | `{genre: X}` — the only filter key, and `refill` only. One fetch per candidate whose genre is not already cached; the loop gives up after `max(20, room × 3)` checks, which can leave a refill short |
 | **Turnover** | | |
-| `ttl_days` | `14` | drop an unwatched entry older than this. `0` = never |
+| `ttl_days` | `14` | drop an unwatched entry older than this, in calendar days. `0` = never |
+| `stale_after_active_days` | `0` | drop an unwatched entry once this many days **the account actually watched something** have passed since it was added. Days of use, not calendar days, so a fortnight away does not empty the lane. `0` = off, and `ttl_days` is the calendar backstop underneath it. Reads `suggest.plays`, so an account the harvest records no plays for never accrues a day and keeps everything until `ttl_days` |
 | `refresh_per_day` | `0` | retire this many of the oldest every run, whatever the TTL says |
 | `keep_min` | `0` | never let `refresh_per_day` rotate the lane below this many videos |
 | `sample_pool` | `0` | pick from a weighted random draw over the top N candidates instead of the strict top. `0` or `1` = strict, as is any value when `expand: none` |
 | `cooldown_days` | `60` | a dropped video is not offered again for this long |
 | `watched_cooldown_days` | `365` | same, for a video that was dropped because it was watched |
-| `rotate_cooldown_days` | `21` | same, for one dropped by `refresh_per_day` |
+| `rotate_cooldown_days` | `21` | same, for one dropped by `refresh_per_day` or `stale_after_active_days` |
 | **Candidate rules** | | |
 | `exclude_watched` | `true` | drop what this account already watched |
 | `exclude_subscribed` | `true` | drop channels this account subscribes to — their feed already shows them. `false` does not re-admit them under `channel_latest`, which skips subscribed channels when choosing whom to poll |
@@ -138,6 +139,8 @@ Per-`expand` keys, ignored by the other modes:
 |---|---|---|---|
 | `seed` | `{limit: 30}` | `recommended`, `channel_latest`, `none` | see below |
 | `recommend_max_age_days` | `0` | `recommended` | drop a recommendation older than this. `0` = off. Free — `recommendedVideos` carries `published`, as an RFC3339 string derived from its relative "21 hours ago" text, so it is approximate. Fine at day scale |
+| `recommend_age_halflife_days` | `0` | `recommended` | halve a candidate's score per N days since it was uploaded. `0` = off. `recommend_max_age_days` decides what may enter at all; this decides how much of what enters is old, and costs nothing extra for the same reason |
+| `recommend_age_floor` | `0.15` | `recommended` | the discount an ancient recommendation bottoms out at |
 | `max_channels` | `12` | `channel_latest` | channels to poll per run |
 | `max_age_days` | `21` | `channel_latest` | how new an upload must be |
 | `subscription` | see below | `subscription_feed` | see below |
@@ -260,8 +263,9 @@ the page.
 
 #### `shuffle`
 
-The hourly reorder (`iv-suggest shuffle`). Membership is the nightly run's job;
-this only decides what sits at the top. Settable in `defaults` and per lane.
+The hourly reorder (`iv-suggest shuffle`). It decides what sits at the top, and
+may take out a video the viewer has since watched; what comes IN is the nightly
+run's job. Settable in `defaults` and per lane.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -271,6 +275,10 @@ this only decides what sits at the top. Settable in `defaults` and per lane.
 | `fatigue_cap` | `12` | never penalise beyond this many hours |
 | `recency_boost` | `1.0` | extra weight for a freshly added video… |
 | `recency_halflife` | `12.0` | …halving every N hours |
+| `published_halflife_days` | `0` | halve the weight per N days since the video was **uploaded**, so an old upload takes less of the page. `0` = off |
+| `published_floor` | `0.15` | the discount an ancient upload bottoms out at, so a good one can still surface |
+| `unwatched_halflife_days` | `0` | halve the weight per N days the video has sat in the lane unwatched. `0` = off |
+| `unwatched_floor` | `0.25` | the discount a long-ignored video bottoms out at |
 | `jitter` | `0.15` | ± random factor, so equal scores order differently |
 | `diversity` | `true` | no two adjacent videos from one channel |
 | `round_robin_top` | `true` | slot 1 is a rota, not a ranking: only the half of the lane that has waited longest is eligible, so at least half of it leads before any video returns to the top |

@@ -154,6 +154,16 @@ DEFAULTS = {
     # expand: recommended, drop a recommendation older than this. 0 = off, so
     # the existing lanes keep taking the whole graph.
     "recommend_max_age_days": 0,
+    # expand: recommended, halve a candidate's score per N days since it was
+    # uploaded, so an old video competes for a slot instead of owning one.
+    # 0 = off. A cap decides what may enter; this decides how much of it does.
+    "recommend_age_halflife_days": 0,
+    "recommend_age_floor": 0.15,   # the discount an ancient recommendation bottoms out at
+    # Retire an entry nobody watched once this many days the account actually
+    # watched something have passed since it was added. Days of use, not
+    # calendar days, so a fortnight away does not empty the lane. 0 = off, and
+    # `ttl_days` stays the calendar backstop underneath it.
+    "stale_after_active_days": 0,
     # expand: subscription_feed
     "subscription": {"kinds": ["video"], "max_age_hours": 0, "rank": "views"},
     "played_decay": 0.99,     # last_played: score falloff per rank in play order
@@ -343,8 +353,8 @@ BEGIN
 END $$;
 """
 
-# The hourly reorder. Membership is the nightly run's job; this only decides
-# what sits at the top, and it never touches YouTube.
+# The hourly reorder. It decides what sits at the top, and may only take a
+# video OUT -- what comes IN is the nightly run's call. It never touches YouTube.
 # channel_videos.kind, written by the fork's ClassifyChannelVideosJob.
 SUB_KINDS = ("video", "short", "live")
 
@@ -374,6 +384,15 @@ SHUFFLE_DEFAULTS = {
     "fatigue_cap": 12,    # never penalise beyond this many hours
     "recency_boost": 1.0,     # extra weight for a freshly added video...
     "recency_halflife": 12.0,  # ...halving every N hours
+    # Publish age, which `recency_halflife` above is not: that one counts hours
+    # since the video entered the lane, so a five year old upload added last
+    # night takes the full boost. 0 = off.
+    "published_halflife_days": 0,
+    "published_floor": 0.15,
+    # Hours in the lane again, but downwards and on a scale of days: something
+    # on offer for a week and still unwatched has answered the question. 0 = off.
+    "unwatched_halflife_days": 0,
+    "unwatched_floor": 0.25,
     "jitter": 0.15,       # +/- random factor, so equal scores order differently
     "diversity": True,    # no two adjacent videos from one channel
     "round_robin_top": True,  # every video reaches slot 1 before any repeats
@@ -1548,6 +1567,7 @@ def cooldown_days_for(lane, why):
     if why == "blocked":
         return 0
     return {"watched": lane["watched_cooldown_days"],
+            "unwatched": lane["rotate_cooldown_days"],
             "rotated": lane["rotate_cooldown_days"]}.get(why, lane["cooldown_days"])
 
 
@@ -1639,7 +1659,19 @@ def adopted_item_state(lane_id, current, dry):
     return added_at, added_ts, item_score
 
 
-def why_it_leaves(v, lane, run, added_at, ttl_cutoff):
+def date_this_many_active_days_ago(active_days):
+    """The date `active_days` days of watching back, or "" when there have not been that many.
+    An entry added before it has been on offer through that many days somebody used."""
+    if not active_days:
+        return ""
+    return one("SELECT to_char(min(d),'YYYY-MM-DD') FROM (SELECT DISTINCT played::date AS d "
+               "FROM suggest.plays WHERE account=%s AND outcome=%s "
+               "ORDER BY d DESC LIMIT %d) recent "
+               "HAVING count(*) = %d;"
+               % (acct(), lit(WATCHED), int(active_days), int(active_days)))
+
+
+def why_it_leaves(v, lane, run, added_at, ttl_cutoff, stale_cutoff=""):
     """Why this entry leaves the lane tonight, or None to keep it.
     Blocked is tested first: it is the one reason that carries no cooldown."""
     if v.get("authorId") in run.blocked:
@@ -1648,6 +1680,8 @@ def why_it_leaves(v, lane, run, added_at, ttl_cutoff):
         return "watched"
     if ttl_cutoff and added_at.get(v["videoId"], "9999") < ttl_cutoff:
         return "expired"
+    if stale_cutoff and added_at.get(v["videoId"], "9999") < stale_cutoff:
+        return "unwatched"
     return None
 
 
@@ -1667,10 +1701,11 @@ def sweep_lane(lane, current, plid, run):
     added_at, added_ts, item_score = adopted_item_state(lane_id, current, run.dry)
     ttl = lane["ttl_days"]
     old = one("SELECT to_char(now() - interval '%d days','YYYY-MM-DD');" % ttl) if ttl else ""
+    stale = date_this_many_active_days_ago(lane["stale_after_active_days"])
 
     drop, keep = [], []
     for v in current:
-        why = why_it_leaves(v, lane, run, added_at, old)
+        why = why_it_leaves(v, lane, run, added_at, old, stale)
         (drop if why else keep).append((v, why))
 
     retire = oldest_survivors(keep, lane, added_ts, item_score)
@@ -1726,6 +1761,27 @@ def pick_seeds(lane, run):
     return seeds, seed_free
 
 
+# What a listing entry with no `published` is treated as being. Every lane on
+# this instance gets a real date on 100% of rows, so this only decides what a
+# malformed answer costs: old enough to be discounted, not old enough to drop.
+AGE_OF_A_LISTING_WITH_NO_DATE = 30.0
+
+
+def soft_decay(units, halflife, floor):
+    """A multiplier halving every `halflife` units, bottoming out at `floor`. 1.0 when halflife is 0."""
+    if not halflife:
+        return 1.0
+    return floor + (1.0 - floor) * 0.5 ** (max(0.0, units) / float(halflife))
+
+
+def days_since_upload(rec):
+    """A listing entry's age in days, or the no-date stand-in when it carries none."""
+    published = parse_published(rec)
+    if not published:
+        return AGE_OF_A_LISTING_WITH_NO_DATE
+    return max(0.0, (time.time() - published) / 86400.0)
+
+
 def is_too_old(rec, cutoff):
     """Whether a listing entry predates the cutoff. Free: a listing carries `published`."""
     if not cutoff:
@@ -1768,7 +1824,9 @@ def expand_by_recommendation(lane, seeds, room, run):
                 continue
             if is_too_old(rec, rec_cutoff):
                 continue
-            scores[rid] = scores.get(rid, 0.0) + weight
+            scores[rid] = scores.get(rid, 0.0) + weight * soft_decay(
+                days_since_upload(rec), lane["recommend_age_halflife_days"],
+                lane["recommend_age_floor"])
             meta_seen.setdefault(rid, listing_meta(rec))
     return scores, meta_seen
 
@@ -1801,7 +1859,7 @@ def expand_by_channel_uploads(lane, seeds, room, run):
             published = parse_published(rec)
             if published and published < cutoff:
                 continue
-            age = max(0.0, (time.time() - published) / 86400.0) if published else 30.0
+            age = days_since_upload(rec)
             scores[rid] = max(scores.get(rid, 0.0), watched_times * (0.93 ** age))
             meta_seen.setdefault(rid, listing_meta(rec))
     return scores, meta_seen
@@ -2670,7 +2728,8 @@ def read_order(plid, lane_id):
         "coalesce(i.top_hours,0), "
         "extract(epoch FROM (now() - coalesce(i.added, now())))/3600.0, "
         "extract(epoch FROM (now() - coalesce(i.last_top, "
-        "'1970-01-01'::timestamptz)))/3600.0, coalesce(pv.title,'') "
+        "'1970-01-01'::timestamptz)))/3600.0, coalesce(pv.title,''), "
+        "extract(epoch FROM (now() - pv.published))/86400.0 "
         "FROM playlists p "
         "CROSS JOIN LATERAL unnest(p.\"index\") WITH ORDINALITY AS u(idx, ord) "
         "JOIN playlist_videos pv ON pv.plid = p.id AND pv.\"index\" = u.idx "
@@ -2679,10 +2738,81 @@ def read_order(plid, lane_id):
         "WHERE p.id = %s ORDER BY u.ord;" % (acct(), lit(lane_id), lit(plid)))
 
 
+# The policies whose playlists mean one viewer's `exclude_watched`. last_played
+# holds what somebody played on purpose, and a consensus lane is compiled for a
+# logged out visitor, so neither has a watch history the hourly sweep could read.
+WATCH_FILTERED_POLICIES = ("refill", "mix")
+
+
+def sweeps_the_watched(lane):
+    """Whether the hourly reorder may drop a watched video out of this lane."""
+    return (lane["policy"] in WATCH_FILTERED_POLICIES
+            and lane["exclude_watched"])
+
+
+def watched_still_offered(plid):
+    """The videos this account has watched that the playlist still holds. Costs no API call."""
+    return {r[0] for r in query(
+        "SELECT pv.id FROM playlists p "
+        "CROSS JOIN LATERAL unnest(p.\"index\") AS u(idx) "
+        "JOIN playlist_videos pv ON pv.plid = p.id AND pv.\"index\" = u.idx "
+        "JOIN users viewer ON viewer.email = %s "
+        "WHERE p.id = %s AND pv.id = ANY(viewer.watched);"
+        % (acct(), lit(plid)))}
+
+
+def forget_a_watched_entry(lane, plid, video):
+    """Drop one watched video, with the bookkeeping its lane's policy keeps.
+    A mix lane writes no items row, so it has none to delete and no cooldown to honour."""
+    if lane["policy"] in COMPILED_POLICIES:
+        bot_api("DELETE", "/api/v1/auth/playlists/%s/videos/%s"
+                % (plid, video["indexId"]))
+        return
+    retire_item(lane["id"], plid, video,
+                cooldown_days_for(lane, "watched"), "watched")
+
+
+def drop_the_watched(lane, plid, dry):
+    """Take out what the viewer has already watched, so a play clears the lane within the hour.
+    Removal only: the nightly run still owns what comes IN. Free until something must go."""
+    if not sweeps_the_watched(lane):
+        return 0
+    gone = watched_still_offered(plid)
+    if not gone:
+        return 0
+    if dry:
+        log("lane %-16s would drop %d watched" % (lane["id"], len(gone)))
+        return len(gone)
+    playlist = bot_api("GET", "/api/v1/auth/playlists/" + plid)
+    dropped = 0
+    for video in (playlist.get("videos") or []):
+        if video["videoId"] not in gone:
+            continue
+        log("lane %-16s - watched  %s"
+            % (lane["id"], (video.get("title") or video["videoId"])[:52]))
+        forget_a_watched_entry(lane, plid, video)
+        dropped += 1
+    return dropped
+
+
+def item_to_rank(row):
+    """One `read_order` row as the dict `rank_items` reads."""
+    idx, vid, ucid, score, top_hours, age_h, since_top_h, title, pub_days = row
+    return {"idx": int(idx), "vid": vid, "ucid": ucid, "title": title,
+            "score": max(float(score), 0.01), "top": int(top_hours),
+            "age": float(age_h), "since_top": float(since_top_h),
+            "published_days": AGE_OF_A_LISTING_WITH_NO_DATE if pub_days in (None, "")
+            else float(pub_days)}
+
+
 def display_score(it, cfg):
-    """One item's display weight: its score discounted by fatigue, lifted by recency."""
+    """One item's display weight: its score lifted by arrival, discounted by fatigue and both ages."""
     s = it["score"] * (cfg["fatigue"] ** min(it["top"], cfg["fatigue_cap"]))
     s *= 1.0 + cfg["recency_boost"] * (0.5 ** (it["age"] / cfg["recency_halflife"]))
+    s *= soft_decay(it["published_days"], cfg["published_halflife_days"],
+                    cfg["published_floor"])
+    s *= soft_decay(it["age"] / 24.0, cfg["unwatched_halflife_days"],
+                    cfg["unwatched_floor"])
     if cfg["jitter"]:
         s *= random.uniform(1.0 - cfg["jitter"], 1.0 + cfg["jitter"])
     return s
@@ -2710,7 +2840,7 @@ def spread_channels(ordered):
 
 def rank_items(items, cfg):
     """The display order for one lane. Pure: same input, same distribution.
-    Each item needs score, plus top, age and since_top, all counted in hours."""
+    Each item needs score, top, age and since_top in hours, and published_days in days."""
     for it in items:
         it["display"] = display_score(it, cfg)
     ordered = sorted(items, key=lambda it: -it["display"])
@@ -2728,7 +2858,7 @@ def source_current_order(src, orders):
 
 def restrict_to_present(sources, items):
     """Cut every source down to the videos this playlist already holds.
-    A shuffle may only permute; membership stays the nightly run's call."""
+    A shuffle may only shrink a lane; what comes in stays the nightly run's call."""
     present = {it["vid"] for it in items}
     for s in sources:
         s["vids"] = [vid for vid in s["order"] if vid in present]
@@ -2808,16 +2938,13 @@ def shuffle_lane(lane, orders, dry):
     if not plid:
         log("lane %-16s no playlist yet, skipped" % lane_id)
         return None
+    drop_the_watched(lane, plid, dry)
     rows = read_order(plid, lane_id)
     if len(rows) < 3:
         log("lane %-16s %d videos, too few to reorder" % (lane_id, len(rows)))
         return [r[1] for r in rows]
 
-    items = []
-    for idx, vid, ucid, score, top_hours, age_h, since_top_h, title in rows:
-        items.append({"idx": int(idx), "vid": vid, "ucid": ucid, "title": title,
-                      "score": max(float(score), 0.01), "top": int(top_hours),
-                      "age": float(age_h), "since_top": float(since_top_h)})
+    items = [item_to_rank(row) for row in rows]
     before = [it["vid"] for it in items]
 
     if lane["policy"] in COMPILED_POLICIES:
@@ -2844,7 +2971,8 @@ def shuffle_lane(lane, orders, dry):
 
 
 def cmd_shuffle(args):
-    """Reorder every lane. Database only: no API call, no YouTube fetch."""
+    """Reorder every lane, dropping first what the viewer has watched since the nightly run.
+    Costs no YouTube fetch, and no API call at all on the hours nothing needs dropping."""
     for_job("shuffle")
     announce_the_build()
     all_lanes = load_config()
@@ -2855,7 +2983,7 @@ def cmd_shuffle(args):
 
 
 def shuffle_account(user, all_lanes, args):
-    use_account(user["email"])
+    serve_account(user["email"])
     lanes = enrolled_lanes(user, all_lanes)
     if args.lane:
         lanes = [l for l in lanes if l["id"] == args.lane]
@@ -3657,7 +3785,7 @@ def main():
     h.add_argument("--dry-run", action="store_true")
     sub.add_parser("sid-check",
                    help="did each account's login survive the nightly restart")
-    s = sub.add_parser("shuffle", help="reorder the lanes; database only, no fetches")
+    s = sub.add_parser("shuffle", help="reorder the lanes and drop the watched; no fetches")
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--lane")
     s.add_argument("--account", help="reorder only this account")
