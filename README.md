@@ -35,7 +35,7 @@ have watched since last night:
 
 | `policy` | Behaviour |
 |---|---|
-| `refill` | score candidates, top the lane up to `size`, retire the stale |
+| `refill` | score candidates, top the lane up to `size`, retire the stale — or, with `displace_when_full`, grow into `size` and then let each new video displace the lowest standing one |
 | `last_played` | hold the N most recently *played* videos of a genre |
 | `mix` | interleave other lanes — or other accounts' lanes — by share of output |
 | `consensus` | one feed compiled from every account's mix, weighted by how many of them hold a video and redrawn every hour |

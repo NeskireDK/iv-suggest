@@ -119,10 +119,12 @@ only**. `init` and `run` name any inert key a lane sets:
 | `stale_after_active_days` | `0` | drop an unwatched entry once this many days **the account actually watched something** have passed since it was added. Days of use, not calendar days, so a fortnight away does not empty the lane. `0` = off, and `ttl_days` is the calendar backstop underneath it. Reads `suggest.plays`, so an account the harvest records no plays for never accrues a day and keeps everything until `ttl_days` |
 | `refresh_per_day` | `0` | retire this many of the oldest every run, whatever the TTL says |
 | `keep_min` | `0` | never let `refresh_per_day` rotate the lane below this many videos |
+| `grow_per_day` | `0` | most videos one run may add. `0` = fill every empty slot at once. What lets a lane have a big `size` without a night that tries to reach it |
+| `displace_when_full` | `false` | turnover as displacement instead of expiry: retire nothing on a clock, let the lane grow into `size`, then let each new video take the place of the lowest **standing** one — its stored score at the same two decays `display_score` applies, minus the fatigue and jitter that mean only this hour. Refused with `grow_per_day: 0`, which would fill the lane once and freeze it |
 | `sample_pool` | `0` | pick from a weighted random draw over the top N candidates instead of the strict top. `0` or `1` = strict, as is any value when `expand: none` |
 | `cooldown_days` | `60` | a dropped video is not offered again for this long |
 | `watched_cooldown_days` | `365` | same, for a video that was dropped because it was watched |
-| `rotate_cooldown_days` | `21` | same, for one dropped by `refresh_per_day` or `stale_after_active_days` |
+| `rotate_cooldown_days` | `21` | same, for one dropped by `refresh_per_day`, `stale_after_active_days` or `displace_when_full` |
 | **Candidate rules** | | |
 | `exclude_watched` | `true` | drop what this account already watched |
 | `exclude_subscribed` | `true` | drop channels this account subscribes to — their feed already shows them. `false` does not re-admit them under `channel_latest`, which skips subscribed channels when choosing whom to poll |

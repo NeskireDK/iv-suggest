@@ -113,17 +113,26 @@ lanes:
     min_seconds: 60
     max_seconds: 900            # drops the one hour "mega hits" compilations
     max_per_channel: 2
-    refresh_per_day: 4
     rotate_cooldown_days: 14    # the Music candidate pool is small, recycle sooner
     sample_pool: 30
-    keep_min: 20
+    # A library rather than a rota. Nothing is retired for going unplayed, and
+    # nothing is retired at all until the lane is full; after that each new
+    # song takes the place of the lowest standing one. 6 a night reaches 100
+    # in about a fortnight, which is what "bigger, but do not fill it in a day"
+    # comes to. The in-lane decay is what decides who is at the bottom.
+    size: 100
+    grow_per_day: 6
+    displace_when_full: true
+    refresh_per_day: 0
+    stale_after_active_days: 0
     # Upload age off, both ends. This lane's median upload is 2418 days old, so
     # a 21 day halflife puts the whole lane on the floor: every song equally
     # discounted is no ranking at all, just jitter. A song is not stale for
-    # being from 1998. Being skipped for three days still counts against it,
-    # which is why the two rules below stay on.
+    # being from 1998.
     recommend_age_halflife_days: 0
-    shuffle: {published_halflife_days: 0}
+    # 100 videos competing for 10 visible slots churn the top far harder than a
+    # 30 lane, so the window widens with the lane, as music-watched's does.
+    shuffle: {published_halflife_days: 0, visible: 40}
 
   # Channels watched but never subscribed to. Everything else in this file
   # recycles videos that already existed; this lane reads what those channels
@@ -210,8 +219,9 @@ lanes:
     # empty it with nothing to refill from.
     stale_after_active_days: 0
 
-  # Interest lanes, same shape as music-discover. Playlists only — none of these
-  # feed the front page.
+  # Interest lanes, same shape as music-discover: they grow into `size` and
+  # then each new video displaces the lowest standing one, rather than anything
+  # being retired on a clock. Playlists only — none of these feed the front page.
   #
   # shuffle_window 700: the most recent 700 history entries are fully
   # genre-cached, so seeding costs zero fetches.
@@ -224,10 +234,12 @@ lanes:
     expand: recommended
     filter: {genre: "Gaming"}
     size: 20
-    refresh_per_day: 4
     sample_pool: 30
-    keep_min: 12
     fetch_cap: 60
+    grow_per_day: 4
+    displace_when_full: true
+    refresh_per_day: 0
+    stale_after_active_days: 0
 
   - id: autos
     title: "Cars"
@@ -235,10 +247,12 @@ lanes:
     expand: recommended
     filter: {genre: "Autos & Vehicles"}
     size: 20
-    refresh_per_day: 4
     sample_pool: 30
-    keep_min: 12
     fetch_cap: 60
+    grow_per_day: 4
+    displace_when_full: true
+    refresh_per_day: 0
+    stale_after_active_days: 0
 
   - id: sci-tech
     title: "Science & tech"
@@ -246,10 +260,12 @@ lanes:
     expand: recommended
     filter: {genre: "Science & Technology"}
     size: 20
-    refresh_per_day: 4
     sample_pool: 30
-    keep_min: 12
     fetch_cap: 60
+    grow_per_day: 4
+    displace_when_full: true
+    refresh_per_day: 0
+    stale_after_active_days: 0
 
   # One person's whole front page, and the source `popular` compiles from.
   # Spec: ~10% music, the rest recommendation driven.

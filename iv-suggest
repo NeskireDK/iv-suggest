@@ -151,6 +151,11 @@ DEFAULTS = {
     "refresh_per_day": 0,     # retire this many of the oldest entries every run
     "rotate_cooldown_days": 21,
     "keep_min": 0,            # never rotate the lane below this many videos
+    "grow_per_day": 0,        # most a run may add. 0 = fill every empty slot at once
+    # Retire nothing on a clock: let the lane grow into `size`, then let each
+    # new video displace the worst one already there. `grow_per_day` is the
+    # rate, and the decays are what put a video at the bottom to be displaced.
+    "displace_when_full": False,
     "min_watched": 0,         # skip this lane for an account with less history
     "sample_pool": 0,         # weighted random pick over the top N candidates
     "max_channels": 12,       # expand: channel_latest, channels per run
@@ -1262,10 +1267,20 @@ def load_config():
         lane = merge_lane(defaults, raw)
         refuse_a_lane_key_that_cannot_mean_what_it_must(
             "lane %r in %s" % (lane.get("id"), CONFIG), lane)
+        refuse_a_lane_that_can_never_turn_over(lane)
         lane["ignored"] = ignored_keys(lane["policy"], raw)
         lanes.append(lane)
     _CONFIG_CACHE["lanes"] = lanes
     return lanes
+
+
+def refuse_a_lane_that_can_never_turn_over(lane):
+    """Exit on a displacing lane with no growth rate: it would fill once and then freeze.
+    `grow_per_day` is the only thing that opens a slot once `displace_when_full` is on."""
+    if lane["displace_when_full"] and not lane["grow_per_day"]:
+        raise Aborted("lane %r sets displace_when_full with grow_per_day 0, so "
+                      "nothing would ever displace anything: give it a rate"
+                      % lane.get("id"))
 
 
 def warn_ignored_keys(lanes):
@@ -1645,6 +1660,7 @@ def cooldown_days_for(lane, why):
         return 0
     return {"watched": lane["watched_cooldown_days"],
             "unwatched": lane["rotate_cooldown_days"],
+            "displaced": lane["rotate_cooldown_days"],
             "rotated": lane["rotate_cooldown_days"]}.get(why, lane["cooldown_days"])
 
 
@@ -1772,6 +1788,56 @@ def oldest_survivors(keep, lane, added_ts, item_score):
     return {vw[0]["videoId"] for vw in stale[:rotate]}
 
 
+def upload_age_in(plid):
+    """Upload age in days for every video the playlist holds, over SQL and free."""
+    return {r[0]: (AGE_OF_A_LISTING_WITH_NO_DATE if r[1] in (None, "")
+                   else max(0.0, float(r[1])))
+            for r in query("SELECT id, extract(epoch FROM (now() - published))/86400.0 "
+                           "FROM playlist_videos WHERE plid = %s;" % lit(plid))}
+
+
+def standing_score(stored, days_in_lane, days_since_upload, cfg):
+    """What an entry is worth now: its score at the discount the display already applies.
+    The two decays of `display_score`, without the fatigue and jitter that mean only this hour."""
+    return (stored
+            * soft_decay(days_since_upload, cfg["published_halflife_days"],
+                         cfg["published_floor"])
+            * soft_decay(days_in_lane, cfg["unwatched_halflife_days"],
+                         cfg["unwatched_floor"]))
+
+
+def lowest_standing(keep, lane, added_ts, item_score, upload_days):
+    """The ids a full lane gives up so better ones can take their place, worst first.
+    A lane below `size` gives up nothing: it grows into its size rather than churning."""
+    room_wanted = lane["grow_per_day"]
+    if len(keep) < lane["size"] or room_wanted <= 0:
+        return set()
+    now, cfg = time.time(), lane["shuffle"]
+
+    def standing(vw):
+        vid = vw[0]["videoId"]
+        return standing_score(
+            item_score.get(vid, 0.0),
+            max(0.0, (now - added_ts.get(vid, now)) / 86400.0),
+            upload_days.get(vid, AGE_OF_A_LISTING_WITH_NO_DATE), cfg)
+
+    return {vw[0]["videoId"] for vw in sorted(keep, key=standing)[:room_wanted]}
+
+
+def what_this_run_gives_up(keep, lane, plid, added_ts, item_score):
+    """Which entries leave to make room, and the word for why they did."""
+    if lane["displace_when_full"]:
+        return lowest_standing(keep, lane, added_ts, item_score,
+                               upload_age_in(plid)), "displaced"
+    return oldest_survivors(keep, lane, added_ts, item_score), "rotated"
+
+
+def room_for_new(lane, keep):
+    """Slots this run may fill: what the lane is short, capped by how fast it may grow."""
+    short = lane["size"] - len(keep)
+    return min(short, lane["grow_per_day"]) if lane["grow_per_day"] else short
+
+
 def sweep_lane(lane, current, plid, run):
     """What leaves the lane tonight, what stays, and the room that opens up."""
     lane_id = lane["id"]
@@ -1785,16 +1851,16 @@ def sweep_lane(lane, current, plid, run):
         why = why_it_leaves(v, lane, run, added_at, old, stale)
         (drop if why else keep).append((v, why))
 
-    retire = oldest_survivors(keep, lane, added_ts, item_score)
+    retire, gave_up = what_this_run_gives_up(keep, lane, plid, added_ts, item_score)
     if retire:
-        drop.extend((v, "rotated") for v, _ in keep if v["videoId"] in retire)
+        drop.extend((v, gave_up) for v, _ in keep if v["videoId"] in retire)
         keep = [vw for vw in keep if vw[0]["videoId"] not in retire]
 
     for v, why in drop:
         log("  - %-9s %s" % (why, v["title"][:60]))
         if not run.dry:
             retire_item(lane_id, plid, v, cooldown_days_for(lane, why), why)
-    room = lane["size"] - len(keep)
+    room = room_for_new(lane, keep)
     log("  swept %d, kept %d, room for %d" % (len(drop), len(keep), room))
     return drop, keep, room
 
