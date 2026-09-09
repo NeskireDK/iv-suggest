@@ -117,8 +117,9 @@ cannot regress the status quo.
 - **The hourly redraw is fully fresh.** No fatigue counter, no memory of what
   was on screen last hour. A compiled lane writes no `suggest.items` row, so
   there is nowhere to age a counter anyway, and there is no one viewer to
-  disorient. Membership still changes only nightly: the reorder permutes, which
-  is the same division `mix` already lives under.
+  disorient. Membership still changes only nightly: with no viewer there is no
+  watch history to sweep, so for a consensus lane the reorder is a pure
+  permutation.
 
 Two things the spec left ambiguous, resolved the same way:
 

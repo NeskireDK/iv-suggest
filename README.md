@@ -30,11 +30,12 @@ One playlist plus the rules that fill it. A new genre is a new block in
     sample_pool: 30
 ```
 
-Four policies, plus an hourly reorder that costs no fetches:
+Four policies, plus an hourly reorder that costs no fetches and drops what you
+have watched since last night:
 
 | `policy` | Behaviour |
 |---|---|
-| `refill` | score candidates, top the lane up to `size`, retire the stale |
+| `refill` | score candidates, top the lane up to `size`, retire the stale — or, with `displace_when_full`, grow into `size` and then let each new video displace the lowest standing one |
 | `last_played` | hold the N most recently *played* videos of a genre |
 | `mix` | interleave other lanes — or other accounts' lanes — by share of output |
 | `consensus` | one feed compiled from every account's mix, weighted by how many of them hold a video and redrawn every hour |
@@ -124,7 +125,7 @@ iv-suggest init [--all-users]                     schema, sessions, playlists
 iv-suggest run [--dry-run] [--lane ID]            fill the lanes
            [--account EMAIL]
            [--seeds N] [--rate N] [--budget N]
-iv-suggest shuffle [--dry-run] [--lane ID]        reorder only, no fetches
+iv-suggest shuffle [--dry-run] [--lane ID]        reorder + drop watched, no fetches
            [--account EMAIL]
 iv-suggest status [--account EMAIL]               lane sizes and recent runs
 iv-suggest dedupe [--dry-run] [--account EMAIL]   one upload per song
@@ -420,10 +421,13 @@ the age window *is* the turnover.
 size 20 filled to 3 on a 75-channel instance, because only 35 of those channels
 ever stream.
 
-**The hourly shuffle is a permutation, nothing else.** `playlists.index` *is* the
-display order in Invidious — the feed reads `ORDER BY array_position(index, ...)`
-on every request — so reordering a lane is one SQL `UPDATE` on a `bigint[]`: no
-delete, no re-add, no API call, and the client-visible `indexId` in
+**The hourly shuffle may shrink a lane, never grow one.** It drops what the
+viewer has watched since the nightly run, then permutes the rest; a watched
+video used to sit on the page until 03:30. The permutation itself is free.
+`playlists.index` *is* the display order in Invidious — the feed reads
+`ORDER BY array_position(index, ...)` on every request — so reordering a lane is
+one SQL `UPDATE` on a `bigint[]`: no delete, no re-add, no API call, and the
+client-visible `indexId` in
 `playlist_videos.index` never moves. It is race-safe against the nightly run
 because it permutes whatever the array holds at write time, so a video added
 between the read and the write sorts last and survives. The ranking discounts

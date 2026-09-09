@@ -333,10 +333,20 @@ class WhoMints(unittest.TestCase):
     def test_the_pure_readers_mint_nothing(self):
         minters = callers_of(self.source, "open_session")
         self.assertIn("serve_account", minters)
-        for reader in ("cmd_status", "cmd_metrics", "cmd_shuffle",
-                       "cmd_sid_check", "recorded_sessions",
-                       "shuffle_account", "status_account", "use_account"):
+        for reader in ("cmd_status", "cmd_metrics", "cmd_sid_check",
+                       "recorded_sessions", "status_account", "use_account"):
             self.assertNotIn(reader, minters)
+
+    def test_the_shuffle_mints_because_it_now_retires_the_watched(self):
+        """It was a pure reader until it started dropping what somebody watched.
+
+        The reorder itself is still one SQL UPDATE. The DELETE that takes a
+        watched video out of the playlist is an API call, so the account has to
+        be served rather than merely pointed at.
+        """
+        minters = callers_of(self.source, "open_session")
+        self.assertIn("shuffle_account", minters)
+        self.assertIn("drop_the_watched", callers_of(self.source, "api"))
 
     def test_the_transport_is_only_reached_through_bot_api(self):
         """`bot_api` records that this engine, not a viewer, refreshed a video's
