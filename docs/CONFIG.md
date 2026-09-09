@@ -284,4 +284,5 @@ run's job. Settable in `defaults` and per lane.
 | `unwatched_floor` | `0.25` | the discount a long-ignored video bottoms out at |
 | `jitter` | `0.15` | ± random factor, so equal scores order differently |
 | `diversity` | `true` | no two adjacent videos from one channel |
+| `rank_order` | `""` | `""` \| `score` \| `published`. Hold the lane in one fixed order instead of reordering it. For a lane whose point *is* a rank — biggest first, newest first — the weighted ranking destroys it: the stored score falls 1% per rank while fatigue alone takes 34%. A hold is not `enabled: false`: the lane is still swept for watched videos and still reports an order to a mix that sources it |
 | `round_robin_top` | `true` | slot 1 is a rota, not a ranking: only the half of the lane that has waited longest is eligible, so at least half of it leads before any video returns to the top |

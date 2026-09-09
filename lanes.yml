@@ -168,6 +168,10 @@ lanes:
     cooldown_days: 7
     rotate_cooldown_days: 3
     dedupe_songs: false
+    # "Biggest" is the whole lane. Held rather than reordered, because the
+    # stored score falls 1% per rank while fatigue alone takes 34%, so an hour
+    # of the weighted ranking leaves the feed rank meaning nothing.
+    shuffle: {rank_order: score}
 
   # The recommendation graph restricted to the last fortnight. `suggested` takes
   # the whole graph and mostly returns older videos. NOT a home-mix source.
@@ -195,6 +199,7 @@ lanes:
     min_seconds: 0              # the whole point of this lane
     max_per_channel: 3
     dedupe_songs: false
+    shuffle: {rank_order: score}   # ranked by views; same reasoning as subs-top48
 
   # Live streams, newest first rather than biggest: a stream is worth seeing
   # because it is on or just finished, not because it is popular.
@@ -218,10 +223,21 @@ lanes:
     # and the lane already sits at 9 of 10. Retiring what nobody watched would
     # empty it with nothing to refill from.
     stale_after_active_days: 0
+    # By date, not by stored score: this lane accumulates over a 30 day window,
+    # so each night's arrivals are scored against that night's ranking and
+    # collide with the last one's. Measured before this: slot 1 held 08-27 and
+    # slot 2 held 09-03, in a lane whose one job is newest first.
+    shuffle: {rank_order: published}
 
   # Interest lanes, same shape as music-discover: they grow into `size` and
   # then each new video displaces the lowest standing one, rather than anything
   # being retired on a clock. Playlists only — none of these feed the front page.
+  #
+  # 60, not music-discover's 100: the genre cache holds 325 Gaming, 201 Science
+  # & Technology and 192 Autos videos, and a lane may only take what is left
+  # after watched, subscribed and the other lanes have had theirs. 60 at
+  # max_per_channel 2 needs 30 distinct channels; the thinnest of the three has
+  # 112. Raising it again is one number once the cache has grown.
   #
   # shuffle_window 700: the most recent 700 history entries are fully
   # genre-cached, so seeding costs zero fetches.
@@ -233,10 +249,10 @@ lanes:
     seed: {limit: 15, scan: 300, genre: "Gaming", shuffle_window: 700}
     expand: recommended
     filter: {genre: "Gaming"}
-    size: 20
+    size: 60
     sample_pool: 30
     fetch_cap: 60
-    grow_per_day: 4
+    grow_per_day: 6
     displace_when_full: true
     refresh_per_day: 0
     stale_after_active_days: 0
@@ -246,10 +262,10 @@ lanes:
     seed: {limit: 15, scan: 300, genre: "Autos & Vehicles", shuffle_window: 700}
     expand: recommended
     filter: {genre: "Autos & Vehicles"}
-    size: 20
+    size: 60
     sample_pool: 30
     fetch_cap: 60
-    grow_per_day: 4
+    grow_per_day: 6
     displace_when_full: true
     refresh_per_day: 0
     stale_after_active_days: 0
@@ -259,10 +275,10 @@ lanes:
     seed: {limit: 15, scan: 300, genre: "Science & Technology", shuffle_window: 700}
     expand: recommended
     filter: {genre: "Science & Technology"}
-    size: 20
+    size: 60
     sample_pool: 30
     fetch_cap: 60
-    grow_per_day: 4
+    grow_per_day: 6
     displace_when_full: true
     refresh_per_day: 0
     stale_after_active_days: 0
