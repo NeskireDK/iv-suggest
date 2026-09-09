@@ -478,6 +478,11 @@ SHUFFLE_DEFAULTS = {
     "jitter": 0.15,       # +/- random factor, so equal scores order differently
     "diversity": True,    # no two adjacent videos from one channel
     "round_robin_top": True,  # every video reaches slot 1 before any repeats
+    # Hold one fixed order instead of reordering at all. "" = the weighted
+    # ranking above. A lane whose whole point is a rank -- biggest first,
+    # newest first -- wants this: fatigue alone cuts 34% against a score
+    # gradient of 1% per rank, so the rank does not survive the day otherwise.
+    "rank_order": "",     # "" | "score" | "published"
 }
 
 
@@ -1275,12 +1280,16 @@ def load_config():
 
 
 def refuse_a_lane_that_can_never_turn_over(lane):
-    """Exit on a displacing lane with no growth rate: it would fill once and then freeze.
-    `grow_per_day` is the only thing that opens a slot once `displace_when_full` is on."""
+    """Exit on a lane whose settings would run without doing what they say."""
     if lane["displace_when_full"] and not lane["grow_per_day"]:
         raise Aborted("lane %r sets displace_when_full with grow_per_day 0, so "
                       "nothing would ever displace anything: give it a rate"
                       % lane.get("id"))
+    held = lane["shuffle"]["rank_order"]
+    if held and held not in RANK_ORDERS:
+        raise Aborted("lane %r asks to be held in shuffle.rank_order %r, which "
+                      "this engine cannot sort by. The orders are: %s"
+                      % (lane.get("id"), held, ", ".join(sorted(RANK_ORDERS))))
 
 
 def warn_ignored_keys(lanes):
@@ -2981,9 +2990,17 @@ def spread_channels(ordered):
     return out
 
 
+# An order a lane may be held in rather than reordered into. `score` is the rank
+# the nightly run stored, which for a subscription_feed lane is its feed rank.
+RANK_ORDERS = {"score": lambda it: -it["score"],
+               "published": lambda it: it["published_days"]}
+
+
 def rank_items(items, cfg):
     """The display order for one lane. Pure: same input, same distribution.
     Each item needs score, top, age and since_top in hours, and published_days in days."""
+    if cfg["rank_order"]:
+        return sorted(items, key=RANK_ORDERS[cfg["rank_order"]])
     for it in items:
         it["display"] = display_score(it, cfg)
     ordered = sorted(items, key=lambda it: -it["display"])

@@ -182,14 +182,15 @@ class Refusals(unittest.TestCase):
 
     def test_displacing_with_no_rate_is_refused_rather_than_frozen(self):
         lane = dict(self.mod.DEFAULTS, id="frozen", displace_when_full=True,
-                    grow_per_day=0)
+                    grow_per_day=0, shuffle=dict(self.mod.SHUFFLE_DEFAULTS))
         with self.assertRaises(self.mod.Aborted) as caught:
             self.mod.refuse_a_lane_that_can_never_turn_over(lane)
         self.assertIn("frozen", str(caught.exception))
         self.assertIn("grow_per_day", str(caught.exception))
 
     def test_a_rate_without_displacement_is_fine(self):
-        lane = dict(self.mod.DEFAULTS, id="ok", grow_per_day=6)
+        lane = dict(self.mod.DEFAULTS, id="ok", grow_per_day=6,
+                    shuffle=dict(self.mod.SHUFFLE_DEFAULTS))
         self.assertIsNone(self.mod.refuse_a_lane_that_can_never_turn_over(lane))
 
 
