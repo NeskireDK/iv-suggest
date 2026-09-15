@@ -230,7 +230,7 @@ class Rebuilding(unittest.TestCase):
 
     def context(self, watched=(), blocked=(), dry=False):
         return self.mod.LaneRun(list(watched), set(watched), set(), set(blocked),
-                               NoFetcher(), dry, None)
+                               NoFetcher(), dry, None, set())
 
     def compiled(self, watched=(), blocked=(), **over):
         drawn = []

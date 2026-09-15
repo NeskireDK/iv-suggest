@@ -289,7 +289,7 @@ class MixCost(Harnessed):
     def rebuild(self):
         return self.engine.run_lane_mix(self.lane, self.engine.LaneRun(
             list(BOB.watched), set(BOB.watched), set(),
-            self.engine.read_blocked(), None, False, None))
+            self.engine.read_blocked(), None, False, None, set()))
 
     def test_a_mix_costs_no_youtube_fetch(self):
         mark = self.instance.api.since()

@@ -132,7 +132,7 @@ class CandidateAge(unittest.TestCase):
             def video(self, vid):
                 return {"recommendedVideos": recs}
 
-        run = self.mod.LaneRun([], set(), set(), set(), Fetcher(), True, None)
+        run = self.mod.LaneRun([], set(), set(), set(), Fetcher(), True, None, set())
         scores, _ = self.mod.expand_by_recommendation(lane, ["seed0000001"], 10, run)
         return scores
 

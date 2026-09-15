@@ -117,9 +117,9 @@ class PerViewer(unittest.TestCase):
         lane.update(over)
         return lane
 
-    def context(self, watched=(), blocked=(), dry=True):
+    def context(self, watched=(), blocked=(), dry=True, dead=()):
         return self.mod.LaneRun(list(watched), set(watched), set(),
-                                set(blocked), None, dry, None)
+                                set(blocked), None, dry, None, set(dead))
 
     # NB: not called run(); that is TestCase's own entry point.
     def mixed(self, watched=(), blocked=()):

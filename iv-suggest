@@ -964,6 +964,16 @@ def note_bot_touch(vid):
             "ON CONFLICT (vid, at) DO NOTHING;" % lit(vid))
 
 
+def bury_video(dead, vid, days, reason):
+    """Remember a video nothing can fetch or add, so no later run retries it."""
+    dead.add(vid)
+    execute("INSERT INTO suggest.video_dead(vid,until,reason) VALUES "
+            "(%s, now() + interval '%d days', %s) ON CONFLICT (vid) DO "
+            "UPDATE SET until=EXCLUDED.until, reason=EXCLUDED.reason, "
+            "seen=now(), hits=suggest.video_dead.hits+1;"
+            % (lit(vid), days, lit(reason)))
+
+
 def unfetchable_videos():
     """Ids no run should try again, so none re-pays the timeouts they already cost."""
     return {r[0] for r in query(
@@ -1075,12 +1085,7 @@ class Fetcher:
 
     def bury(self, vid, days, reason):
         """Remember a video that cannot be fetched, so no later run retries it."""
-        self.dead.add(vid)
-        execute("INSERT INTO suggest.video_dead(vid,until,reason) VALUES "
-                "(%s, now() + interval '%d days', %s) ON CONFLICT (vid) DO "
-                "UPDATE SET until=EXCLUDED.until, reason=EXCLUDED.reason, "
-                "seen=now(), hits=suggest.video_dead.hits+1;"
-                % (lit(vid), days, lit(reason)))
+        bury_video(self.dead, vid, days, reason)
 
     def channel_latest(self, ucid):
         """Recent uploads of one channel: one fetch for about 60 videos."""
@@ -1667,7 +1672,8 @@ def cooldown_days_for(lane, why):
     """Days a swept video is held out; a blocked channel gets none, so unblocking is instant."""
     if why == "blocked":
         return 0
-    return {"watched": lane["watched_cooldown_days"],
+    return {"dead": 0,
+            "watched": lane["watched_cooldown_days"],
             "unwatched": lane["rotate_cooldown_days"],
             "displaced": lane["rotate_cooldown_days"],
             "rotated": lane["rotate_cooldown_days"]}.get(why, lane["cooldown_days"])
@@ -1716,8 +1722,12 @@ def add_to_lane(lane_id, plid, vid, score, song, fetcher):
     return True
 
 
+# `dead` is the fetcher's own set, shared by reference rather than copied: a
+# video buried partway through a run has to be dead for the lanes that follow
+# it. A compiled lane reads it without ever naming the fetcher, which is the
+# invariant test_the_consensus_run_never_touches_the_fetcher holds it to.
 LaneRun = namedtuple(
-    "LaneRun", "watched watched_set subs blocked fetcher dry seed_override")
+    "LaneRun", "watched watched_set subs blocked fetcher dry seed_override dead")
 
 
 def run_lane(lane, run):
@@ -1778,6 +1788,8 @@ def why_it_leaves(v, lane, run, added_at, ttl_cutoff, stale_cutoff=""):
     Blocked is tested first: it is the one reason that carries no cooldown."""
     if v.get("authorId") in run.blocked:
         return "blocked"
+    if v["videoId"] in run.dead:
+        return "dead"
     if lane["exclude_watched"] and v["videoId"] in run.watched_set:
         return "watched"
     if ttl_cutoff and added_at.get(v["videoId"], "9999") < ttl_cutoff:
@@ -2450,6 +2462,7 @@ def run_lane_mix(lane, run):
                           % (src["lane"], owner))
         return [vid for vid, ucid in playlist_videos(src_plid)
                 if ucid not in run.blocked
+                and vid not in run.dead
                 and not (lane["exclude_watched"] and vid in run.watched_set)]
 
     sources = []
@@ -2484,10 +2497,29 @@ def rebuild_playlist(lane, desired, run):
         return len(current), len(desired), 0, 0
     for v in (playlist.get("videos") or []):
         bot_api("DELETE", "/api/v1/auth/playlists/%s/videos/%s" % (plid, v["indexId"]))
-    for vid in desired:
+    landed = [vid for vid in desired if added_to_the_rebuild(plid, vid, run)]
+    log("  rebuilt: %d videos (was %d)" % (len(landed), len(current)))
+    return len(current), len(landed), 0, 0
+
+
+def added_to_the_rebuild(plid, vid, run):
+    """Put one video back into a rebuilt playlist. False when Invidious refused it.
+    Refusals cannot raise: the deletes have run, so a lane would publish half of itself."""
+    try:
         bot_api("POST", "/api/v1/auth/playlists/%s/videos" % plid, {"videoId": vid})
-    log("  rebuilt: %d videos (was %d)" % (len(desired), len(current)))
-    return len(current), len(desired), 0, 0
+        return True
+    except urllib.error.HTTPError as e:
+        log("    add refused (%s), leaving %s out of this rebuild" % (e, vid))
+        bury_video(run.dead, vid, DAYS_BEFORE_RETRYING_A_BROKEN_VIDEO,
+                   "playlist add %s" % e.code)
+        forget_a_dead_video_everywhere(vid)
+        return False
+
+
+def forget_a_dead_video_everywhere(vid):
+    """Drop a video no playlist can hold from every lane's state, for every account.
+    Left in one source lane it is re-offered to the next rebuild, and to whoever opens it."""
+    execute("DELETE FROM suggest.items WHERE vid=%s;" % lit(vid))
 
 
 def consensus_config(lane):
@@ -2507,8 +2539,8 @@ def consensus_source_mixes(cfg):
     return mixes
 
 
-def consensus_mixes(cfg, blocked):
-    """Every source mix that exists, its videos in display order, blocked channels dropped."""
+def consensus_mixes(cfg, blocked, dead):
+    """Every source mix that exists, in display order, minus blocked channels and dead videos."""
     mixes = []
     for src in consensus_source_mixes(cfg):
         owner = src["user"] or ACCOUNT
@@ -2519,7 +2551,7 @@ def consensus_mixes(cfg, blocked):
             raise Aborted("source lane %r of %s has no playlist yet"
                           % (src["lane"], owner))
         src["vids"] = [vid for vid, ucid in playlist_videos(plid)
-                       if ucid not in blocked]
+                       if ucid not in blocked and vid not in dead]
         mixes.append(src)
     return mixes
 
@@ -2562,7 +2594,7 @@ def run_lane_consensus(lane, run):
     No watch-history filter: nobody watches this lane, so the blocklists are unioned instead."""
     cfg = consensus_config(lane)
     log("\nlane %s  (%s)  policy consensus" % (lane["id"], lane["title"]))
-    mixes = consensus_mixes(cfg, household_blocked())
+    mixes = consensus_mixes(cfg, household_blocked(), run.dead)
     if not mixes:
         raise Aborted("no source mix of %r exists yet" % lane["id"])
     weights = consensus_weights(mixes, cfg)
@@ -2711,7 +2743,7 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
             log("\naccount %s: no lane %r" % (ACCOUNT, args.lane))
             return 0
     run = LaneRun(watched, set(watched), subs, read_blocked(), fetcher,
-                  args.dry_run, seed_override)
+                  args.dry_run, seed_override, fetcher.dead)
     log_account_header(lanes, run)
     if held_back:
         log("held back until there is more history: %s" % ", ".join(held_back))

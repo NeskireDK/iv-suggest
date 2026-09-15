@@ -48,7 +48,7 @@ class WhyItLeaves(unittest.TestCase):
     def setUp(self):
         self.mod = load(IV_SUGGEST_ACCOUNT=ME)
         self.run = self.mod.LaneRun([], {"seen0000001"}, set(), {"UCblocked"},
-                                    None, True, None)
+                                    None, True, None, set())
         self.lane = dict(self.mod.DEFAULTS)
         self.added = {"old00000001": "2026-09-01", "new00000001": "2026-09-08"}
 

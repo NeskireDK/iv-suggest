@@ -50,6 +50,10 @@ ALLOWED = (
     "SELECT %s, count(*) FROM suggest.fetches WHERE %s GROUP BY 1;",
     "SELECT status, coalesce(error,''), count(*) FROM ",
     "SELECT kind, q.quantile, ",
+    # A video the uploader removed is gone for everybody. Scoping this would
+    # leave every other account still offering it, and their next compiled
+    # rebuild failing on the add the way this one just did.
+    "DELETE FROM suggest.items WHERE vid=",
 )
 
 
