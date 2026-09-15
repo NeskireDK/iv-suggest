@@ -69,7 +69,7 @@ def feed_now(instance):
 
 def source_mixes(engine):
     """The home-mixes the engine itself reads, straight off the database."""
-    return engine.consensus_mixes(engine.consensus_config({}), {})
+    return engine.consensus_mixes(engine.consensus_config({}), {}, set())
 
 
 def redraw_the_feed_hourly(instance):

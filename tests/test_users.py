@@ -215,6 +215,7 @@ class Spent:
     fetches = 320
     lane_cache_hits = 0
     lane_lookups = 0
+    dead = frozenset()
 
 
 class Args:

@@ -275,7 +275,8 @@ class LaneCase(unittest.TestCase):
     def context(self, watched=(), subs=(), blocked=None, dry=False,
                 seed_override=None):
         return self.mod.LaneRun(list(watched), set(watched), set(subs),
-                                blocked or {}, self.fetch, dry, seed_override)
+                                blocked or {}, self.fetch, dry, seed_override,
+                                self.fetch.dead)
 
     def fill(self, lane, watched=(), subs=(), blocked=None, dry=False,
              seed_override=None, db=None, api=None, fetch=None):
