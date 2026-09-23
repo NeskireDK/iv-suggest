@@ -180,6 +180,31 @@ with no trace anywhere; the shipped one runs twice an hour. It exits 1 when the
 history API refused an open — 409 is the account's own `watch_history`
 preference being off.
 
+**That half can only ever speak for one account, and it misses plays.** A
+metadata refresh carries no identity, so `mark_watched` posts history for
+`IV_SUGGEST_ACCOUNT` and nobody else — and a refresh does not happen at all for
+a video fetched in the last ten minutes, so playing through a page or a playlist
+hides every play after the first. Measured on one instance, 113 of the last 500
+`users.watched` entries had no play row.
+
+So the harvest has a second half, which runs after the first and reads
+`users.watched` itself. That array is per account and holds every play any
+history-writing client reported, in last-played order and with no clock; the
+harvest records where it ended in `suggest.watch_marks` and dates the growth on
+the next look. **Forward-only by construction** — a first look records the mark
+and claims nothing behind it, because there are no dates back there to invent.
+
+Position, not set difference: Invidious does
+`array_append(array_remove(watched, id), id)`, so a re-watch moves its id to the
+end, and that move *is* a play. A play the first half already recorded within
+the hour is left alone, since marking a video watched is itself what appends it
+to this array.
+
+Play rows carry the channel (`ucid`) denormalised at harvest, so affinity work
+does not depend on the metadata cache still holding the video, and they are kept
+for `PLAY_RETENTION_DAYS` rather than the `LOG_RETENTION_DAYS` the call logs
+share: plays are the only dated record of what somebody watched, not a log.
+
 Four series follow it. `iv_suggest_plays_judged_24h{outcome=}` and
 `iv_suggest_plays_logged{outcome=}` split every open into `watched`, `bot` or
 `refused`; a rising `bot` share against a flat `watched` count is the separation

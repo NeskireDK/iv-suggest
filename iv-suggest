@@ -267,6 +267,18 @@ CREATE TABLE IF NOT EXISTS suggest.host_events (
 CREATE TABLE IF NOT EXISTS suggest.plays (
   vid text, played timestamptz, account text, outcome text, why text,
   PRIMARY KEY (vid, played));
+-- Denormalised at harvest rather than joined to video_meta at read time, so a
+-- play stays answerable about its channel however the metadata cache is swept.
+ALTER TABLE suggest.plays ADD COLUMN IF NOT EXISTS ucid text;
+-- Where each account's users.watched ended when the harvest last looked.
+-- An anonymous playback carries no identity, so the half of the harvest that
+-- infers a play from a metadata refresh can only ever speak for one account.
+-- This array is the one per-account trace there is -- and it holds no dates, so
+-- the harvest has to date its growth itself. Forward-only by construction:
+-- a first look records the mark and claims nothing behind it.
+CREATE TABLE IF NOT EXISTS suggest.watch_marks (
+  account text PRIMARY KEY, last_vid text, watched_len int,
+  seen timestamptz DEFAULT now());
 -- When this bot last made Invidious refresh a video's cache row, which is the
 -- same write a person's playback causes. Written at the one choke point every
 -- call goes through, so a new call site cannot quietly start looking like a
@@ -334,14 +346,17 @@ ALTER TABLE suggest.items    ADD COLUMN IF NOT EXISTS account text;
 ALTER TABLE suggest.cooldown ADD COLUMN IF NOT EXISTS account text;
 ALTER TABLE suggest.runs     ADD COLUMN IF NOT EXISTS account text;
 ALTER TABLE suggest.shuffles ADD COLUMN IF NOT EXISTS account text;
+ALTER TABLE suggest.plays    ADD COLUMN IF NOT EXISTS account text;
 UPDATE suggest.lanes    SET account = __ACCOUNT__ WHERE account IS NULL;
 UPDATE suggest.items    SET account = __ACCOUNT__ WHERE account IS NULL;
 UPDATE suggest.cooldown SET account = __ACCOUNT__ WHERE account IS NULL;
 UPDATE suggest.runs     SET account = __ACCOUNT__ WHERE account IS NULL;
 UPDATE suggest.shuffles SET account = __ACCOUNT__ WHERE account IS NULL;
+UPDATE suggest.plays    SET account = __ACCOUNT__ WHERE account IS NULL;
 ALTER TABLE suggest.lanes    ALTER COLUMN account SET NOT NULL;
 ALTER TABLE suggest.items    ALTER COLUMN account SET NOT NULL;
 ALTER TABLE suggest.cooldown ALTER COLUMN account SET NOT NULL;
+ALTER TABLE suggest.plays    ALTER COLUMN account SET NOT NULL;
 DO $$
 DECLARE
   t text;
@@ -349,7 +364,8 @@ DECLARE
 BEGIN
   FOR t, keys IN VALUES ('lanes', 'account, lane'),
                         ('items', 'account, lane, vid'),
-                        ('cooldown', 'account, lane, vid')
+                        ('cooldown', 'account, lane, vid'),
+                        ('plays', 'account, vid, played')
   LOOP
     -- Only rebuild a primary key that does not already carry `account`, so a
     -- second `init` is free instead of another index rebuild.
@@ -376,7 +392,7 @@ END $$;
 READABLE_BY_DASHBOARD = (
     "bot_touches", "cooldown", "fetches", "host_events", "items", "job_runs",
     "lanes", "plays", "runs", "shuffles", "upstream_samples", "video_dead",
-    "video_meta")
+    "video_meta", "watch_marks")
 
 # Withheld on purpose, and named rather than merely left out: a table absent
 # from both lists is a table nobody has decided about, and test_dashboard_reads
@@ -3274,8 +3290,14 @@ PLAY_HARVEST = "play-harvest"
 
 # Long enough to answer "did it mark that one?" or "what did that week cost?"
 # months later, short enough that these stay logs rather than a second watch
-# history. One knob for both, so the two cannot drift apart.
+# history. One knob for all of them, so they cannot drift apart.
 LOG_RETENTION_DAYS = 180
+
+# Plays are not one of those logs. They are the only dated record of what
+# somebody watched -- `users.watched` holds order and no clock -- and the
+# affinity work reads a year of them, so they outlive the logs on purpose. At
+# this instance's rate a year is ~20 MB.
+PLAY_RETENTION_DAYS = 365
 
 # What became of one open. Stored rather than derived from the reason text,
 # because these are what the metrics are grouped by and a reason is prose.
@@ -3283,6 +3305,7 @@ WATCHED, BOT, REFUSED = "watched", "bot", "refused"
 PLAY_OUTCOMES = (WATCHED, BOT, REFUSED)
 
 BOT_FETCHED_IT = "the bot fetched it, not a person"
+SEEN_IN_HISTORY = "appeared in users.watched"
 
 NIGHTLY_RECREATE = "nightly-recreate"
 # A boundary older than this cannot be evidence of anything: every session
@@ -3373,9 +3396,11 @@ def mark_watched(vid):
 
 def record_judged_open(vid, when, outcome, why):
     """Remember this open was judged, so the watermark moves past it either way."""
-    execute("INSERT INTO suggest.plays(vid, played, account, outcome, why) "
-            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (vid, played) DO NOTHING;"
-            % (lit(vid), lit(when), acct(), lit(outcome), lit(why)))
+    execute("INSERT INTO suggest.plays(vid, played, account, outcome, why, ucid) "
+            "SELECT %s, %s, %s, %s, %s, "
+            "(SELECT author_id FROM suggest.video_meta WHERE vid = %s) "
+            "ON CONFLICT (account, vid, played) DO NOTHING;"
+            % (lit(vid), lit(when), acct(), lit(outcome), lit(why), lit(vid)))
 
 
 # The harvest carries this for the fetch log as well as its own tables: it is
@@ -3383,7 +3408,7 @@ def record_judged_open(vid, when, outcome, why):
 # bounds without a second timer to forget about.
 def forget_the_far_past():
     """Drop what neither a later harvest nor a later question can use."""
-    prune("suggest.plays", "played", LOG_RETENTION_DAYS)
+    prune("suggest.plays", "played", PLAY_RETENTION_DAYS)
     prune("suggest.fetches", "at", LOG_RETENTION_DAYS)
     prune("suggest.upstream_samples", "at", LOG_RETENTION_DAYS)
     prune("suggest.bot_touches", "at", BOT_TOUCH_LOG_DAYS)
@@ -3468,6 +3493,93 @@ def judge_one_open(vid, by_the_bot, dry):
     return WATCHED, ""
 
 
+# The other half of the harvest, and the only half that can speak for more than
+# one account. `mark_watched` infers a play from Invidious refreshing its own
+# metadata cache, which carries no identity and misses any play of a video
+# fetched within VIDEO_CACHE_LIFETIME -- measured on this instance, 113 of the
+# last 500 watch-history entries had no play row. `users.watched` has every one
+# of them and no clock, so dating its growth is what fills both gaps.
+def watched_array(email):
+    """One account's users.watched, oldest first."""
+    row = query("SELECT array_to_string(watched,' ') FROM users WHERE email=%s;"
+                % lit(email))
+    return row[0][0].split() if row and row[0][0] else []
+
+
+def watch_mark(email):
+    """(last vid seen, how long the array was), or None if never looked at."""
+    row = query("SELECT coalesce(last_vid,''), coalesce(watched_len,0) "
+                "FROM suggest.watch_marks WHERE account=%s;" % lit(email))
+    return (row[0][0], int(row[0][1])) if row else None
+
+
+def note_watch_mark(email, watched):
+    execute("INSERT INTO suggest.watch_marks(account,last_vid,watched_len,seen) "
+            "VALUES (%s,%s,%d,now()) ON CONFLICT (account) DO UPDATE SET "
+            "last_vid = EXCLUDED.last_vid, watched_len = EXCLUDED.watched_len, "
+            "seen = now();"
+            % (lit(email), lit(watched[-1] if watched else ""), len(watched)))
+
+
+def played_since_the_mark(watched, mark):
+    """The entries appended since the mark. By position, not set difference:
+    Invidious moves a re-watched id to the end, and that move IS a play."""
+    last_vid, watched_len = mark
+    if last_vid and last_vid in watched:
+        return watched[watched.index(last_vid) + 1:]
+    return watched[watched_len:]
+
+
+# The metadata-refresh half writes its own row for PRIMARY and then marks the
+# video watched, which appends it to the very array this half reads. The guard
+# is what stops one play being recorded twice.
+ALREADY_RECORDED_MINUTES = 60
+
+
+def record_a_play(email, vid):
+    """Date one entry of users.watched as a play, unless it is already recorded."""
+    execute("INSERT INTO suggest.plays(vid, played, account, outcome, why, ucid) "
+            "SELECT %s, now(), %s, %s, %s, "
+            "(SELECT author_id FROM suggest.video_meta WHERE vid = %s) "
+            "WHERE NOT EXISTS (SELECT 1 FROM suggest.plays p WHERE p.account = %s "
+            "AND p.vid = %s AND p.played > now() - interval '%d minutes');"
+            % (lit(vid), lit(email), lit(WATCHED), lit(SEEN_IN_HISTORY),
+               lit(vid), lit(email), lit(vid), ALREADY_RECORDED_MINUTES))
+
+
+def harvest_one_watched_array(email, dry):
+    """Date what this account's watch history gained since the last look. Returns how many."""
+    watched = watched_array(email)
+    mark = watch_mark(email)
+    if mark is None:
+        if not dry:
+            note_watch_mark(email, watched)
+        log("  %-28s first look, marked at %d entries" % (email, len(watched)))
+        return 0
+    played = played_since_the_mark(watched, mark)
+    if not dry:
+        for vid in played:
+            record_a_play(email, vid)
+        note_watch_mark(email, watched)
+    log("  %-28s %d played%s" % (email, len(played),
+                                 " (dry run, nothing written)" if dry else ""))
+    return len(played)
+
+
+def accounts_with_a_session():
+    """Every account this bot serves. Read from the database, not the config:
+    a timer that runs every quarter hour should not depend on parsing lanes.yml."""
+    return [row[0] for row in query(
+        "SELECT account FROM suggest.accounts ORDER BY account;")]
+
+
+def harvest_every_watched_array(dry):
+    """Date every served account's watch history, including those the API half cannot see.
+    Runs after that half, never before: marking a video watched appends it to this array."""
+    return sum(harvest_one_watched_array(email, dry)
+               for email in accounts_with_a_session())
+
+
 def cmd_harvest_plays(args):
     """Mark as watched what somebody opened, because Yattee reports no play."""
     for_job("harvest-plays")
@@ -3480,15 +3592,17 @@ def cmd_harvest_plays(args):
     looked = one("SELECT now()::text;")
     opens = unjudged_opens(plays_watermark())
     tally = judge_every_open(opens, args.dry_run)
+    dated = harvest_every_watched_array(args.dry_run)
     if not args.dry_run:
         note_job_run(PLAY_HARVEST, looked)
         forget_the_far_past()
     if not opens:
-        log("nothing opened since the last harvest")
+        log("nothing opened since the last harvest, %d dated from watch history"
+            % dated)
         return 0
     log("%d opened, %d marked watched, %d were this bot's own writes, "
-        "%d refused%s"
-        % (len(opens), tally[WATCHED], tally[BOT], tally[REFUSED],
+        "%d refused, %d dated from watch history%s"
+        % (len(opens), tally[WATCHED], tally[BOT], tally[REFUSED], dated,
            " (dry run, nothing written)" if args.dry_run else ""))
     if tally[REFUSED]:
         log("a refusal is Invidious declining to record it. 409 is the "
