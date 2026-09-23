@@ -1,8 +1,8 @@
 [Unit]
-Description=Hourly reorder of the suggestion lanes
+Description=Reorder the suggestion lanes every quarter hour
 
 [Timer]
-OnCalendar=hourly
+OnCalendar=*:00/15
 RandomizedDelaySec=120
 Persistent=false
 

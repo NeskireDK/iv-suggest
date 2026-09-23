@@ -30,7 +30,7 @@ One playlist plus the rules that fill it. A new genre is a new block in
     sample_pool: 30
 ```
 
-Four policies, plus an hourly reorder that costs no fetches and drops what you
+Four policies, plus a reorder that costs no fetches and drops what you
 have watched since last night:
 
 | `policy` | Behaviour |
@@ -421,7 +421,7 @@ the age window *is* the turnover.
 size 20 filled to 3 on a 75-channel instance, because only 35 of those channels
 ever stream.
 
-**The hourly shuffle may shrink a lane, never grow one.** It drops what the
+**The shuffle may shrink a lane, never grow one.** It drops what the
 viewer has watched since the nightly run, then permutes the rest; a watched
 video used to sit on the page until 03:30. The permutation itself is free.
 `playlists.index` *is* the display order in Invidious — the feed reads
