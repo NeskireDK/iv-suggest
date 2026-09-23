@@ -58,7 +58,7 @@ are served **least-recently-succeeded first**, so an exhausted budget does not
 starve the same person every night. The shared mix costs nothing, so a light
 account stays close to free.
 
-One timer, one hourly shuffle, both looping internally. No per-account units.
+One timer, one shuffle, both looping internally. No per-account units.
 
 ## Decisions taken, not left open
 
@@ -99,7 +99,7 @@ One timer, one hourly shuffle, both looping internally. No per-account units.
   governs newly created playlists.
 - **The first timer-driven full `run` has not happened on this code.** The
   2026-08-31 fill was a manual foreground run straight after the deploy; only the
-  hourly shuffle has run from a timer since.
+  shuffle has run from a timer since.
 - **A session is minted per account by whoever calls the API.** There are two
   entry points and the difference is the whole safety property:
 

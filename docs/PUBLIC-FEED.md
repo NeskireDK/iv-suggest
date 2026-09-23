@@ -45,15 +45,15 @@ Reading `home-mix` rather than the raw lanes also means the per-account taste
 filtering has already happened once. The compiled feed is a merge of opinions,
 not a merge of catalogues.
 
-### Cadence: hourly, and random within the hour
+### Cadence: every reorder, and random each time
 
 The membership question and the ordering question separate the same way they
 already do for a normal lane: the nightly run decides what is eligible, the
-hourly reorder decides what sits at the top. Here both are cheap, because a
+reorder decides what sits at the top. Here both are cheap, because a
 `home-mix` is already in the database — so the whole rebuild rides the existing
 `iv-suggest-shuffle.timer` and costs **zero fetches**, exactly as `mix` does.
 
-Random every hour, not deterministic-best every hour: a strict score ordering
+Random on every reorder, not deterministic-best: a strict score ordering
 would pin the same dozen videos to the top of a public playlist for as long as
 those mixes hold them. The random draw is what makes the feed feel alive to a
 visitor who opens it twice in a day. So the score sets each video's *weight in a
@@ -73,7 +73,7 @@ argue with:
 
 With one account enrolled and any history, every weight collapses to the single
 mix's `1 / (rank + k)` and the feed degrades to "that account's home mix,
-shuffled hourly" — which is what the instance shows today, so the first version
+reshuffled on every reorder" — which is what the instance shows today, so the first version
 cannot regress the status quo.
 
 ### The rest, unchanged from the sketch
@@ -114,8 +114,8 @@ cannot regress the status quo.
 - **The sample size is the lane's own `size`.** No new key: `size` already means
   "videos the lane holds", and a second name for it would be one more thing to
   keep in step. The live value is a config change, not a code one.
-- **The hourly redraw is fully fresh.** No fatigue counter, no memory of what
-  was on screen last hour. A compiled lane writes no `suggest.items` row, so
+- **The redraw is fully fresh.** No fatigue counter, no memory of what
+  was on screen before it. A compiled lane writes no `suggest.items` row, so
   there is nowhere to age a counter anyway, and there is no one viewer to
   disorient. Membership still changes only nightly: with no viewer there is no
   watch history to sweep, so for a consensus lane the reorder is a pure
@@ -125,7 +125,7 @@ Two things the spec left ambiguous, resolved the same way:
 
 - "Redrawn every hour" and "the nightly run decides what is eligible" pull in
   different directions once the pool is bigger than the lane. Membership is
-  nightly and the **order** is hourly, because the hourly reorder can only
+  nightly and the **order** moves on every reorder, because a reorder can only
   permute a playlist without spending upstream writes on it, and because a
   visitor opening the feed twice in a day sees a different top either way.
 - A source naming an account that has no such lane still aborts the lane, as it
