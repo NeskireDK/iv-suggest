@@ -159,6 +159,15 @@ class Migration(RealPostgres, unittest.TestCase):
         self.assertEqual("PRIMARY KEY (account, lane, vid)", keys["suggest.items"])
         self.assertEqual("PRIMARY KEY (account, lane, vid)", keys["suggest.cooldown"])
 
+    def test_the_fatigue_counter_is_widened_to_fractional_hours(self):
+        """An int column truncates a sub-hour gap to 0, so a 15 minute shuffle
+        would never tire anything. LEGACY_SQL still declares it int on purpose."""
+        self.migrate()
+        self.assertEqual(["double precision"], self.psql(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_schema='suggest' AND table_name='items' "
+            "AND column_name='top_hours';"))
+
     def test_metadata_cache_stays_global(self):
         """Scoping it per account would multiply the YouTube fetch bill."""
         self.migrate()

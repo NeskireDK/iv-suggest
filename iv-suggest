@@ -225,7 +225,11 @@ ALTER TABLE suggest.video_meta ADD COLUMN IF NOT EXISTS views bigint;
 CREATE TABLE IF NOT EXISTS suggest.video_dead (
   vid text PRIMARY KEY, until timestamptz, reason text,
   seen timestamptz DEFAULT now(), hits int DEFAULT 1);
-ALTER TABLE suggest.items ADD COLUMN IF NOT EXISTS top_hours int DEFAULT 0;
+ALTER TABLE suggest.items ADD COLUMN IF NOT EXISTS top_hours double precision DEFAULT 0;
+-- It shipped as an int counting shuffle runs, which only equalled hours while
+-- the timer fired hourly. The name was always the intent; this is what makes it
+-- true, and what lets the shuffle interval move without retuning `fatigue`.
+ALTER TABLE suggest.items ALTER COLUMN top_hours TYPE double precision;
 ALTER TABLE suggest.items ADD COLUMN IF NOT EXISTS last_top timestamptz;
 -- false marks a row filled in from a recommendation or channel listing: every
 -- field is real EXCEPT genre, which those listings do not carry. A genre lane
@@ -462,6 +466,8 @@ COMPILED_POLICIES = ("mix", "consensus")
 SHUFFLE_DEFAULTS = {
     "enabled": True,
     "visible": 10,        # slots that count as "on screen" for the fatigue counter
+    # Wall-clock hours, read off the gap between reorders, so the shuffle
+    # interval can move without any of these three meaning something else.
     "fatigue": 0.75,      # score multiplier per hour already spent on screen
     "fatigue_cap": 12,    # never penalise beyond this many hours
     "recency_boost": 1.0,     # extra weight for a freshly added video...
@@ -2983,7 +2989,7 @@ def item_to_rank(row):
     """One `read_order` row as the dict `rank_items` reads."""
     idx, vid, ucid, score, top_hours, age_h, since_top_h, title, pub_days = row
     return {"idx": int(idx), "vid": vid, "ucid": ucid, "title": title,
-            "score": max(float(score), 0.01), "top": int(top_hours),
+            "score": max(float(score), 0.01), "top": float(top_hours),
             "age": float(age_h), "since_top": float(since_top_h),
             "published_days": AGE_OF_A_LISTING_WITH_NO_DATE if pub_days in (None, "")
             else float(pub_days)}
@@ -3107,18 +3113,35 @@ def permute_playlist_index(plid, ordered):
             % (_bigint_array([it["idx"] for it in ordered]), lit(plid)))
 
 
+def _float_literal(value):
+    return "%.6f::double precision" % value
+
+
+def hours_since_the_last_reorder(lane_id):
+    """Wall-clock hours this lane has held the order it is about to lose.
+    Zero on its first reorder and on a backwards clock, so neither can age anything."""
+    held = query("SELECT extract(epoch FROM (now() - max(ran)))/3600.0 "
+                 "FROM suggest.shuffles WHERE account=%s AND lane=%s;"
+                 % (acct(), lit(lane_id)))
+    if not held or held[0][0] in (None, ""):
+        return 0.0
+    return max(float(held[0][0]), 0.0)
+
+
 def age_fatigue(lane_id, cfg, after):
-    """Raise fatigue for what is on screen and lower it for what is not."""
+    """Raise fatigue for what is on screen and lower it for what is not, in hours."""
     visible = _text_array(after[:cfg["visible"]])
+    held = _float_literal(hours_since_the_last_reorder(lane_id))
     execute("UPDATE suggest.items SET top_hours = "
-            "least(coalesce(top_hours,0)+1, %d) "
+            "least(coalesce(top_hours,0)+%s, %s) "
             "WHERE account=%s AND lane=%s AND vid = ANY(%s); "
-            "UPDATE suggest.items SET top_hours = greatest(coalesce(top_hours,0)-1, 0) "
+            "UPDATE suggest.items SET top_hours = greatest(coalesce(top_hours,0)-%s, 0) "
             "WHERE account=%s AND lane=%s AND NOT (vid = ANY(%s)); "
             "UPDATE suggest.items SET last_top = now() "
             "WHERE account=%s AND lane=%s AND vid=%s;"
-            % (cfg["fatigue_cap"], acct(), lit(lane_id), visible,
+            % (held, _float_literal(cfg["fatigue_cap"]),
                acct(), lit(lane_id), visible,
+               held, acct(), lit(lane_id), visible,
                acct(), lit(lane_id), lit(after[0])))
 
 
