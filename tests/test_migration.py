@@ -47,6 +47,9 @@ CREATE TABLE suggest.video_dead (
   seen timestamptz DEFAULT now(), hits int DEFAULT 1);
 CREATE TABLE suggest.shuffles (
   ran timestamptz DEFAULT now(), lane text, videos int, moved int, error text);
+CREATE TABLE suggest.plays (
+  vid text, played timestamptz, account text, outcome text, why text,
+  PRIMARY KEY (vid, played));
 INSERT INTO suggest.lanes(lane,plid,title) VALUES ('suggested','IVPL_a','Suggested');
 INSERT INTO suggest.items(lane,vid,score) VALUES ('suggested','aaaaaaaaaaa',1.5);
 INSERT INTO suggest.cooldown(lane,vid,until,reason)
@@ -54,6 +57,7 @@ INSERT INTO suggest.cooldown(lane,vid,until,reason)
 INSERT INTO suggest.runs(lane,added,removed,kept,fetches)
   VALUES ('suggested',1,0,29,12);
 INSERT INTO suggest.shuffles(lane,videos,moved) VALUES ('suggested',30,7);
+INSERT INTO suggest.plays(vid,played,outcome) VALUES ('aaaaaaaaaaa',now(),'watched');
 INSERT INTO suggest.video_meta(vid,title) VALUES ('aaaaaaaaaaa','a video');
 """
 
@@ -142,7 +146,7 @@ class Migration(RealPostgres, unittest.TestCase):
         self.migrate()
         self.assertEqual(["andre@example.com|suggested|IVPL_a"],
                          self.psql("SELECT account, lane, plid FROM suggest.lanes;"))
-        for table in ("items", "cooldown", "runs", "shuffles"):
+        for table in ("items", "cooldown", "runs", "shuffles", "plays"):
             self.assertEqual(
                 ["1"],
                 self.psql("SELECT count(*) FROM suggest.%s WHERE account=%s;"
@@ -158,6 +162,18 @@ class Migration(RealPostgres, unittest.TestCase):
         self.assertEqual("PRIMARY KEY (account, lane)", keys["suggest.lanes"])
         self.assertEqual("PRIMARY KEY (account, lane, vid)", keys["suggest.items"])
         self.assertEqual("PRIMARY KEY (account, lane, vid)", keys["suggest.cooldown"])
+        self.assertEqual("PRIMARY KEY (account, vid, played)", keys["suggest.plays"])
+
+    def test_two_accounts_can_hold_the_same_play(self):
+        """The old key was global, so a second account could accrue no history."""
+        self.migrate()
+        when = "2026-09-23 12:00:00+00"
+        for who in (ACCOUNT, OTHER):
+            self.psql("INSERT INTO suggest.plays(account,vid,played,outcome) "
+                      "VALUES (%s,'bbbbbbbbbbb','%s','watched');"
+                      % (self.mod.lit(who), when))
+        self.assertEqual(["2"], self.psql(
+            "SELECT count(*) FROM suggest.plays WHERE vid='bbbbbbbbbbb';"))
 
     def test_the_fatigue_counter_is_widened_to_fractional_hours(self):
         """An int column truncates a sub-hour gap to 0, so a 15 minute shuffle

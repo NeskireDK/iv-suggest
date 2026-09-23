@@ -576,11 +576,18 @@ class TheRetention(unittest.TestCase):
                           "suggest.upstream_samples", "suggest.bot_touches"],
                          tables)
 
-    def test_the_two_logs_share_one_retention_knob(self):
+    def test_the_logs_share_one_retention_knob(self):
+        """`fetches` and `upstream_samples` are both call logs; one number for both."""
         mod, written = self.pruned()
         days = "%d days" % mod.LOG_RETENTION_DAYS
-        self.assertIn(days, written[0])
         self.assertIn(days, written[1])
+        self.assertIn(days, written[2])
+
+    def test_plays_outlive_the_logs_on_their_own_knob(self):
+        """They are the only dated record of what somebody watched, not a log of calls."""
+        mod, written = self.pruned()
+        self.assertIn("%d days" % mod.PLAY_RETENTION_DAYS, written[0])
+        self.assertGreater(mod.PLAY_RETENTION_DAYS, mod.LOG_RETENTION_DAYS)
 
     def test_a_table_init_has_not_made_yet_is_left_alone(self):
         """Deploy before `init` would otherwise crash the harvest every half hour."""
