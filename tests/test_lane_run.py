@@ -136,10 +136,12 @@ class Fetch:
     and never makes it fail; BudgetSpent is pinned in test_fetch_budget.py.
     """
 
-    def __init__(self, meta=None, recs=None, channels=None, dead=()):
+    def __init__(self, meta=None, recs=None, channels=None, dead=(),
+                 searches=None):
         self.meta = dict(meta or {})
         self.recs = dict(recs or {})
         self.channels = dict(channels or {})
+        self.searches = dict(searches or {})
         self.dead = set(dead)
         self.budget = 10 ** 6
         self.fetches = 0
@@ -166,6 +168,11 @@ class Fetch:
         self.fetches += 1
         self.lane_used += 1
         return self.channels.get(ucid)
+
+    def search(self, term):
+        self.fetches += 1
+        self.lane_used += 1
+        return self.searches.get(term, [])
 
     def known(self, vid):
         return self.meta.get(vid)

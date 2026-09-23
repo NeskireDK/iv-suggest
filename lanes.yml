@@ -283,6 +283,29 @@ lanes:
     refresh_per_day: 0
     stale_after_active_days: 0
 
+  # A topic the account was not watching a month ago and is now. Small on
+  # purpose: it is a tip-off, not a section, and it answers to whatever is
+  # bursting rather than to a genre anybody chose.
+  #
+  # terms 2 at ~20 results each is 2 fetches a night for the whole lane. The
+  # defaults for min_recent and min_lift are what this instance's own history
+  # wanted: on 2026-09-23 "wow forever" stood at 37 of the last 200 watched
+  # titles against 0 of the 951 before them, and the next distinct topic
+  # ("steam deck", 8 titles) was still well clear of the floor.
+  - id: burst
+    title: "Picking up on"
+    expand: topic_burst
+    size: 8
+    ttl_days: 10
+    max_age_days: 30            # a burst is about now; an old upload is not it
+    max_per_channel: 1          # 8 slots on one topic, so one voice each
+    refresh_per_day: 8          # the whole lane turns over nightly, like the topic
+    keep_min: 0
+    fetch_cap: 4
+    # Nothing is held back for going unwatched: the lane empties itself when the
+    # burst passes, because the terms stop clearing the floor.
+    stale_after_active_days: 0
+
   # One person's whole front page, and the source `popular` compiles from.
   # Spec: ~10% music, the rest recommendation driven.
   #
@@ -300,11 +323,15 @@ lanes:
       # position 8 — just off the first screen on the TV.
       pure: 5
       sources:
-        - {lane: suggested, share: 0.50}
+        - {lane: suggested, share: 0.44}
         - {lane: fresh-uploads, share: 0.30}
         # 0.10 of 54 = 5.4, so about the 5 asked for
         - {lane: subs-top48, share: 0.10}
         - {lane: music-discover, share: 0.10}
+        # 0.06 of 54 = 3.2, the three asked for. Taken from `suggested`, which
+        # supplies its full 30 and can spare them; the other three sources are
+        # already at what they were asked to be.
+        - {lane: burst, share: 0.06}
       # A source may name another account, which makes this the household feed:
       #   - {user: them@example.com, lane: suggested, share: 0.2}
 

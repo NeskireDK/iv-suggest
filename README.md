@@ -40,14 +40,23 @@ have watched since last night:
 | `mix` | interleave other lanes — or other accounts' lanes — by share of output |
 | `consensus` | one feed compiled from every account's mix, weighted by how many of them hold a video and redrawn every hour |
 
-Four ways to find candidates:
+Five ways to find candidates:
 
 | `expand` | Source | Fetch cost |
 |---|---|---|
 | `recommended` | each seed's `recommendedVideos` | 1 per seed |
 | `channel_latest` | recent uploads of channels you watch but never subscribed to | 1 per channel, ~60 videos each |
+| `topic_burst` | a search per topic the account has just started watching | 1 per term, ~20 videos each |
 | `subscription_feed` | the `channel_videos` table over SQL | **zero** |
 | `none` | the seeds themselves, in watch order | zero |
+
+`topic_burst` works out its own terms: it compares the titles already cached for
+the newest slice of the watch history against the slice before it and keeps what
+is frequent now and rare then — so the lane answers to whatever somebody has
+picked up, rather than to a genre anybody chose. On this instance's history it
+found *"wow forever"* at 37 of the last 200 watched titles against 0 of the 951
+before them. The floors, the one-term-per-topic rule and the two ways it can be
+fooled are in [docs/CONFIG.md](docs/CONFIG.md).
 
 Every key of both is in **[docs/CONFIG.md](docs/CONFIG.md)** — the one place
 settings are documented.
