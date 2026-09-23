@@ -35,6 +35,7 @@ import sys
 import time
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import namedtuple
 from datetime import datetime, timezone
@@ -143,7 +144,7 @@ DEFAULTS = {
     "min_seconds": 120,
     "max_seconds": 0,         # 0 = no upper bound; use it to drop compilations
     "seed": {"limit": 30},
-    "expand": "recommended",  # recommended | none | channel_latest | subscription_feed
+    "expand": "recommended",  # recommended | none | channel_latest | topic_burst | subscription_feed
     "filter": {},
     "policy": "refill",       # refill | last_played | mix
     "privacy": "unlisted",    # only "private" breaks /feed/playlist/<plid> (RSS)
@@ -159,7 +160,14 @@ DEFAULTS = {
     "min_watched": 0,         # skip this lane for an account with less history
     "sample_pool": 0,         # weighted random pick over the top N candidates
     "max_channels": 12,       # expand: channel_latest, channels per run
-    "max_age_days": 21,       # expand: channel_latest, how new an upload must be
+    "max_age_days": 21,       # expand: channel_latest and topic_burst, how new an upload must be
+    # expand: topic_burst. A term must be watched `min_recent` times inside the
+    # newest `recent` history entries AND be `min_lift` times commoner there
+    # than in the `baseline` before them. Both, because either alone is noise:
+    # lift on its own promotes a word watched twice, and a raw count promotes
+    # whatever the account always watches.
+    "burst": {"recent": 200, "baseline": 1000, "terms": 2,
+              "min_recent": 3, "min_lift": 20.0},
     # expand: recommended, drop a recommendation older than this. 0 = off, so
     # the existing lanes keep taking the whole graph.
     "recommend_max_age_days": 0,
@@ -1122,6 +1130,32 @@ class Fetcher:
                 delay *= 2
         return None
 
+    def search(self, term):
+        """One page of search results for a term: one fetch for about 20 videos."""
+        self._refuse_when_out_of_budget()
+        delay = 5.0
+        for attempt in range(3):
+            self._pace()
+            try:
+                data = bot_api("GET", "/api/v1/search?q=%s&type=video"
+                               % urllib.parse.quote(term), attempt=attempt)
+                self._spend_one_fetch()
+                self._upstream_answered()
+                return data or []
+            except urllib.error.HTTPError as e:
+                self._spend_one_fetch()
+                if self._only_this_request_is_broken(e):
+                    self._upstream_answered()
+                    log("  skipping search %r (upstream %d)" % (term, e.code))
+                    return []
+                self._trouble(e, delay)
+                delay *= 2
+            except Exception as e:
+                self._spend_one_fetch()
+                self._trouble(e, delay)
+                delay *= 2
+        return []
+
     def _alive(self):
         try:
             return bool(bot_api("GET", "/api/v1/stats"))
@@ -1239,7 +1273,7 @@ _CONFIG_CACHE = {}
 # A watch count moves only when somebody watches something, and every reader of
 # it compares against min_watched, so one answer per invocation is enough.
 _WATCH_COUNTS = {}
-MERGED_LANE_BLOCKS = ("shuffle", "subscription", "mix", "consensus")
+MERGED_LANE_BLOCKS = ("shuffle", "subscription", "mix", "consensus", "burst")
 
 
 def read_config():
@@ -1898,8 +1932,8 @@ def blocked_without_a_fetch(vid, run):
 
 
 def pick_seeds(lane, run):
-    """The history ids this lane expands. A subscription_feed lane needs none."""
-    seed_free = lane["expand"] == "subscription_feed"
+    """The history ids this lane expands. Some expanders need none."""
+    seed_free = lane["expand"] in SEEDLESS_EXPANDERS
     seeds = []
     if seed_free:
         log("  no seeds needed (%s)" % lane["expand"])
@@ -2035,6 +2069,136 @@ def expand_by_channel_uploads(lane, seeds, room, run):
     return scores, meta_seen
 
 
+# Words too common in a title to be a topic. Deliberately short: a term still
+# has to clear `min_recent` and `min_lift` against the account's own baseline,
+# and that filter does far more work than a long stopword list would.
+_TITLE_FILLER = frozenset("""
+the a an of and or in on to for with is are was were be been it its this that
+you your my we our they them what how why when where new official video music
+lyric lyrics hd 4k full ft feat vs from at by as not no all more most best can
+will just but if then than so up out over into about after before
+""".split())
+
+
+def title_terms(title):
+    """The words and adjacent word pairs of one title, filler dropped."""
+    words = [w for w in re.findall(r"[a-z0-9']+", title.lower())
+             if w not in _TITLE_FILLER and len(w) > 2]
+    pairs = {" ".join(words[i:i + 2]) for i in range(len(words) - 1)}
+    return set(words) | pairs
+
+
+# Half a hit stands in for none, so a term entirely new to the account is a
+# large lift rather than a division by zero.
+HALF_A_HIT = 0.5
+
+
+def term_lift(recent_hits, recent_total, older_hits, older_total):
+    """How many times commoner a term is now than it was."""
+    if not recent_total or not older_total:
+        return 0.0
+    return (recent_hits / recent_total) / ((older_hits + HALF_A_HIT) / older_total)
+
+
+def watched_titles(recent, baseline):
+    """(titles of the newest `recent` watched, titles of the `baseline` before them).
+    Straight from the metadata cache, so it costs no fetch."""
+    rows = query(
+        "SELECT CASE WHEN w.pos > w.n - %d THEN 'recent' ELSE 'older' END, "
+        "coalesce(m.title,'') FROM ("
+        "  SELECT unnest(watched) AS vid, generate_subscripts(watched,1) AS pos, "
+        "         array_length(watched,1) AS n FROM users WHERE email = %s) w "
+        "JOIN suggest.video_meta m ON m.vid = w.vid "
+        "WHERE w.pos > w.n - %d AND coalesce(m.title,'') <> '';"
+        % (int(recent), acct(), int(recent) + int(baseline)))
+    now = [title for band, title in rows if band == "recent"]
+    before = [title for band, title in rows if band != "recent"]
+    return now, before
+
+
+# Two tests, because each misses what the other catches. "wow forever" and
+# "warcraft forever" sit in DIFFERENT titles, so no amount of co-occurrence
+# separates them -- only the shared word does. "wow" and "warcraft forever"
+# share no word, and only co-occurrence does. Measured against the smaller
+# side, so a broad term does not swallow a narrow one inside it.
+SAME_TOPIC_OVERLAP = 0.6
+
+
+def names_the_same_topic(term, seen, other_term, other_seen):
+    if set(term.split()) & set(other_term.split()):
+        return True
+    return len(seen & other_seen) > SAME_TOPIC_OVERLAP * min(len(seen), len(other_seen))
+
+
+def pick_distinct_terms(ranked, most):
+    """The strongest terms, one per topic. Longer terms first: a pair makes a
+    better search than either word alone, and "wow" would otherwise take the slot."""
+    ordered = sorted(ranked, key=lambda t: (-len(t[0].split()), -t[1]))
+    taken = []
+    for term, lift, seen in ordered:
+        if any(names_the_same_topic(term, seen, other_term, other_seen)
+               for other_term, _, other_seen in taken):
+            continue
+        taken.append((term, lift, seen))
+        if len(taken) == most:
+            break
+    return [(term, lift, len(seen)) for term, lift, seen in taken]
+
+
+def bursting_terms(cfg):
+    """Terms the account has started watching: (term, lift, hits), strongest first."""
+    now, before = watched_titles(cfg["recent"], cfg["baseline"])
+    if len(now) < cfg["min_recent"] or not before:
+        log("  %d recent and %d earlier titles cached, too few to compare"
+            % (len(now), len(before)))
+        return []
+    seen_in, older_hits = {}, {}
+    for index, title in enumerate(now):
+        for term in title_terms(title):
+            seen_in.setdefault(term, set()).add(index)
+    for title in before:
+        for term in title_terms(title):
+            older_hits[term] = older_hits.get(term, 0) + 1
+    strong = [(term, term_lift(len(seen), len(now), older_hits.get(term, 0),
+                               len(before)), seen)
+              for term, seen in seen_in.items() if len(seen) >= cfg["min_recent"]]
+    return pick_distinct_terms(
+        [t for t in strong if t[1] >= cfg["min_lift"]], cfg["terms"])
+
+
+def expand_by_topic_burst(lane, seeds, room, run):
+    """Videos about a topic the account was not watching a month ago and is now.
+    One search per term, so the whole lane costs as many fetches as it has terms."""
+    scores, meta_seen = {}, {}
+    cfg = lane["burst"]
+    terms = bursting_terms(cfg)
+    if not terms:
+        log("  nothing is bursting in the watch history, nothing to do")
+        return scores, meta_seen
+    log("  bursting: %s" % ", ".join("%s (x%.0f, %d plays)" % (t, lift, hits)
+                                     for t, lift, hits in terms))
+    cutoff = time.time() - lane["max_age_days"] * 86400.0
+    for term, lift, _ in terms:
+        try:
+            found = run.fetcher.search(term)
+        except BudgetSpent as e:
+            log("  %s, searched only %d terms" % (e, terms.index((term, lift, _))))
+            break
+        for rec in found:
+            rid = rec.get("videoId")
+            if not rid or not VID_RE.match(rid):
+                continue
+            if rec.get("liveNow") or rec.get("isUpcoming"):
+                continue
+            if is_too_old(rec, cutoff):
+                continue
+            age = days_since_upload(rec)
+            scores[rid] = max(scores.get(rid, 0.0), lift * (0.93 ** age))
+            meta_seen.setdefault(rid, listing_meta(rec))
+    log("  %d candidates from %d searches" % (len(scores), len(terms)))
+    return scores, meta_seen
+
+
 def expand_by_subscription_feed(lane, seeds, room, run):
     """The subscription feed table, straight over SQL and costing no YouTube fetch."""
     scores, meta_seen = {}, {}
@@ -2083,7 +2247,12 @@ def expand_by_watch_order(lane, seeds, room, run):
 
 EXPANDERS = {"recommended": expand_by_recommendation,
              "channel_latest": expand_by_channel_uploads,
+             "topic_burst": expand_by_topic_burst,
              "subscription_feed": expand_by_subscription_feed}
+
+# Expanders that read no watch history at all: one reads the subscription feed
+# table, the other searches for terms it derives from the history itself.
+SEEDLESS_EXPANDERS = ("subscription_feed", "topic_burst")
 
 
 def expand_candidates(lane, seeds, room, run):

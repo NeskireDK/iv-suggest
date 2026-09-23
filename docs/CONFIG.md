@@ -109,7 +109,7 @@ only**. `init` and `run` name any inert key a lane sets:
 | `id` | — | **Required.** stable key for state, overrides and `--lane` |
 | `title` | — | **Required.** the playlist title Invidious shows |
 | `policy` | `refill` | `refill` \| `last_played` \| `mix` \| `consensus` — see [README](../README.md#what-a-lane-is) |
-| `expand` | `recommended` | where candidates come from: `recommended` \| `channel_latest` \| `subscription_feed` \| `none` |
+| `expand` | `recommended` | where candidates come from: `recommended` \| `channel_latest` \| `topic_burst` \| `subscription_feed` \| `none` |
 | `size` | `30` | videos the lane holds |
 | `min_watched` | `0` | skip this lane for an account with fewer watched videos than this. The gate for auto-enrolment — no state to flip, the lane appears once the history exists |
 | `privacy` | `unlisted` | `unlisted` \| `public` \| `private`. Only `private` breaks `/feed/playlist/<plid>`. **Applied when the playlist is created and never again** — changing a live lane is a database edit |
@@ -145,9 +145,48 @@ Per-`expand` keys, ignored by the other modes:
 | `recommend_age_halflife_days` | `0` | `recommended` | halve a candidate's score per N days since it was uploaded. `0` = off. `recommend_max_age_days` decides what may enter at all; this decides how much of what enters is old, and costs nothing extra for the same reason |
 | `recommend_age_floor` | `0.15` | `recommended` | the discount an ancient recommendation bottoms out at |
 | `max_channels` | `12` | `channel_latest` | channels to poll per run |
-| `max_age_days` | `21` | `channel_latest` | how new an upload must be |
+| `max_age_days` | `21` | `channel_latest`, `topic_burst` | how new an upload must be |
+| `burst` | see below | `topic_burst` | see below |
 | `subscription` | see below | `subscription_feed` | see below |
 | `played_decay` | `0.99` | *policy* `last_played` | score falloff per rank in play order |
+
+#### `burst`
+
+`expand: topic_burst` fills a lane with a topic the account was not watching a
+month ago and is now. It reads the titles already in `suggest.video_meta` for
+the newest `recent` entries of `users.watched` and the `baseline` before them,
+takes the words and adjacent word pairs of each, and keeps the terms that are
+both frequent now and rare then. Then one search per term.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `recent` | `200` | newest watch-history entries that count as "now" |
+| `baseline` | `1000` | the entries before those, which "now" is rare against |
+| `terms` | `2` | how many topics to search for, so also how many fetches the lane costs |
+| `min_recent` | `3` | a term must appear in at least this many recent titles |
+| `min_lift` | `20.0` | and be at least this many times commoner now than before |
+
+**Both floors, because either alone is noise.** Lift on its own promotes a word
+watched twice; a raw count promotes whatever the account always watches. Between
+them they do the work a long stopword list would, which is why the shipped one
+is short.
+
+**One term per topic.** Longer terms are preferred — a word pair makes a better
+search than either word alone — and a term is dropped when it shares a word with
+one already taken, or turns up in more than 60% of the same videos. The two
+tests catch different things: *"wow forever"* and *"warcraft forever"* sit in
+different titles and only the shared word separates them, while *"wow"* and
+*"warcraft forever"* share no word and only the co-occurrence does.
+
+⚠️ **Synonyms with no shared word still get two slots.** *"wow forever"* and
+*"world warcraft"* are one topic to a reader and two to this, because they
+neither share a word nor sit in the same titles. The cost is one wasted search
+and a lane fuller of the hottest topic; the results themselves de-duplicate.
+
+⚠️ **The lane feeds itself.** Promoting a topic makes more of it get watched,
+which strengthens the burst. Keep the lane small, keep `ttl_days` short, and
+leave `stale_after_active_days: 0` so it empties when the terms stop clearing
+the floor rather than holding a topic that has passed.
 
 #### `seed`
 
