@@ -456,9 +456,10 @@ playlist, so `public` buys nothing. What a listed lane leaks is watch taste, not
 credentials, but the decision is made on somebody else's behalf as soon as the
 instance has more than one account.
 
-**The hourly reorder has its own tuning.** `shuffle:` is a block of its own in
+**The reorder has its own tuning.** `shuffle:` is a block of its own in
 [docs/CONFIG.md](docs/CONFIG.md); the defaults in `lanes.yml` were picked by
-simulation, and the comment there says against what.
+simulation, and the comment there says against what. Its weights are wall-clock,
+so how often the timer fires is a display choice and not a tuning input.
 
 ## Song identity
 

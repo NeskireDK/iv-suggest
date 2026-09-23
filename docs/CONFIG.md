@@ -266,9 +266,15 @@ the page.
 
 #### `shuffle`
 
-The hourly reorder (`iv-suggest shuffle`). It decides what sits at the top, and
-may take out a video the viewer has since watched; what comes IN is the nightly
+The reorder (`iv-suggest shuffle`). It decides what sits at the top, and may
+take out a video the viewer has since watched; what comes IN is the nightly
 run's job. Settable in `defaults` and per lane.
+
+Every weight below is wall-clock, read off the gap between one reorder and the
+next, so **the timer's interval is a free knob**: running it four times an hour
+refreshes the page four times as often and costs a video exactly the same
+fatigue per hour it sat on screen. Tune `fatigue` for how fast a lane should
+tire, not for how often the timer fires.
 
 | Key | Default | Meaning |
 |---|---|---|
