@@ -150,7 +150,7 @@ DEFAULTS = {
     "min_seconds": 120,
     "max_seconds": 0,         # 0 = no upper bound; use it to drop compilations
     "seed": {"limit": 30},
-    "expand": "recommended",  # recommended | none | channel_latest | topic_burst | subscription_feed
+    "expand": "recommended",  # recommended | none | channel_latest | channel_popular | topic_burst | subscription_feed
     "filter": {},
     "policy": "refill",       # refill | last_played | mix
     "privacy": "unlisted",    # only "private" breaks /feed/playlist/<plid> (RSS)
@@ -1183,6 +1183,36 @@ class Fetcher:
                 self._trouble(e, delay)
                 delay *= 2
         return []
+
+    def channel_popular(self, ucid):
+        """One channel's best uploads regardless of age: one fetch for about 60."""
+        self._refuse_when_out_of_budget()
+        delay = 5.0
+        for attempt in range(3):
+            self._pace()
+            try:
+                data = bot_api("GET",
+                               "/api/v1/channels/%s/videos?sort_by=popular" % ucid,
+                               attempt=attempt)
+                self._spend_one_fetch()
+                self._upstream_answered()
+                return data
+            except urllib.error.HTTPError as e:
+                self._spend_one_fetch()
+                if e.code in (404, 410):
+                    self._upstream_answered()
+                    return None
+                if self._only_this_request_is_broken(e):
+                    self._upstream_answered()
+                    log("  skipping channel %s (upstream %d)" % (ucid, e.code))
+                    return None
+                self._trouble(e, delay)
+                delay *= 2
+            except Exception as e:
+                self._spend_one_fetch()
+                self._trouble(e, delay)
+                delay *= 2
+        return None
 
     def _alive(self):
         try:
@@ -2258,6 +2288,37 @@ def bursting_terms(cfg):
         [t for t in strong if t[1] >= cfg["min_lift"]], cfg["terms"])
 
 
+# The one source that can reach a named channel's OLDER uploads.
+# `channel_latest` asks /latest, which is the newest ~60 with no paging, so a
+# subscribed channel's back catalogue was unreachable however much somebody
+# watched it -- and its newest ~60 is what the subscription feed already shows.
+def expand_by_channel_back_catalogue(lane, seeds, room, run):
+    """The best-watched uploads of the channels this account returns to, at any age."""
+    scores, meta_seen = {}, {}
+    affinity = channel_affinity(run, lane["affinity"])
+    wanted = {cid: weight for cid, weight in affinity.weights.items()
+              if cid not in run.blocked}
+    picks = channels_to_read(wanted, lane["max_channels"])
+    log("  %d watched channels, taking the back catalogue of %d"
+        % (len(wanted), len(picks)))
+    for rank, (cid, weight) in enumerate(picks):
+        try:
+            data = run.fetcher.channel_popular(cid)
+        except BudgetSpent as e:
+            log("  %s, read only the first %d channels" % (e, rank))
+            break
+        for place, rec in enumerate((data or {}).get("videos") or []):
+            rid = rec.get("videoId")
+            if not rid or not VID_RE.match(rid):
+                continue
+            if rec.get("liveNow") or rec.get("isUpcoming"):
+                continue
+            scores[rid] = max(scores.get(rid, 0.0),
+                              weight * rank_derived_score(place))
+            meta_seen.setdefault(rid, listing_meta(rec))
+    return scores, meta_seen
+
+
 def expand_by_topic_burst(lane, seeds, room, run):
     """Videos about a topic the account was not watching a month ago and is now.
     One search per term, so the whole lane costs as many fetches as it has terms."""
@@ -2366,12 +2427,13 @@ def expand_by_watch_order(lane, seeds, room, run):
 
 EXPANDERS = {"recommended": expand_by_recommendation,
              "channel_latest": expand_by_channel_uploads,
+             "channel_popular": expand_by_channel_back_catalogue,
              "topic_burst": expand_by_topic_burst,
              "subscription_feed": expand_by_subscription_feed}
 
 # Expanders that read no watch history at all: one reads the subscription feed
 # table, the other searches for terms it derives from the history itself.
-SEEDLESS_EXPANDERS = ("subscription_feed", "topic_burst")
+SEEDLESS_EXPANDERS = ("subscription_feed", "topic_burst", "channel_popular")
 
 
 def expand_candidates(lane, seeds, room, run):

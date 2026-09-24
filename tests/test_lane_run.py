@@ -137,11 +137,12 @@ class Fetch:
     """
 
     def __init__(self, meta=None, recs=None, channels=None, dead=(),
-                 searches=None):
+                 searches=None, back_catalogue=None):
         self.meta = dict(meta or {})
         self.recs = dict(recs or {})
         self.channels = dict(channels or {})
         self.searches = dict(searches or {})
+        self.back_catalogue = dict(back_catalogue or {})
         self.dead = set(dead)
         self.budget = 10 ** 6
         self.fetches = 0
@@ -173,6 +174,11 @@ class Fetch:
         self.fetches += 1
         self.lane_used += 1
         return self.searches.get(term, [])
+
+    def channel_popular(self, ucid):
+        self.fetches += 1
+        self.lane_used += 1
+        return self.back_catalogue.get(ucid)
 
     def known(self, vid):
         return self.meta.get(vid)

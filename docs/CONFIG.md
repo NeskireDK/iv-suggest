@@ -109,7 +109,7 @@ only**. `init` and `run` name any inert key a lane sets:
 | `id` | — | **Required.** stable key for state, overrides and `--lane` |
 | `title` | — | **Required.** the playlist title Invidious shows |
 | `policy` | `refill` | `refill` \| `last_played` \| `mix` \| `consensus` — see [README](../README.md#what-a-lane-is) |
-| `expand` | `recommended` | where candidates come from: `recommended` \| `channel_latest` \| `topic_burst` \| `subscription_feed` \| `none` |
+| `expand` | `recommended` | where candidates come from: `recommended` \| `channel_latest` \| `channel_popular` \| `topic_burst` \| `subscription_feed` \| `none` |
 | `size` | `30` | videos the lane holds |
 | `min_watched` | `0` | skip this lane for an account with fewer watched videos than this. The gate for auto-enrolment — no state to flip, the lane appears once the history exists |
 | `privacy` | `unlisted` | `unlisted` \| `public` \| `private`. Only `private` breaks `/feed/playlist/<plid>`. **Applied when the playlist is created and never again** — changing a live lane is a database edit |
@@ -146,11 +146,33 @@ Per-`expand` keys, ignored by the other modes:
 | `recommend_age_halflife_days` | `0` | `recommended` | halve a candidate's score per N days since it was uploaded. `0` = off. `recommend_max_age_days` decides what may enter at all; this decides how much of what enters is old, and costs nothing extra for the same reason |
 | `recommend_age_floor` | `0.15` | `recommended` | the discount an ancient recommendation bottoms out at |
 | `affinity` | see below | `recommended`, `channel_latest` | see below |
-| `max_channels` | `12` | `channel_latest` | channels to poll per run |
+| `max_channels` | `12` | `channel_latest`, `channel_popular` | channels to poll per run |
 | `max_age_days` | `21` | `channel_latest`, `topic_burst` | how new an upload must be |
 | `burst` | see below | `topic_burst` | see below |
 | `subscription` | see below | `subscription_feed` | see below |
 | `played_decay` | `0.99` | *policy* `last_played` | score falloff per rank in play order |
+
+#### `expand: channel_popular` — the back catalogue
+
+`channel_latest` asks `/api/v1/channels/<ucid>/latest`, the newest ~60 with no
+paging. So a channel's **older** uploads were unreachable however much somebody
+watched it — and its newest ~60 is exactly what the subscription feed already
+shows. That is why the dedupe above re-admits almost nothing on its own: the
+thing worth having was never being offered.
+
+`channel_popular` asks `/videos?sort_by=popular` instead: same shape, ordered by
+views, at any age. One fetch per channel for about 60 videos.
+
+- It picks channels from the `affinity` weights through the same weighted draw
+  `channel_latest` uses, capped by `max_channels` — so it follows what somebody
+  actually returns to rather than a list anybody maintains.
+- **Subscribed channels included**, unlike `channel_latest`. Their back
+  catalogue is the half the feed never shows.
+- **No age cutoff.** `max_age_days` is not read here. A five year old video with
+  two million views is the point of the lane, not a failure of it.
+
+`exclude_watched` does most of the filtering, since these are by construction
+the channels the account has watched most.
 
 #### `subs_feed_window`, and why the ban became a dedupe
 
