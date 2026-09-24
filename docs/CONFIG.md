@@ -165,11 +165,18 @@ every candidate from it. Read by `expand: recommended` and
 | `floor` | `0.7` | the multiplier everything else bottoms out at |
 
 **Entries, not days.** `users.watched` is the complete watch record and carries
-no clock — `suggest.plays` has dates but only from 2026-09-23, and it cannot see
-a play of anything Invidious fetched in the last ten minutes. Convert with the
-account's own rate if you need to: at the ~21 entries a day measured here over
-2026-09-17→09-24, `200` was about ten days and the `scan` window about
-seventy.
+no clock, so these count positions.
+
+⚠️ **Convert with the play rate, not with how fast the array grows.** Invidious
+does `array_append(array_remove(watched, id), id)`, so a re-watch does not
+lengthen the array — it *moves* the id to the end and pushes everything behind
+it back one. Position therefore falls away once per **play**, re-watches
+included, while the array's length only counts videos seen for the first time.
+Measured here, the length grew ~22 a day over 2026-09-17→09-24 while
+`suggest.plays` recorded **30.1 watched a day over the same week and 30.4 over
+the 18 days before it** — so `200` is about a week, not the ten days the growth
+rate suggests. Both figures are upper bounds on the age, because the harvest
+cannot see a play of anything Invidious fetched in the last ten minutes.
 
 **Log, not linear.** Watch counts are heavily skewed. On one real history the
 top channel stood at 15.4 weighted watches against a median of 0.1, so scaling
