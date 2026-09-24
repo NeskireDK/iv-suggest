@@ -557,9 +557,14 @@ class Filter(LaneCase):
         self.assertEqual(["ddddddddddd"], self.offer(
             self.lane(), blocked={"UC-r": "Bad"}))
 
-    def test_a_subscribed_channel_is_refused_when_the_lane_excludes_them(self):
-        self.assertEqual(["ddddddddddd"], self.offer(
+    def test_a_subscribed_channel_is_no_longer_banned_outright(self):
+        """Its feed only ever showed the top of it, so only that is a duplicate."""
+        self.assertEqual(["ccccccccccc", "ddddddddddd"], self.offer(
             self.lane(), subs=["UC-r"]))
+
+    def test_a_window_of_zero_still_bans_the_whole_channel(self):
+        self.assertEqual(["ddddddddddd"], self.offer(
+            self.lane(subs_feed_window=0), subs=["UC-r"]))
 
     def test_a_video_shorter_than_min_seconds_is_refused(self):
         fetch = Fetch(recs={"h0000000000": {"recommendedVideos": [
@@ -618,11 +623,20 @@ class RunContext(LaneCase):
         self.fill(self.lane(), watched=["h0000000000", "fffffffffff"],
                   subs=["UC-sub"], blocked={"UC-bad": "Bad"},
                   db=Db(), api=Api(), fetch=Fetch(recs=recs))
-        self.assertEqual(["ccccccccccc"], self.api.added())
+        self.assertEqual(["ccccccccccc", "ddddddddddd"], self.api.added())
         rejected = self.logged("rejected")[0]
         self.assertIn("'watched': 1", rejected)
-        self.assertIn("'subscribed': 1", rejected)
         self.assertIn("'blocked': 1", rejected)
+        self.assertNotIn("subscribed", rejected)
+
+    def test_a_whole_channel_ban_is_still_reachable_by_setting_the_window_to_zero(self):
+        recs = {"h0000000000": {"recommendedVideos": [
+            rec("ccccccccccc", author_id="UC-ok"),
+            rec("ddddddddddd", author_id="UC-sub")]}}
+        self.fill(self.lane(subs_feed_window=0), watched=["h0000000000"],
+                  subs=["UC-sub"], db=Db(), api=Api(), fetch=Fetch(recs=recs))
+        self.assertEqual(["ccccccccccc"], self.api.added())
+        self.assertIn("'subscribed': 1", self.logged("rejected")[0])
 
     def test_one_fetcher_is_shared_by_the_seed_scan_and_the_expansion(self):
         fetch = Fetch(recs={"h0000000000": {"recommendedVideos": [rec("ccccccccccc")]}})

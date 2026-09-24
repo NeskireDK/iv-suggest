@@ -140,6 +140,11 @@ DEFAULTS = {
     "max_per_channel": 2,
     "exclude_watched": True,
     "exclude_subscribed": True,
+    # What `exclude_subscribed` excludes. 0 keeps the old meaning, the whole
+    # channel. Above 0 it excludes only the videos the subscription view is
+    # actually showing right now -- which is the only thing "their feed already
+    # shows them" was ever true of.
+    "subs_feed_window": 50,
     "dedupe_across_lanes": True,
     "dedupe_songs": True,     # one upload per song, across every lane
     "min_seconds": 120,
@@ -2286,6 +2291,33 @@ def expand_by_topic_burst(lane, seeds, room, run):
     return scores, meta_seen
 
 
+# Keyed by account, for the same reason the affinity table is: one invocation
+# serves every managed account in turn.
+_SUBS_FEED = {}
+
+
+def videos_in_the_subs_feed(subs, window):
+    """The newest `window` videos the subscription view is showing this account."""
+    key = (ACCOUNT, window)
+    if key not in _SUBS_FEED:
+        _SUBS_FEED[key] = {row[0] for row in query(
+            "SELECT id FROM channel_videos WHERE ucid IN (%s) "
+            "ORDER BY published DESC LIMIT %d;"
+            % (",".join(lit(u) for u in sorted(subs)), int(window)))} \
+            if window and subs else set()
+    return _SUBS_FEED[key]
+
+
+def subscribed_videos_to_skip(lane, run):
+    """The subscribed videos this lane may not take, and what to call the refusal.
+    A whole-channel ban when `subs_feed_window` is 0, otherwise just the feed's own top N."""
+    if not lane["exclude_subscribed"]:
+        return set(), "subscribed"
+    if not lane["subs_feed_window"]:
+        return None, "subscribed"
+    return videos_in_the_subs_feed(run.subs, lane["subs_feed_window"]), "subs_feed"
+
+
 def expand_by_subscription_feed(lane, seeds, room, run):
     """The subscription feed table, straight over SQL and costing no YouTube fetch."""
     scores, meta_seen = {}, {}
@@ -2408,7 +2440,9 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
 
     rejected = {"watched": 0, "subscribed": 0, "cooldown": 0, "in_lane": 0,
                 "other_lane": 0, "short": 0, "long": 0, "genre": 0,
-                "channel_cap": 0, "same_song": 0, "dead": 0, "blocked": 0}
+                "channel_cap": 0, "same_song": 0, "dead": 0, "blocked": 0,
+                "subs_feed": 0}
+    skip_subscribed, subscribed_refusal = subscribed_videos_to_skip(lane, run)
     chosen = []
     genre_wanted = (lane.get("filter") or {}).get("genre")
     checked = 0
@@ -2434,8 +2468,9 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
         if meta.get("authorId") in run.blocked:
             rejected["blocked"] += 1
             continue
-        if lane["exclude_subscribed"] and meta.get("authorId") in run.subs:
-            rejected["subscribed"] += 1
+        if meta.get("authorId") in run.subs and (
+                skip_subscribed is None or vid in skip_subscribed):
+            rejected[subscribed_refusal] += 1
             continue
         secs = meta.get("seconds") or 0
         if lane["min_seconds"] and 0 < secs < lane["min_seconds"]:

@@ -127,7 +127,8 @@ only**. `init` and `run` name any inert key a lane sets:
 | `rotate_cooldown_days` | `21` | same, for one dropped by `refresh_per_day`, `stale_after_active_days` or `displace_when_full` |
 | **Candidate rules** | | |
 | `exclude_watched` | `true` | drop what this account already watched |
-| `exclude_subscribed` | `true` | drop channels this account subscribes to — their feed already shows them. `false` does not re-admit them under `channel_latest`, which skips subscribed channels when choosing whom to poll |
+| `exclude_subscribed` | `true` | skip what the subscription feed already offers. What that means is `subs_feed_window`'s to say. `false` turns it off entirely, which is what the subscription lanes do |
+| `subs_feed_window` | `50` | how many of the feed's newest videos count as "already offered". `0` restores the old meaning — the whole channel, banned on sight |
 | `dedupe_across_lanes` | `true` | a video sits in one lane at a time, per account |
 | `dedupe_songs` | `true` | one upload per song, across every lane a person holds. `dedupe` skips a lane that sets it `false`, and skips a compiled lane whatever it says. See [README](../README.md#song-identity) |
 | `min_seconds` | `120` | drop anything shorter, **when the length is known** — a candidate reporting `0` seconds passes. `0` = off |
@@ -150,6 +151,28 @@ Per-`expand` keys, ignored by the other modes:
 | `burst` | see below | `topic_burst` | see below |
 | `subscription` | see below | `subscription_feed` | see below |
 | `played_decay` | `0.99` | *policy* `last_played` | score falloff per rank in play order |
+
+#### `subs_feed_window`, and why the ban became a dedupe
+
+`exclude_subscribed` was justified by *"their feed already shows them"*. That is
+only true of the videos the subscription view is **currently** showing — a
+channel's older uploads fall out of it and stop being duplicates. So the rule
+now skips those videos rather than the channel, and it maintains itself: as a
+video falls out of the feed it becomes eligible here.
+
+**Expect the direct effect to be small.** Over five nights and 52 lane-runs the
+old rule rejected **13 videos in total**, about 2.6 a night. The reason to
+change it is the loop behind that number: a banned channel never entered a lane,
+so it never became a *seed*, so the recommendation graph was never asked what
+sits near it.
+
+⚠️ **It changes which candidates survive, not whom the bot polls.**
+`expand: channel_latest` still chooses only unsubscribed channels. A subscribed
+channel's newest ~60 uploads *are* the feed, so polling it would spend a fetch
+to rediscover what `subscription_feed` already has for free. Reaching a
+subscribed channel's **older** uploads needs a source that can ask for them.
+
+Set `0` to get the old whole-channel ban back on a lane that wants it.
 
 #### `affinity`
 
