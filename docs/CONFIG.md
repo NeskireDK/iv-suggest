@@ -144,11 +144,51 @@ Per-`expand` keys, ignored by the other modes:
 | `recommend_max_age_days` | `0` | `recommended` | drop a recommendation older than this. `0` = off. Free — `recommendedVideos` carries `published`, as an RFC3339 string derived from its relative "21 hours ago" text, so it is approximate. Fine at day scale |
 | `recommend_age_halflife_days` | `0` | `recommended` | halve a candidate's score per N days since it was uploaded. `0` = off. `recommend_max_age_days` decides what may enter at all; this decides how much of what enters is old, and costs nothing extra for the same reason |
 | `recommend_age_floor` | `0.15` | `recommended` | the discount an ancient recommendation bottoms out at |
+| `affinity` | see below | `recommended`, `channel_latest` | see below |
 | `max_channels` | `12` | `channel_latest` | channels to poll per run |
 | `max_age_days` | `21` | `channel_latest`, `topic_burst` | how new an upload must be |
 | `burst` | see below | `topic_burst` | see below |
 | `subscription` | see below | `subscription_feed` | see below |
 | `played_decay` | `0.99` | *policy* `last_played` | score falloff per rank in play order |
+
+#### `affinity`
+
+How much the account has been watching a channel lately, as a multiplier on
+every candidate from it. Read by `expand: recommended` and
+`expand: channel_latest`; the other expanders never see it.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `scan` | `1500` | how deep into `users.watched` to look |
+| `halflife_entries` | `200` | a watch this many entries further back counts half |
+| `boost` | `2.0` | the multiplier the most-watched channel takes |
+| `floor` | `0.7` | the multiplier everything else bottoms out at |
+
+**Entries, not days.** `users.watched` is the complete watch record and carries
+no clock — `suggest.plays` has dates but only from 2026-09-23, and it cannot see
+a play of anything Invidious fetched in the last ten minutes. Convert with the
+account's own rate if you need to: at the ~21 entries a day measured here over
+2026-09-17→09-24, `200` was about ten days and the `scan` window about
+seventy.
+
+**Log, not linear.** Watch counts are heavily skewed. On one real history the
+top channel stood at 15.4 weighted watches against a median of 0.1, so scaling
+against the top linearly left **574 of 586 channels within 0.08 of the floor** —
+a two-channel promotion rather than an affinity. The log curve puts the top at
+`boost` and the dozen behind it between 1.4 and 1.9.
+
+⚠️ **`floor` applies to a channel the history has never named**, not just to one
+watched long ago — most of the history has no cached channel, so there is no
+way to tell those apart. It is a floor and not a zero for that reason: a zero
+would blank a candidate on missing data rather than on dislike.
+
+An account whose history names **no** channel at all gets a multiplier of
+exactly `1.0` rather than the floor, so a fresh account is scored as it was
+before this existed.
+
+⚠️ **`max_per_channel` still caps what a promoted channel may contribute.**
+Raising `boost` without raising that cap promotes a channel into a limit it
+already hits.
 
 #### `burst`
 

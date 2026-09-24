@@ -50,6 +50,15 @@ Five ways to find candidates:
 | `subscription_feed` | the `channel_videos` table over SQL | **zero** |
 | `none` | the seeds themselves, in watch order | zero |
 
+**`recommended` and `channel_latest` also weigh the channel.** Candidates are
+multiplied by how much the account has been watching that channel lately —
+positions in `users.watched`, newest counting most — so the graph's answer is
+re-ranked toward channels somebody actually returns to. It costs no fetch and no
+query, changes ranking rather than membership, and bottoms out at a floor rather
+than a zero. Keys and the reason the curve is logarithmic are in
+[docs/CONFIG.md](docs/CONFIG.md) under `affinity`. The other three expanders do
+not read it.
+
 `topic_burst` works out its own terms: it compares the titles already cached for
 the newest slice of the watch history against the slice before it and keeps what
 is frequent now and rare then — so the lane answers to whatever somebody has
