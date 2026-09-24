@@ -337,9 +337,9 @@ lanes:
   # The shares below are an allocation of 54 slots, not a pile of adjustments:
   # every one was re-read when `deep-cuts` joined rather than shaving whichever
   # source happened to be biggest. What each supplies against what it holds:
-  # suggested 20 of 30, fresh-uploads 15 of 25, music 5 of 100, subs 5 of 5,
-  # burst 3 of 8, deep-cuts 4 of 20. Only subs-top48 is at its own size, so
-  # every other share can move without the source running short.
+  # suggested 22 of 30, fresh-uploads 15 of 25, music 6 of 100, subs 4 of 5,
+  # burst 3 of 8, deep-cuts 4 of 20. Nothing is at its own size any more, so
+  # every share can move without the source running short.
   - id: home-mix
     title: "Home mix"
     policy: mix
@@ -350,10 +350,12 @@ lanes:
       # position 8 — just off the first screen on the TV.
       pure: 5
       sources:
-        - {lane: suggested, share: 0.38}
+        - {lane: suggested, share: 0.40}
         - {lane: fresh-uploads, share: 0.28}
-        # 0.10 of 54 = 5.4, so about the 5 asked for
-        - {lane: subs-top48, share: 0.10}
+        # 0.08 of 54 = 4.3, which is the 4 asked for. It was 0.10 and supplied
+        # 5: the ideal allocation wanted 6 and the lane only holds 5, so the
+        # spare slot fell to music-discover and the feed read one over.
+        - {lane: subs-top48, share: 0.08}
         - {lane: music-discover, share: 0.10}
         # 0.06 of 54 = 3.2, the three asked for
         - {lane: burst, share: 0.06}
@@ -395,6 +397,15 @@ lanes:
     consensus:
       sources:
         - {users: all, lane: home-mix}
+      # The same 21 days and 0.15 floor every lane on this instance discounts
+      # upload age by. The two sources that deliberately carry old videos --
+      # music-discover with its age decay off, deep-cuts with no age cap at all
+      # -- were right inside their own playlists and wrong here: measured on
+      # 2026-09-24 the feed held 9 videos over a year old, the first of them at
+      # median position 5 and 1.48 of them in the visible top ten. At these
+      # values that becomes position 17 and 0.32.
+      published_halflife_days: 21
+      published_floor: 0.15
 
   # Music only, which is what this slot pointed at before it was compiled.
   - id: trending
