@@ -46,9 +46,17 @@ Five ways to find candidates:
 |---|---|---|
 | `recommended` | each seed's `recommendedVideos` | 1 per seed |
 | `channel_latest` | recent uploads of channels you watch but never subscribed to | 1 per channel, ~60 videos each |
+| `channel_popular` | the best-watched uploads of channels you return to, at any age | 1 per channel, ~60 videos each |
 | `topic_burst` | a search per topic the account has just started watching | 1 per term, ~20 videos each |
 | `subscription_feed` | the `channel_videos` table over SQL | **zero** |
 | `none` | the seeds themselves, in watch order | zero |
+
+**`channel_popular` is the only way to a channel's older uploads.** `/latest`
+returns the newest ~60 with no paging, which for a subscribed channel is just
+the subscription feed again; `?sort_by=popular` returns the same shape ordered
+by views at any age. It follows the `affinity` weights below rather than a list
+anybody maintains, and it does poll subscribed channels, because their back
+catalogue is the half the feed never shows.
 
 **`recommended` and `channel_latest` also weigh the channel.** Candidates are
 multiplied by how much the account has been watching that channel lately —

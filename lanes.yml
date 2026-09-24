@@ -288,6 +288,26 @@ lanes:
     refresh_per_day: 0
     stale_after_active_days: 0
 
+  # The other half of the subscription rule above. A channel's newest ~60 is
+  # what the feed already shows, so the only thing worth asking a well-watched
+  # channel for is what sits BEHIND that -- which `channel_latest` cannot reach
+  # at all, subscribed or not. Deliberately no max_age_days: a five year old
+  # video with two million views is the point of the lane, not a failure of it.
+  #
+  # 8 channels at one fetch each. exclude_watched does most of the filtering
+  # here, because these are the channels the account has watched most.
+  - id: deep-cuts
+    title: "More from channels you watch"
+    expand: channel_popular
+    size: 20
+    max_channels: 8
+    fetch_cap: 10
+    max_per_channel: 3
+    ttl_days: 30                # an old video does not go off; turnover is by rota
+    refresh_per_day: 2
+    keep_min: 10
+    stale_after_active_days: 0  # nothing here is stale for being unwatched
+
   # A topic the account was not watching a month ago and is now. Small on
   # purpose: it is a tip-off, not a section, and it answers to whatever is
   # bursting rather than to a genre anybody chose.
