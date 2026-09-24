@@ -495,6 +495,12 @@ CONSENSUS_DEFAULTS = {
     "sources": [{"users": "all", "lane": "home-mix"}],
     "rank_offset": 4.0,
     "agreement_power": 1.0,
+    # A source mix may rank an old video highly on purpose -- music-discover
+    # turns its own upload-age decay off, because a song is not stale for being
+    # from 1998. That holds in a music playlist and not in a public feed read as
+    # what is happening now, so the feed discounts age for itself. 0 = off.
+    "published_halflife_days": 0,
+    "published_floor": 0.15,
 }
 
 COMPILED_POLICIES = ("mix", "consensus")
@@ -2933,12 +2939,33 @@ def depth_weights(mixes, rank_offset):
     return depth
 
 
+def upload_ages_in_days(vids):
+    """Days since upload for each video, off whichever playlist rows already carry it."""
+    rows = query("SELECT id, extract(epoch FROM (now() - max(published)))/86400.0 "
+                 "FROM playlist_videos WHERE id IN (%s) GROUP BY id;"
+                 % ",".join(lit(vid) for vid in sorted(vids)))
+    return {row[0]: float(row[1]) for row in rows if row[1] not in (None, "")}
+
+
+def upload_age_weights(vids, cfg):
+    """A multiplier per video for how old its upload is, or none at all when the lane is not asking."""
+    halflife = float(cfg["published_halflife_days"])
+    if not halflife or not vids:
+        return {}
+    ages = upload_ages_in_days(vids)
+    return {vid: soft_decay(ages.get(vid, AGE_OF_A_LISTING_WITH_NO_DATE),
+                            halflife, float(cfg["published_floor"]))
+            for vid in vids}
+
+
 def consensus_weights(mixes, cfg):
-    """Each video's draw weight: its depth in the mixes, lifted by how many agree."""
+    """Each video's draw weight: its depth in the mixes, lifted by how many agree, cut by upload age."""
     counts = agreement_counts(mixes)
     power = float(cfg["agreement_power"])
-    return {vid: depth * counts[vid] ** power for vid, depth
-            in depth_weights(mixes, float(cfg["rank_offset"])).items()}
+    depth = depth_weights(mixes, float(cfg["rank_offset"]))
+    age = upload_age_weights(set(depth), cfg)
+    return {vid: weight * counts[vid] ** power * age.get(vid, 1.0)
+            for vid, weight in depth.items()}
 
 
 def consensus_draw(weights, size):

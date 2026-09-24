@@ -350,13 +350,34 @@ upstream.
 | `sources` | `[{users: all, lane: home-mix}]` | list of `{lane}`, `{user, lane}` or `{users: all, lane}`, read exactly as `mix.sources` is. `share` is not read: this policy scores, it does not divide slots |
 | `rank_offset` | `4.0` | the *k* in `1 / (rank + k)`, one video's weight from one mix. Must be above zero. Lower pins the head of each mix in place; higher flattens the mix's own order until only agreement counts |
 | `agreement_power` | `1.0` | exponent on the number of mixes holding a video. `1.0` doubles what two accounts agree on, `0.0` turns agreement off and leaves the depth sum |
+| `published_halflife_days` | `0` | upload age halves a video's weight every N days. `0` = off, which is the plain depth-and-agreement weight |
+| `published_floor` | `0.15` | the least that discount may leave, so an old video is unlikely to lead rather than excluded |
 
 The weight of a video is `1 / (rank + k)` summed over every mix holding it,
-times `holders ** agreement_power`; the playlist is then a weighted sample
-without replacement of `size` videos. So agreement **raises** a video's weight
+times `holders ** agreement_power`, times the upload-age discount; the playlist
+is then a weighted sample without replacement of `size` videos. So agreement **raises** a video's weight
 rather than gating its inclusion — with the defaults, a video two mixes hold at
 rank 4 outweighs another account's top pick, and a video only one account holds
 is unlikely rather than excluded.
+
+**Upload age, and why the feed decides it rather than the source.** A source
+lane may rank an old video highly on purpose — `music-discover` turns its own
+`published_halflife_days` off, because a song is not stale for being from 1998,
+and `channel_popular` reads no `max_age_days` at all, because a five year old
+video with two million views is the point of that lane. Both of those hold
+inside a playlist somebody opened for the genre and stop holding in a feed a
+logged-out visitor reads as what is happening now. So the discount is the
+consensus lane's own setting, applied to every source alike; it changes nothing
+about how the source lanes rank themselves.
+
+The dates come from `playlist_videos`, in one query per draw, so this costs no
+fetch and no extra table. A video the playlist carries no date for is treated as
+30 days old rather than dropped.
+
+⚠️ **With more than one mix in play this also thins what gets in, not only where
+it sits.** One account holding a `home-mix` means the draw takes every video it
+has and the weights decide order alone. Two mixes make the pool bigger than
+`size`, and then a floored weight is a video that often does not appear at all.
 
 Three things follow from the feed having no viewer:
 
