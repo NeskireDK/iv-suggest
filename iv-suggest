@@ -26,6 +26,7 @@ import base64
 import csv
 import io
 import json
+import math
 import os
 import random
 import re
@@ -159,6 +160,12 @@ DEFAULTS = {
     "displace_when_full": False,
     "min_watched": 0,         # skip this lane for an account with less history
     "sample_pool": 0,         # weighted random pick over the top N candidates
+    # How much the account has been watching a channel lately, as a multiplier on
+    # every candidate from it. Positions in users.watched, not dates: that array
+    # is the complete watch record and has no clock, and suggest.plays only
+    # started dating it on 2026-09-23.
+    "affinity": {"halflife_entries": 200, "scan": 1500,
+                 "boost": 2.0, "floor": 0.7},
     "max_channels": 12,       # expand: channel_latest, channels per run
     "max_age_days": 21,       # expand: channel_latest and topic_burst, how new an upload must be
     # expand: topic_burst. A term must be watched `min_recent` times inside the
@@ -1289,7 +1296,8 @@ _CONFIG_CACHE = {}
 # A watch count moves only when somebody watches something, and every reader of
 # it compares against min_watched, so one answer per invocation is enough.
 _WATCH_COUNTS = {}
-MERGED_LANE_BLOCKS = ("shuffle", "subscription", "mix", "consensus", "burst")
+MERGED_LANE_BLOCKS = ("shuffle", "subscription", "mix", "consensus", "burst",
+                      "affinity")
 
 
 def read_config():
@@ -2010,11 +2018,72 @@ def is_too_old(rec, cutoff):
     return not published or published < cutoff
 
 
+def weigh_by_recency(watched, meta, halflife):
+    """How much each channel has been watched lately, the newest entries counting most.
+    Reads the metadata cache the fetcher already holds, so it costs nothing."""
+    weights = {}
+    last = len(watched) - 1
+    for position, vid in enumerate(watched):
+        cid = (meta.get(vid) or {}).get("authorId")
+        if cid:
+            weights[cid] = weights.get(cid, 0.0) + 0.5 ** ((last - position) / halflife)
+    return weights
+
+
+# Log, not linear. Watch counts are heavily skewed -- one channel at 15 weighted
+# watches against a median of 0.1 -- so scaling against the top linearly put 574
+# of 586 channels within 0.08 of the floor, which is a two-channel promotion
+# rather than an affinity. On a log curve the top still leads and the dozen
+# channels behind it land between 1.4 and 1.9.
+# A floor and not a zero: the cache knows no channel for most of the history, so
+# a zero would blank a candidate on missing data rather than on dislike.
+def as_multipliers(weights, boost, floor):
+    """Channel weights mapped onto [floor, boost], the most-watched channel at the top."""
+    if not weights:
+        return {}
+    top = max(weights.values())
+    if top <= 0:
+        return {}
+    return {cid: floor + (boost - floor) * (math.log1p(w) / math.log1p(top))
+            for cid, w in weights.items()}
+
+
+# Two shapes of the same answer, because the two readers want different things.
+# `weights` is a recency-weighted watch count, the direct successor to the raw
+# count `channels_to_read` was drawing on. `multipliers` is that mapped onto a
+# bounded range, for multiplying a score that already means something.
+Affinity = namedtuple("Affinity", "weights multipliers")
+
+
+# Keyed by account as well as by settings: one invocation serves every managed
+# account in turn, and a table built from one person's history must never be
+# handed to the next.
+_AFFINITY = {}
+
+
+def channel_affinity(run, cfg):
+    """How much this account has been watching each channel, computed once per run."""
+    key = (ACCOUNT, cfg["scan"], cfg["halflife_entries"], cfg["boost"],
+           cfg["floor"])
+    if key not in _AFFINITY:
+        tail = run.watched[-cfg["scan"]:]
+        weights = weigh_by_recency(tail, run.fetcher.meta,
+                                   max(cfg["halflife_entries"], 1))
+        _AFFINITY[key] = Affinity(
+            weights, as_multipliers(weights, cfg["boost"], cfg["floor"]))
+    return _AFFINITY[key]
+
+
+def affinity_of(table, cid, cfg):
+    """One channel's multiplier. A channel the history has never named takes the floor."""
+    return table.get(cid, cfg["floor"]) if table else 1.0
+
+
 def channels_to_read(watch_counts, most):
     """A weighted draw over the watched channels, capped at `most`.
     Weighted, not the plain top N, so a channel watched twice still gets a turn."""
     drawn = sorted(watch_counts.items(),
-                   key=lambda kv: -(random.random() ** (1.0 / max(kv[1], 1))))
+                   key=lambda kv: -(random.random() ** (1.0 / max(kv[1], 1e-6))))
     return drawn[:most]
 
 
@@ -2029,6 +2098,8 @@ def expand_by_recommendation(lane, seeds, room, run):
     scores, meta_seen = {}, {}
     rec_age = lane["recommend_max_age_days"]
     rec_cutoff = time.time() - rec_age * 86400.0 if rec_age else 0.0
+    cfg = lane["affinity"]
+    affinity = channel_affinity(run, cfg)
     for rank, vid in enumerate(seeds):
         try:
             data = run.fetcher.video(vid)
@@ -2046,7 +2117,8 @@ def expand_by_recommendation(lane, seeds, room, run):
                 continue
             scores[rid] = scores.get(rid, 0.0) + weight * soft_decay(
                 days_since_upload(rec), lane["recommend_age_halflife_days"],
-                lane["recommend_age_floor"])
+                lane["recommend_age_floor"]) * affinity_of(
+                    affinity.multipliers, rec.get("authorId"), cfg)
             meta_seen.setdefault(rid, listing_meta(rec))
     return scores, meta_seen
 
@@ -2055,16 +2127,15 @@ def expand_by_channel_uploads(lane, seeds, room, run):
     """New uploads from channels in the history the account never subscribed to.
     The only source of a video published since the last run: the graph recycles."""
     scores, meta_seen = {}, {}
-    watch_counts = {}
-    for vid in seeds:
-        cid = (run.fetcher.meta.get(vid) or {}).get("authorId")
-        if cid and cid not in run.subs and cid not in run.blocked:
-            watch_counts[cid] = watch_counts.get(cid, 0) + 1
+    cfg = lane["affinity"]
+    affinity = channel_affinity(run, cfg)
+    watch_counts = {cid: weight for cid, weight in affinity.weights.items()
+                    if cid not in run.subs and cid not in run.blocked}
     picks = channels_to_read(watch_counts, lane["max_channels"])
     log("  %d unsubscribed channels in the history, taking %d"
         % (len(watch_counts), len(picks)))
     cutoff = time.time() - lane["max_age_days"] * 86400.0
-    for rank, (cid, watched_times) in enumerate(picks):
+    for rank, (cid, weight) in enumerate(picks):
         try:
             data = run.fetcher.channel_latest(cid)
         except BudgetSpent as e:
@@ -2080,7 +2151,7 @@ def expand_by_channel_uploads(lane, seeds, room, run):
             if published and published < cutoff:
                 continue
             age = days_since_upload(rec)
-            scores[rid] = max(scores.get(rid, 0.0), watched_times * (0.93 ** age))
+            scores[rid] = max(scores.get(rid, 0.0), weight * (0.93 ** age))
             meta_seen.setdefault(rid, listing_meta(rec))
     return scores, meta_seen
 

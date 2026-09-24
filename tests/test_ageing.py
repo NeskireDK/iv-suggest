@@ -128,6 +128,7 @@ class CandidateAge(unittest.TestCase):
     def expand(self, lane, recs):
         class Fetcher:
             lane_used = cache_hits = 0
+            meta = {}
 
             def video(self, vid):
                 return {"recommendedVideos": recs}
