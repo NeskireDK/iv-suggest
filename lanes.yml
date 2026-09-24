@@ -334,10 +334,12 @@ lanes:
   # One person's whole front page, and the source `popular` compiles from.
   # Spec: ~10% music, the rest recommendation driven.
   #
-  # size 54 is what the shares and the source sizes agree on: suggested supplies
-  # its full 30, fresh-uploads 19 of its 25, music 5. Growing `suggested` or
-  # `fresh-uploads` is what makes the page longer; raising `size` alone would
-  # only pull in more music.
+  # The shares below are an allocation of 54 slots, not a pile of adjustments:
+  # every one was re-read when `deep-cuts` joined rather than shaving whichever
+  # source happened to be biggest. What each supplies against what it holds:
+  # suggested 20 of 30, fresh-uploads 15 of 25, music 5 of 100, subs 5 of 5,
+  # burst 3 of 8, deep-cuts 4 of 20. Only subs-top48 is at its own size, so
+  # every other share can move without the source running short.
   - id: home-mix
     title: "Home mix"
     policy: mix
@@ -348,15 +350,20 @@ lanes:
       # position 8 — just off the first screen on the TV.
       pure: 5
       sources:
-        - {lane: suggested, share: 0.44}
-        - {lane: fresh-uploads, share: 0.30}
+        - {lane: suggested, share: 0.38}
+        - {lane: fresh-uploads, share: 0.28}
         # 0.10 of 54 = 5.4, so about the 5 asked for
         - {lane: subs-top48, share: 0.10}
         - {lane: music-discover, share: 0.10}
-        # 0.06 of 54 = 3.2, the three asked for. Taken from `suggested`, which
-        # supplies its full 30 and can spare them; the other three sources are
-        # already at what they were asked to be.
+        # 0.06 of 54 = 3.2, the three asked for
         - {lane: burst, share: 0.06}
+        # 0.08 of 54 = 4.3. Older videos from channels the account keeps coming
+        # back to, which nothing else here can reach: every other source is
+        # bounded by what was published recently or by what the graph offers
+        # today. Paid for out of suggested and fresh-uploads together, because
+        # both were over what they need to supply and neither should carry a
+        # new source on its own.
+        - {lane: deep-cuts, share: 0.08}
       # A source may name another account, which makes this the household feed:
       #   - {user: them@example.com, lane: suggested, share: 0.2}
 
