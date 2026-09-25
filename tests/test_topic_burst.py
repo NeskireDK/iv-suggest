@@ -6,6 +6,7 @@ term has to clear both against the account's own baseline, which is what lets
 the stopword list stay short.
 """
 
+import time
 import unittest
 
 from support import load
@@ -133,7 +134,7 @@ class TheExpander(unittest.TestCase):
     def video(self, **over):
         return dict({"videoId": "aaaaaaaaaaa", "title": "Kraken Beta Raids",
                      "author": "Someone", "authorId": "UCx", "lengthSeconds": 600,
-                     "published": 9e9}, **over)
+                     "published": time.time() - 86400.0}, **over)
 
     def test_it_searches_each_bursting_term_once(self):
         self.run_with([self.video()])

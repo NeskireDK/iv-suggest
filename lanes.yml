@@ -397,8 +397,9 @@ lanes:
     consensus:
       sources:
         - {users: all, lane: home-mix}
-      # The same 21 days and 0.15 floor every lane on this instance discounts
-      # upload age by. The two sources that deliberately carry old videos --
+      # The same 21 days and 0.15 floor `defaults.shuffle` above sets, so a
+      # video is discounted the same whether a lane or the feed is reading it.
+      # The two sources that deliberately carry old videos --
       # music-discover with its age decay off, deep-cuts with no age cap at all
       # -- were right inside their own playlists and wrong here: measured on
       # 2026-09-24 the feed held 9 videos over a year old, the first of them at

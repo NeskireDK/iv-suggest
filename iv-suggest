@@ -689,17 +689,29 @@ def _typed_views_literal(views):
     return "NULL::bigint"
 
 
+# Slack for the clock drifting between here and upstream. Past it, a `published`
+# ahead of now is a bogus date rather than a very new upload: one lived in two of
+# this account's lanes reading 2027-02-02, and every ranking that prefers recent
+# leads with it forever.
+CLOCK_SKEW_GRACE_SECONDS = 300.0
+
+
+def not_in_the_future(seconds):
+    """A timestamp, or 0 for one far enough ahead of now to be a bad date rather than a new upload."""
+    return 0.0 if seconds > time.time() + CLOCK_SKEW_GRACE_SECONDS else seconds
+
+
 def parse_published(rec):
-    """Unix seconds from a listing's `published`, or 0 when it carries none.
+    """Unix seconds from a listing's `published`, or 0 when it carries none or names the future.
     `channels/latest` sends unix seconds, `recommendedVideos` an RFC3339 string."""
     pub = rec.get("published")
     if isinstance(pub, (int, float)):
-        return float(pub)
+        return not_in_the_future(float(pub))
     if isinstance(pub, str) and pub:
         try:
-            return datetime.strptime(
+            return not_in_the_future(datetime.strptime(
                 pub, "%Y-%m-%dT%H:%M:%SZ").replace(
-                    tzinfo=timezone.utc).timestamp()
+                    tzinfo=timezone.utc).timestamp())
         except ValueError:
             return 0.0
     return 0.0
@@ -2030,10 +2042,18 @@ def pick_seeds(lane, run):
     return seeds, seed_free
 
 
-# What a listing entry with no `published` is treated as being. Every lane on
-# this instance gets a real date on 100% of rows, so this only decides what a
-# malformed answer costs: old enough to be discounted, not old enough to drop.
+# What a video with no usable `published` is treated as being -- no date at all,
+# or one naming the future. Nearly every row carries a real date, so this only
+# decides what a bad one costs: old enough to be discounted, not old enough to
+# drop.
 AGE_OF_A_LISTING_WITH_NO_DATE = 30.0
+
+
+def upload_age_in_days(days):
+    """Days since upload, reading a date in the future as no date at all."""
+    if days in (None, "") or float(days) < 0:
+        return AGE_OF_A_LISTING_WITH_NO_DATE
+    return float(days)
 
 
 def soft_decay(units, halflife, floor):
@@ -2048,7 +2068,7 @@ def days_since_upload(rec):
     published = parse_published(rec)
     if not published:
         return AGE_OF_A_LISTING_WITH_NO_DATE
-    return max(0.0, (time.time() - published) / 86400.0)
+    return upload_age_in_days((time.time() - published) / 86400.0)
 
 
 def is_too_old(rec, cutoff):
@@ -2944,7 +2964,7 @@ def upload_ages_in_days(vids):
     rows = query("SELECT id, extract(epoch FROM (now() - max(published)))/86400.0 "
                  "FROM playlist_videos WHERE id IN (%s) GROUP BY id;"
                  % ",".join(lit(vid) for vid in sorted(vids)))
-    return {row[0]: float(row[1]) for row in rows if row[1] not in (None, "")}
+    return {row[0]: upload_age_in_days(row[1]) for row in rows}
 
 
 def upload_age_weights(vids, cfg):
@@ -3371,8 +3391,7 @@ def item_to_rank(row):
     return {"idx": int(idx), "vid": vid, "ucid": ucid, "title": title,
             "score": max(float(score), 0.01), "top": float(top_hours),
             "age": float(age_h), "since_top": float(since_top_h),
-            "published_days": AGE_OF_A_LISTING_WITH_NO_DATE if pub_days in (None, "")
-            else float(pub_days)}
+            "published_days": upload_age_in_days(pub_days)}
 
 
 def display_score(it, cfg):

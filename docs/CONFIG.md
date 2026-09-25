@@ -148,6 +148,15 @@ Per-`expand` keys, ignored by the other modes:
 | `affinity` | see below | `recommended`, `channel_latest` | see below |
 | `max_channels` | `12` | `channel_latest`, `channel_popular` | channels to poll per run |
 | `max_age_days` | `21` | `channel_latest`, `topic_burst` | how new an upload must be |
+
+⚠️ **A `published` in the future is read as no date at all, not as a very new
+upload.** Anything past five minutes ahead of now — past ordinary clock drift —
+is refused where the listing is parsed, so every age cutoff above rejects it
+exactly as it rejects a listing carrying no date, and every ranking that prefers
+recent scores it as 30 days old. One such video was live on 2026-09-25 dated
+**2027-02-02**; it would have led any date-ranked lane for as long as the lane
+held it, and nothing was going to age it out.
+
 | `burst` | see below | `topic_burst` | see below |
 | `subscription` | see below | `subscription_feed` | see below |
 | `played_decay` | `0.99` | *policy* `last_played` | score falloff per rank in play order |
@@ -371,8 +380,8 @@ consensus lane's own setting, applied to every source alike; it changes nothing
 about how the source lanes rank themselves.
 
 The dates come from `playlist_videos`, in one query per draw, so this costs no
-fetch and no extra table. A video the playlist carries no date for is treated as
-30 days old rather than dropped.
+fetch and no extra table. A video the playlist carries no usable date for — none
+at all, or one naming the future — is treated as 30 days old rather than dropped.
 
 ⚠️ **With more than one mix in play this also thins what gets in, not only where
 it sits.** One account holding a `home-mix` means the draw takes every video it

@@ -218,6 +218,13 @@ class Unhurried:
         pass
 
 
+def days_ago(days):
+    """An RFC3339 `published` N days back from now, for a fixture that means "recent".
+    A date in the future used to serve, until parse_published started refusing one."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                         time.gmtime(time.time() - days * 86400.0))
+
+
 def rec(vid, title=None, author_id="UC-r", seconds=600, published=None):
     out = {"videoId": vid, "title": title or vid.upper(), "author": "R",
            "authorId": author_id, "lengthSeconds": seconds}
@@ -451,7 +458,7 @@ class Expand(LaneCase):
     def test_recommend_max_age_days_drops_a_recommendation_that_is_too_old(self):
         recs = {"h0000000000": {"recommendedVideos": [
             rec("ccccccccccc", published="2020-01-01T00:00:00Z"),
-            rec("ddddddddddd", published="2099-01-01T00:00:00Z")]}}
+            rec("ddddddddddd", published=days_ago(1))]}}
         self.fill(self.lane(recommend_max_age_days=7), watched=["h0000000000"],
                  db=Db(), api=Api(), fetch=Fetch(recs=recs))
         self.assertEqual(["ddddddddddd"], self.api.added())
