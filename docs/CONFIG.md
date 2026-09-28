@@ -169,6 +169,8 @@ Per-`expand` keys, ignored by the other modes:
 | `max_channels` | `12` | `channel_latest`, `channel_popular` | channels to poll per run |
 | `skip_news` | `false` | `channel_popular` | leave out the channels [`news_channels`](#news_channels) reads as news, and sweep out what the lane already holds from them |
 | `max_age_days` | `21` | `channel_latest`, `topic_burst` | how new an upload must be |
+| `min_age_days` | `0` | `channel_latest` | how old an upload must be; lets two lanes split one channel's uploads by age |
+| `expire_by_upload_age` | `false` | *sweep* | an entry uploaded more than `max_age_days` ago leaves, however recently it was added. `ttl_days` counts time in the lane in whole calendar days, so it cannot hold a lane to hours |
 
 ⚠️ **A `published` in the future is read as no date at all, not as a very new
 upload.** Anything past five minutes ahead of now — past ordinary clock drift —
