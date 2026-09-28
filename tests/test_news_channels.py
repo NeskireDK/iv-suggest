@@ -28,19 +28,22 @@ class Classifying(unittest.TestCase):
         meta = {"v%010d" % i: r for i, r in enumerate(rows)}
         return self.mod.news_channels(meta, self.cfg)
 
-    def test_a_channel_mostly_filed_under_news_is_news(self):
+    def test_eight_of_ten_filed_under_news_is_news(self):
         self.assertEqual({"UCnews"}, self.news(
-            row("UCnews", NEWS), row("UCnews", NEWS), row("UCnews", "Education")))
+            *[row("UCnews", NEWS)] * 8, *[row("UCnews", "Education")] * 2))
 
-    def test_one_news_video_does_not_make_a_gaming_channel_news(self):
+    def test_seven_of_ten_is_not(self):
         self.assertEqual(set(), self.news(
-            row("UCgame", "Gaming"), row("UCgame", "Gaming"), row("UCgame", NEWS)))
+            *[row("UCmixed", NEWS)] * 7, *[row("UCmixed", "Education")] * 3))
+
+    def test_too_few_videos_is_not_evidence_however_they_are_filed(self):
+        """Found live: a gaming streamer read as news off two cached videos."""
+        self.assertEqual(set(), self.news(*[row("UCfew", NEWS)] * 9))
 
     def test_a_row_without_a_real_category_is_not_counted(self):
         """A listing-filled row has genre_known false; its genre is not evidence."""
         self.assertEqual(set(), self.news(
-            row("UCx", NEWS, known=False), row("UCx", NEWS, known=False),
-            row("UCx", "Gaming")))
+            *[row("UCx", NEWS, known=False)] * 10, row("UCx", NEWS)))
 
     def test_a_channel_with_no_category_at_all_is_not_news(self):
         self.assertEqual(set(), self.news(row("UCx", None)))
@@ -49,9 +52,13 @@ class Classifying(unittest.TestCase):
         self.cfg["always"] = {"UCcommentary": "Some Commentary"}
         self.assertEqual({"UCcommentary"}, self.news(row("UCcommentary", "People & Blogs")))
 
+    def test_always_needs_no_evidence(self):
+        self.cfg["always"] = {"UCunseen": "Never Cached"}
+        self.assertEqual({"UCunseen"}, self.news())
+
     def test_never_overrides_the_category(self):
         self.cfg["never"] = {"UCnews": "Filed Wrong"}
-        self.assertEqual(set(), self.news(row("UCnews", NEWS)))
+        self.assertEqual(set(), self.news(*[row("UCnews", NEWS)] * 10))
 
     def test_a_lane_without_skip_news_skips_nothing_and_reads_no_cache(self):
         lane = dict(self.mod.DEFAULTS)
@@ -72,8 +79,8 @@ class BackCatalogue(unittest.TestCase):
         asked = self.asked
 
         class Fetcher:
-            meta = {"v0000000001": row("UCnews", NEWS),
-                    "v0000000002": row("UCgame", "Gaming")}
+            meta = dict({"n%010d" % i: row("UCnews", NEWS) for i in range(10)},
+                        v0000000002=row("UCgame", "Gaming"))
 
             def channel_popular(self, ucid):
                 asked.append(ucid)

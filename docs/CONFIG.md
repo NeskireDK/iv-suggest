@@ -51,13 +51,16 @@ Which channels a lane with `skip_news: true` leaves out.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `genres` | `["News & Politics"]` | a channel whose commonest YouTube category is one of these is news |
+| `genres` | `["News & Politics"]` | the YouTube categories that count as news |
+| `min_videos` | `10` | a channel needs this many cached videos carrying a category before it can be judged at all |
+| `min_share` | `0.8` | the share of those in `genres` that makes it news |
 | `always` | `{}` | channel id → name, news whatever its category says |
 | `never` | `{}` | channel id → name, never news whatever its category says |
 
 The category comes from the metadata cache, so it costs no fetch. Only rows
-from a full video fetch carry one; a channel the cache holds no category for is
-not news. The uploader picks the category, and commentary channels rarely file
+from a full video fetch carry one, so a channel short of `min_videos` is not
+news, however it is filed. Without that floor, measured 2026-09-28, a gaming
+streamer, a farm and an RC channel read as news off one to three videos each. The uploader picks the category, and commentary channels rarely file
 themselves under news — that is what `always` is for. Upload cadence does not
 separate them either: measured 2026-09-28, a finance commentary channel posted
 10.8 a week against 10.0 for a gaming channel and 13.0 for a car-detailing one.

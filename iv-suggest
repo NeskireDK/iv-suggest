@@ -1683,7 +1683,8 @@ def read_user():
     return watched, subs
 
 
-NEWS_CHANNEL_DEFAULTS = {"genres": ["News & Politics"], "always": {}, "never": {}}
+NEWS_CHANNEL_DEFAULTS = {"genres": ["News & Politics"], "min_videos": 10,
+                         "min_share": 0.8, "always": {}, "never": {}}
 
 
 def news_channel_config():
@@ -1691,22 +1692,24 @@ def news_channel_config():
     return dict(NEWS_CHANNEL_DEFAULTS, **(read_config().get("news_channels") or {}))
 
 
-def commonest_genre_by_channel(meta):
-    """Each channel's most frequent YouTube category, counting only rows that carry a real one."""
+def categorised_and_matching(meta, genres):
+    """Per channel, (cached videos carrying a real category, how many of those are in `genres`)."""
     counts = {}
     for m in meta.values():
         if m.get("genre_known", True) and m.get("genre") and m.get("authorId"):
-            per_genre = counts.setdefault(m["authorId"], {})
-            per_genre[m["genre"]] = per_genre.get(m["genre"], 0) + 1
-    return {cid: max(per_genre.items(), key=lambda kv: (kv[1], kv[0]))[0]
-            for cid, per_genre in counts.items()}
+            categorised, matching = counts.get(m["authorId"], (0, 0))
+            counts[m["authorId"]] = (categorised + 1,
+                                     matching + (m["genre"] in genres))
+    return counts
 
 
 def news_channels(meta, cfg):
-    """Channel ids read as news: commonest category in `genres`, plus `always`, minus `never`."""
-    genres = set(cfg["genres"] or [])
-    by_genre = {cid for cid, genre in commonest_genre_by_channel(meta).items()
-                if genre in genres}
+    """Channel ids read as news: at least `min_videos` categorised and `min_share` of them
+    in `genres`, plus `always`, minus `never`."""
+    counts = categorised_and_matching(meta, set(cfg["genres"] or []))
+    by_genre = {cid for cid, (categorised, matching) in counts.items()
+                if categorised >= cfg["min_videos"]
+                and matching >= cfg["min_share"] * categorised}
     return (by_genre | set(cfg["always"] or [])) - set(cfg["never"] or [])
 
 
