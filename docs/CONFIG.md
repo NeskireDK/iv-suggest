@@ -170,7 +170,11 @@ Per-`expand` keys, ignored by the other modes:
 | `skip_news` | `false` | `channel_popular` | leave out the channels [`news_channels`](#news_channels) reads as news, and sweep out what the lane already holds from them |
 | `max_age_days` | `21` | `channel_latest`, `topic_burst` | how new an upload must be |
 | `min_age_days` | `0` | `channel_latest` | how old an upload must be; lets two lanes split one channel's uploads by age |
+
+Both ages are read off the listing, where YouTube rounds down to whole days: `1 day ago` is 24 to 48 hours, `2 days ago` 48 to 72. `max_age_days` is strict, so at `2` a lane takes `hours ago` and `1 day ago` only, and a lane with `min_age_days: 2` takes `2 days ago` onwards — the two meet without a gap or an overlap.
 | `expire_by_upload_age` | `false` | *sweep* | an entry uploaded more than `max_age_days` ago leaves, however recently it was added. `ttl_days` counts time in the lane in whole calendar days, so it cannot hold a lane to hours |
+
+The sweep reads the playlist row's upload date, which Invidious stores without a time of day, so it can call a video up to a day older than it is. It is strict anyway — right after a run nothing held is past `max_age_days` — and `aged_out` carries no cooldown, so a video swept a day early comes back if its channel is read while YouTube still calls it recent.
 
 ⚠️ **A `published` in the future is read as no date at all, not as a very new
 upload.** Anything past five minutes ahead of now — past ordinary clock drift —
