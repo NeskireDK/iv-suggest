@@ -408,7 +408,9 @@ lanes:
       published_halflife_days: 21
       published_floor: 0.15
 
-  # Music only, which is what this slot pointed at before it was compiled.
+  # new-for-you, not music-discover: Trending carries what is recent and
+  # Popular what it is not. This lane is the graph held to 14 days, holds no
+  # music, and is not a home-mix source, so the two feeds share no video.
   - id: trending
     title: "Trending"
     policy: consensus
@@ -417,7 +419,7 @@ lanes:
     min_watched: 0
     consensus:
       sources:
-        - {users: all, lane: music-discover}
+        - {users: all, lane: new-for-you}
 
   # What a newly enrolled account opens onto, and a standing household feed for
   # everyone else. `users: all` names nobody, so it keeps working as accounts
