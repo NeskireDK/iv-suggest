@@ -52,6 +52,12 @@ class Expanding(unittest.TestCase):
     def test_no_floor_takes_everything_it_used_to(self):
         self.assertEqual(4, len(self.found(max_age_days=30)))
 
+    def test_two_days_ago_goes_to_the_old_lane_not_the_young_one(self):
+        """YouTube says "2 days ago" for 48 to 72 hours; Invidious makes it exactly 2.0."""
+        self.run.fetcher.channel_latest = lambda ucid: {"videos": [upload("twodays0001", 2.0)]}
+        self.assertEqual(set(), self.found(max_age_days=2))
+        self.assertEqual({"twodays0001"}, self.found(max_age_days=30, min_age_days=2))
+
 
 class UndatedListing(unittest.TestCase):
     """Invidious stamps an undated listing entry as fetched this instant."""
@@ -103,6 +109,11 @@ class Sweeping(unittest.TestCase):
 
     def test_a_dry_run_with_no_playlist_yet_asks_nothing(self):
         self.assertEqual(frozenset(), self.mod.uploaded_too_long_ago(self.lane, None))
+
+    def test_aged_out_carries_no_cooldown(self):
+        """The stored date has no time of day, so a strict sweep can take a video
+        that is really a day younger; it may come back while YouTube still says so."""
+        self.assertEqual(0, self.mod.cooldown_days_for(self.lane, "aged_out"))
 
     def test_it_leaves_as_aged_out(self):
         run = self.mod.LaneRun([], set(), set(), {}, None, True, None, set())

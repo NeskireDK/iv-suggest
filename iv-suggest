@@ -1844,6 +1844,7 @@ def cooldown_days_for(lane, why):
         return 0
     return {"dead": 0,
             "news": 0,
+            "aged_out": 0,
             "watched": lane["watched_cooldown_days"],
             "unwatched": lane["rotate_cooldown_days"],
             "displaced": lane["rotate_cooldown_days"],
@@ -2140,6 +2141,14 @@ def days_since_upload(rec):
     return upload_age_in_days((time.time() - published) / 86400.0)
 
 
+def within_upload_age(rec, lane):
+    """Whether a dated listing entry is at least `min_age_days` and under `max_age_days` old.
+    Strict at the top: YouTube's "2 days ago" is 48 to 72 hours and arrives as exactly 2.0."""
+    if not parse_published(rec):
+        return False
+    return lane["min_age_days"] <= days_since_upload(rec) < lane["max_age_days"]
+
+
 def is_too_old(rec, cutoff):
     """Whether a listing entry predates the cutoff. Free: a listing carries `published`."""
     if not cutoff:
@@ -2268,7 +2277,6 @@ def expand_by_channel_uploads(lane, seeds, room, run):
     picks = already_read + channels_to_read(unread, lane["max_channels"])
     log("  %d unsubscribed channels in the history, taking %d, %d of them "
         "already read this run" % (len(watch_counts), len(picks), len(already_read)))
-    cutoff = time.time() - lane["max_age_days"] * 86400.0
     for rank, (cid, weight) in enumerate(picks):
         try:
             data = run.fetcher.channel_latest(cid)
@@ -2281,11 +2289,9 @@ def expand_by_channel_uploads(lane, seeds, room, run):
                 continue
             if rec.get("liveNow") or rec.get("isUpcoming"):
                 continue
-            if is_too_old(rec, cutoff):
+            if not within_upload_age(rec, lane):
                 continue
             age = days_since_upload(rec)
-            if age < lane["min_age_days"]:
-                continue
             scores[rid] = max(scores.get(rid, 0.0), weight * (0.93 ** age))
             meta_seen.setdefault(rid, listing_meta(rec))
     return scores, meta_seen
