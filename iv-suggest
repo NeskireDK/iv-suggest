@@ -174,6 +174,8 @@ DEFAULTS = {
     "skip_news": False,
     "max_channels": 12,       # expand: channel_latest, channels per run
     "max_age_days": 21,       # expand: channel_latest and topic_burst, how new an upload must be
+    "min_age_days": 0,
+    "expire_by_upload_age": False,
     # expand: topic_burst. A term must be watched `min_recent` times inside the
     # newest `recent` history entries AND be `min_lift` times commoner there
     # than in the `baseline` before them. Both, because either alone is noise:
@@ -1940,7 +1942,7 @@ def date_this_many_active_days_ago(active_days):
 
 
 def why_it_leaves(v, lane, run, added_at, ttl_cutoff, stale_cutoff="",
-                  news=frozenset()):
+                  news=frozenset(), too_old=frozenset()):
     """Why this entry leaves the lane tonight, or None to keep it.
     Blocked and news are tested first: they are the reasons that carry no cooldown."""
     if v.get("authorId") in run.blocked:
@@ -1949,6 +1951,8 @@ def why_it_leaves(v, lane, run, added_at, ttl_cutoff, stale_cutoff="",
         return "news"
     if v["videoId"] in run.dead:
         return "dead"
+    if v["videoId"] in too_old:
+        return "aged_out"
     if lane["exclude_watched"] and v["videoId"] in run.watched_set:
         return "watched"
     if ttl_cutoff and added_at.get(v["videoId"], "9999") < ttl_cutoff:
@@ -2012,6 +2016,14 @@ def what_this_run_gives_up(keep, lane, plid, added_ts, item_score):
     return oldest_survivors(keep, lane, added_ts, item_score), "rotated"
 
 
+def uploaded_too_long_ago(lane, plid):
+    """Entries uploaded more than `max_age_days` ago; none unless the lane sets `expire_by_upload_age`."""
+    if not lane["expire_by_upload_age"] or not plid:
+        return frozenset()
+    return frozenset(vid for vid, days in upload_age_in(plid).items()
+                     if days > lane["max_age_days"])
+
+
 def room_for_new(lane, keep):
     """Slots this run may fill: what the lane is short, capped by how fast it may grow."""
     short = lane["size"] - len(keep)
@@ -2026,10 +2038,11 @@ def sweep_lane(lane, current, plid, run):
     old = one("SELECT to_char(now() - interval '%d days','YYYY-MM-DD');" % ttl) if ttl else ""
     stale = date_this_many_active_days_ago(lane["stale_after_active_days"])
     news = news_channels_to_skip(lane, run)
+    too_old = uploaded_too_long_ago(lane, plid)
 
     drop, keep = [], []
     for v in current:
-        why = why_it_leaves(v, lane, run, added_at, old, stale, news)
+        why = why_it_leaves(v, lane, run, added_at, old, stale, news, too_old)
         (drop if why else keep).append((v, why))
 
     retire, gave_up = what_this_run_gives_up(keep, lane, plid, added_ts, item_score)
@@ -2255,6 +2268,8 @@ def expand_by_channel_uploads(lane, seeds, room, run):
             if published and published < cutoff:
                 continue
             age = days_since_upload(rec)
+            if age < lane["min_age_days"]:
+                continue
             scores[rid] = max(scores.get(rid, 0.0), weight * (0.93 ** age))
             meta_seen.setdefault(rid, listing_meta(rec))
     return scores, meta_seen

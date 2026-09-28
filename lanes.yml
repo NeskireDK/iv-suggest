@@ -157,6 +157,7 @@ lanes:
     refresh_per_day: 4
     max_channels: 16
     max_age_days: 30
+    min_age_days: 2             # younger belongs to just-uploaded
     max_per_channel: 2
     # 16 channels at one fetch each, plus headroom for the retries a channel
     # listing now takes: at 20 the cap bound mid-lane on a rate-limited night
@@ -196,6 +197,22 @@ lanes:
     refresh_per_day: 6
     sample_pool: 40
     keep_min: 15
+
+  # What Trending publishes. The fresh-uploads channels read for the last two
+  # days only, emptied by upload age rather than by time in the lane, so it
+  # never holds anything older. Subscribed channels stay out: their new uploads
+  # are the subscription feed's.
+  - id: just-uploaded
+    title: "Just uploaded"
+    seed: {limit: 400}
+    expand: channel_latest
+    size: 30
+    ttl_days: 3
+    max_channels: 20
+    max_age_days: 2
+    expire_by_upload_age: true
+    max_per_channel: 2
+    fetch_cap: 36
 
   # Shorts are out of the subscription feed (feed_kinds: [video]) but not thrown
   # away — they land here instead.
@@ -415,9 +432,9 @@ lanes:
       published_halflife_days: 21
       published_floor: 0.15
 
-  # new-for-you, not music-discover: Trending carries what is recent and
-  # Popular what it is not. This lane is the graph held to 14 days, holds no
-  # music, and is not a home-mix source, so the two feeds share no video.
+  # Trending carries the last two days and Popular what is older:
+  # just-uploaded is not a home-mix source, and fresh-uploads takes nothing
+  # younger than it, so the two feeds share no video.
   - id: trending
     title: "Trending"
     policy: consensus
@@ -426,7 +443,7 @@ lanes:
     min_watched: 0
     consensus:
       sources:
-        - {users: all, lane: new-for-you}
+        - {users: all, lane: just-uploaded}
 
   # What a newly enrolled account opens onto, and a standing household feed for
   # everyone else. `users: all` names nobody, so it keeps working as accounts
