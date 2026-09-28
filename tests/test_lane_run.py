@@ -155,6 +155,7 @@ class Fetch:
         self.lane_lookups = 0
         self.buried = []
         self.remembered = []
+        self.latest = {}
 
     def begin_lane(self, lane_id, cap):
         self.lane_cap, self.lane_used = cap, 0
@@ -166,9 +167,12 @@ class Fetch:
         return self.recs.get(vid)
 
     def channel_latest(self, ucid):
+        if ucid in self.latest:
+            return self.latest[ucid]
         self.fetches += 1
         self.lane_used += 1
-        return self.channels.get(ucid)
+        self.latest[ucid] = self.channels.get(ucid)
+        return self.latest[ucid]
 
     def search(self, term):
         self.fetches += 1
@@ -467,19 +471,23 @@ class Expand(LaneCase):
         fetch = Fetch(meta={"h0000000000": {"authorId": "UC-x"},
                             "h0000000001": {"authorId": "UC-sub"}},
                       channels={"UC-x": {"videos": [rec("ccccccccccc",
-                                                        author_id="UC-x")]}})
+                                                        author_id="UC-x",
+                                                        published=days_ago(1))]}})
         self.fill(self.lane(expand="channel_latest"),
                  watched=["h0000000001", "h0000000000"], subs=["UC-sub"],
                  db=Db(), api=Api(), fetch=fetch)
         self.assertEqual(["ccccccccccc"], self.api.added())
 
     def test_channel_latest_skips_a_live_or_upcoming_upload(self):
-        live = dict(rec("ccccccccccc", author_id="UC-x"), liveNow=True)
-        soon = dict(rec("ddddddddddd", author_id="UC-x"), isUpcoming=True)
+        live = dict(rec("ccccccccccc", author_id="UC-x", published=days_ago(1)),
+                    liveNow=True)
+        soon = dict(rec("ddddddddddd", author_id="UC-x", published=days_ago(1)),
+                    isUpcoming=True)
         fetch = Fetch(meta={"h0000000000": {"authorId": "UC-x"}},
                       channels={"UC-x": {"videos": [live, soon,
                                                     rec("eeeeeeeeeee",
-                                                        author_id="UC-x")]}})
+                                                        author_id="UC-x",
+                                                        published=days_ago(1))]}})
         self.fill(self.lane(expand="channel_latest"), watched=["h0000000000"],
                  db=Db(), api=Api(), fetch=fetch)
         self.assertEqual(["eeeeeeeeeee"], self.api.added())

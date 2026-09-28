@@ -166,7 +166,7 @@ Per-`expand` keys, ignored by the other modes:
 | `recommend_age_halflife_days` | `0` | `recommended` | halve a candidate's score per N days since it was uploaded. `0` = off. `recommend_max_age_days` decides what may enter at all; this decides how much of what enters is old, and costs nothing extra for the same reason |
 | `recommend_age_floor` | `0.15` | `recommended` | the discount an ancient recommendation bottoms out at |
 | `affinity` | see below | `recommended`, `channel_latest` | see below |
-| `max_channels` | `12` | `channel_latest`, `channel_popular` | channels to poll per run |
+| `max_channels` | `12` | `channel_latest`, `channel_popular` | channels to poll per run. A `channel_latest` lane also reads, free, every eligible channel an earlier lane already read in the same run |
 | `skip_news` | `false` | `channel_popular` | leave out the channels [`news_channels`](#news_channels) reads as news, and sweep out what the lane already holds from them |
 | `max_age_days` | `21` | `channel_latest`, `topic_burst` | how new an upload must be |
 | `min_age_days` | `0` | `channel_latest` | how old an upload must be; lets two lanes split one channel's uploads by age |
@@ -179,6 +179,11 @@ exactly as it rejects a listing carrying no date, and every ranking that prefers
 recent scores it as 30 days old. One such video was live on 2026-09-25 dated
 **2027-02-02**; it would have led any date-ranked lane for as long as the lane
 held it, and nothing was going to age it out.
+
+The same goes for a `publishedText` of exactly `0 seconds ago`: that is how
+Invidious stamps a listing entry YouTube sent without a date. On 2026-09-28 a
+`/latest` listing carried six-month-old videos that way, and eight of them
+reached the 48-hour Trending lane.
 
 | `burst` | see below | `topic_burst` | see below |
 | `subscription` | see below | `subscription_feed` | see below |
@@ -384,6 +389,7 @@ upstream.
 | `agreement_power` | `1.0` | exponent on the number of mixes holding a video. `1.0` doubles what two accounts agree on, `0.0` turns agreement off and leaves the depth sum |
 | `published_halflife_days` | `0` | upload age halves a video's weight every N days. `0` = off, which is the plain depth-and-agreement weight |
 | `published_floor` | `0.15` | the least that discount may leave, so an old video is unlikely to lead rather than excluded |
+| `repeat_channel_weight` | `1.0` | each channel's heaviest video keeps its weight, its next takes this times it, the one after this squared. Below `1.0` a channel's repeats draw further down; when the draw takes every video, it changes position only, never membership. `1.0` = off |
 
 The weight of a video is `1 / (rank + k)` summed over every mix holding it,
 times `holders ** agreement_power`, times the upload-age discount; the playlist
