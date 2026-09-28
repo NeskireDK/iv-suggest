@@ -201,18 +201,20 @@ lanes:
   # What Trending publishes. The fresh-uploads channels read for the last two
   # days only, emptied by upload age rather than by time in the lane, so it
   # never holds anything older. Subscribed channels stay out: their new uploads
-  # are the subscription feed's.
+  # are the subscription feed's. 60 channels because most post less than every
+  # other day: at 20 on 2026-09-28 the lane held 7 real ones. Whatever
+  # fresh-uploads already read comes on top, free.
   - id: just-uploaded
     title: "Just uploaded"
     seed: {limit: 400}
     expand: channel_latest
     size: 30
     ttl_days: 3
-    max_channels: 20
+    max_channels: 60
     max_age_days: 2
     expire_by_upload_age: true
-    max_per_channel: 2
-    fetch_cap: 36
+    max_per_channel: 3
+    fetch_cap: 80
 
   # Shorts are out of the subscription feed (feed_kinds: [video]) but not thrown
   # away — they land here instead.
@@ -444,6 +446,7 @@ lanes:
     consensus:
       sources:
         - {users: all, lane: just-uploaded}
+      repeat_channel_weight: 0.3  # a channel's 2nd and 3rd upload sit further down, not beside its 1st
 
   # What a newly enrolled account opens onto, and a standing household feed for
   # everyone else. `users: all` names nobody, so it keeps working as accounts

@@ -504,6 +504,7 @@ CONSENSUS_DEFAULTS = {
     # what is happening now, so the feed discounts age for itself. 0 = off.
     "published_halflife_days": 0,
     "published_floor": 0.15,
+    "repeat_channel_weight": 1.0,
 }
 
 COMPILED_POLICIES = ("mix", "consensus")
@@ -704,9 +705,17 @@ def not_in_the_future(seconds):
     return 0.0 if seconds > time.time() + CLOCK_SKEW_GRACE_SECONDS else seconds
 
 
+# Invidious stamps a listing entry YouTube sent without a date as fetched this
+# instant, so its `publishedText` reads exactly this. Seen live 2026-09-28: a
+# channel's /latest listed six-month-old videos this way, after ones from months ago.
+UNDATED_LISTING_TEXT = "0 seconds ago"
+
+
 def parse_published(rec):
     """Unix seconds from a listing's `published`, or 0 when it carries none or names the future.
     `channels/latest` sends unix seconds, `recommendedVideos` an RFC3339 string."""
+    if rec.get("publishedText") == UNDATED_LISTING_TEXT:
+        return 0.0
     pub = rec.get("published")
     if isinstance(pub, (int, float)):
         return not_in_the_future(float(pub))
@@ -1069,6 +1078,7 @@ class Fetcher:
         self.fails = 0
         self.aborts = 0
         self.skipped_500 = 0
+        self.latest = {}
         self.dead_hits = 0
         self.lane_cap = None
         self.lane_used = 0
@@ -1151,7 +1161,9 @@ class Fetcher:
         bury_video(self.dead, vid, days, reason)
 
     def channel_latest(self, ucid):
-        """Recent uploads of one channel: one fetch for about 60 videos."""
+        """Recent uploads of one channel: one fetch for about 60 videos, and none if already read this run."""
+        if ucid in self.latest:
+            return self.latest[ucid]
         self._refuse_when_out_of_budget()
         delay = 5.0
         for attempt in range(3):
@@ -1161,6 +1173,7 @@ class Fetcher:
                                attempt=attempt)
                 self._spend_one_fetch()
                 self._upstream_answered()
+                self.latest[ucid] = data
                 return data
             except urllib.error.HTTPError as e:
                 self._spend_one_fetch()
@@ -2248,9 +2261,13 @@ def expand_by_channel_uploads(lane, seeds, room, run):
     affinity = channel_affinity(run, cfg)
     watch_counts = {cid: weight for cid, weight in affinity.weights.items()
                     if cid not in run.subs and cid not in run.blocked}
-    picks = channels_to_read(watch_counts, lane["max_channels"])
-    log("  %d unsubscribed channels in the history, taking %d"
-        % (len(watch_counts), len(picks)))
+    already_read = [(cid, watch_counts[cid]) for cid in run.fetcher.latest
+                    if cid in watch_counts]
+    unread = {cid: weight for cid, weight in watch_counts.items()
+              if cid not in run.fetcher.latest}
+    picks = already_read + channels_to_read(unread, lane["max_channels"])
+    log("  %d unsubscribed channels in the history, taking %d, %d of them "
+        "already read this run" % (len(watch_counts), len(picks), len(already_read)))
     cutoff = time.time() - lane["max_age_days"] * 86400.0
     for rank, (cid, weight) in enumerate(picks):
         try:
@@ -2264,8 +2281,7 @@ def expand_by_channel_uploads(lane, seeds, room, run):
                 continue
             if rec.get("liveNow") or rec.get("isUpcoming"):
                 continue
-            published = parse_published(rec)
-            if published and published < cutoff:
+            if is_too_old(rec, cutoff):
                 continue
             age = days_since_upload(rec)
             if age < lane["min_age_days"]:
@@ -3044,8 +3060,27 @@ def consensus_weights(mixes, cfg):
     power = float(cfg["agreement_power"])
     depth = depth_weights(mixes, float(cfg["rank_offset"]))
     age = upload_age_weights(set(depth), cfg)
-    return {vid: weight * counts[vid] ** power * age.get(vid, 1.0)
-            for vid, weight in depth.items()}
+    weights = {vid: weight * counts[vid] ** power * age.get(vid, 1.0)
+               for vid, weight in depth.items()}
+    factor = float(cfg["repeat_channel_weight"])
+    if factor >= 1.0 or not weights:
+        return weights
+    return discount_repeat_channels(weights, channels_of(set(weights)), factor)
+
+
+def channels_of(vids):
+    """Each video's channel, off whichever playlist rows already carry it."""
+    return dict(query("SELECT id, max(ucid) FROM playlist_videos WHERE id IN (%s) "
+                      "GROUP BY id;" % ",".join(lit(v) for v in sorted(vids))))
+
+
+def discount_repeat_channels(weights, channels, factor):
+    """Each channel's heaviest video at full weight, the next at `factor` times, then factor², and on."""
+    by_channel = {}
+    for vid in sorted(weights, key=lambda v: -weights[v]):
+        by_channel.setdefault(channels.get(vid) or vid, []).append(vid)
+    return {vid: weights[vid] * factor ** place
+            for vids in by_channel.values() for place, vid in enumerate(vids)}
 
 
 def consensus_draw(weights, size):
