@@ -171,6 +171,7 @@ DEFAULTS = {
     # started dating it on 2026-09-23.
     "affinity": {"halflife_entries": 200, "scan": 1500,
                  "boost": 2.0, "floor": 0.7},
+    "skip_news": False,
     "max_channels": 12,       # expand: channel_latest, channels per run
     "max_age_days": 21,       # expand: channel_latest and topic_burst, how new an upload must be
     # expand: topic_burst. A term must be watched `min_recent` times inside the
@@ -1682,6 +1683,40 @@ def read_user():
     return watched, subs
 
 
+NEWS_CHANNEL_DEFAULTS = {"genres": ["News & Politics"], "always": {}, "never": {}}
+
+
+def news_channel_config():
+    """The `news_channels` block of lanes.yml over NEWS_CHANNEL_DEFAULTS."""
+    return dict(NEWS_CHANNEL_DEFAULTS, **(read_config().get("news_channels") or {}))
+
+
+def commonest_genre_by_channel(meta):
+    """Each channel's most frequent YouTube category, counting only rows that carry a real one."""
+    counts = {}
+    for m in meta.values():
+        if m.get("genre_known", True) and m.get("genre") and m.get("authorId"):
+            per_genre = counts.setdefault(m["authorId"], {})
+            per_genre[m["genre"]] = per_genre.get(m["genre"], 0) + 1
+    return {cid: max(per_genre.items(), key=lambda kv: (kv[1], kv[0]))[0]
+            for cid, per_genre in counts.items()}
+
+
+def news_channels(meta, cfg):
+    """Channel ids read as news: commonest category in `genres`, plus `always`, minus `never`."""
+    genres = set(cfg["genres"] or [])
+    by_genre = {cid for cid, genre in commonest_genre_by_channel(meta).items()
+                if genre in genres}
+    return (by_genre | set(cfg["always"] or [])) - set(cfg["never"] or [])
+
+
+def news_channels_to_skip(lane, run):
+    """The news channels this lane leaves out; none unless it sets `skip_news`."""
+    if not lane["skip_news"]:
+        return frozenset()
+    return news_channels(run.fetcher.meta, news_channel_config())
+
+
 def blocklist_config():
     """The `blocklist` block of lanes.yml over BLOCKLIST_DEFAULTS."""
     return dict(BLOCKLIST_DEFAULTS, **(read_config().get("blocklist") or {}))
@@ -1790,6 +1825,7 @@ def cooldown_days_for(lane, why):
     if why == "blocked":
         return 0
     return {"dead": 0,
+            "news": 0,
             "watched": lane["watched_cooldown_days"],
             "unwatched": lane["rotate_cooldown_days"],
             "displaced": lane["rotate_cooldown_days"],
@@ -1900,11 +1936,14 @@ def date_this_many_active_days_ago(active_days):
                % (acct(), lit(WATCHED), int(active_days), int(active_days)))
 
 
-def why_it_leaves(v, lane, run, added_at, ttl_cutoff, stale_cutoff=""):
+def why_it_leaves(v, lane, run, added_at, ttl_cutoff, stale_cutoff="",
+                  news=frozenset()):
     """Why this entry leaves the lane tonight, or None to keep it.
-    Blocked is tested first: it is the one reason that carries no cooldown."""
+    Blocked and news are tested first: they are the reasons that carry no cooldown."""
     if v.get("authorId") in run.blocked:
         return "blocked"
+    if v.get("authorId") in news:
+        return "news"
     if v["videoId"] in run.dead:
         return "dead"
     if lane["exclude_watched"] and v["videoId"] in run.watched_set:
@@ -1983,10 +2022,11 @@ def sweep_lane(lane, current, plid, run):
     ttl = lane["ttl_days"]
     old = one("SELECT to_char(now() - interval '%d days','YYYY-MM-DD');" % ttl) if ttl else ""
     stale = date_this_many_active_days_ago(lane["stale_after_active_days"])
+    news = news_channels_to_skip(lane, run)
 
     drop, keep = [], []
     for v in current:
-        why = why_it_leaves(v, lane, run, added_at, old, stale)
+        why = why_it_leaves(v, lane, run, added_at, old, stale, news)
         (drop if why else keep).append((v, why))
 
     retire, gave_up = what_this_run_gives_up(keep, lane, plid, added_ts, item_score)
@@ -2322,11 +2362,13 @@ def expand_by_channel_back_catalogue(lane, seeds, room, run):
     """The best-watched uploads of the channels this account returns to, at any age."""
     scores, meta_seen = {}, {}
     affinity = channel_affinity(run, lane["affinity"])
+    news = news_channels_to_skip(lane, run)
     wanted = {cid: weight for cid, weight in affinity.weights.items()
-              if cid not in run.blocked}
+              if cid not in run.blocked and cid not in news}
     picks = channels_to_read(wanted, lane["max_channels"])
-    log("  %d watched channels, taking the back catalogue of %d"
-        % (len(wanted), len(picks)))
+    skipped = len(set(affinity.weights) & news)
+    log("  %d watched channels, %d news skipped, taking the back catalogue of %d"
+        % (len(wanted), skipped, len(picks)))
     for rank, (cid, weight) in enumerate(picks):
         try:
             data = run.fetcher.channel_popular(cid)

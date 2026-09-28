@@ -8,6 +8,12 @@ blocklist:
   playlist: Blocked
   channels: []
 
+# Both file themselves under People & Blogs / Education, so the category misses them.
+news_channels:
+  always:
+    UCIr4vkCsn0tdTW2xZ1jRG1g: Liberal Hivemind
+    UCagiBBx1prefrlsDzDxuA9A: Solving The Money Problem
+
 # Every account on the instance, including ones registered later. `min_watched`
 # below is what stops a new account being handed a dozen playlists it cannot
 # fill; `household` is what it gets in the meantime.
@@ -307,6 +313,7 @@ lanes:
     refresh_per_day: 2
     keep_min: 10
     stale_after_active_days: 0  # nothing here is stale for being unwatched
+    skip_news: true             # a 2023 news segment is stale, not a deep cut
 
   # A topic the account was not watching a month ago and is now. Small on
   # purpose: it is a tip-off, not a section, and it answers to whatever is

@@ -34,7 +34,7 @@ in your shell is missing from a run started by a timer — test with `env -i`.
 
 ## `lanes.yml`
 
-Top-level keys: `blocklist`, `auto_enrol`, `users`, `defaults`, `lanes`.
+Top-level keys: `blocklist`, `news_channels`, `auto_enrol`, `users`, `defaults`, `lanes`.
 
 ### `blocklist`
 
@@ -44,6 +44,23 @@ Top-level keys: `blocklist`, `auto_enrol`, `users`, `defaults`, `lanes`.
 | `channels` | `[]` | extra channel ids, for a channel with nothing convenient to tap |
 
 Per account, because the playlist keys off its owner.
+
+### `news_channels`
+
+Which channels a lane with `skip_news: true` leaves out.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `genres` | `["News & Politics"]` | a channel whose commonest YouTube category is one of these is news |
+| `always` | `{}` | channel id → name, news whatever its category says |
+| `never` | `{}` | channel id → name, never news whatever its category says |
+
+The category comes from the metadata cache, so it costs no fetch. Only rows
+from a full video fetch carry one; a channel the cache holds no category for is
+not news. The uploader picks the category, and commentary channels rarely file
+themselves under news — that is what `always` is for. Upload cadence does not
+separate them either: measured 2026-09-28, a finance commentary channel posted
+10.8 a week against 10.0 for a gaming channel and 13.0 for a car-detailing one.
 
 ### `auto_enrol`
 
@@ -147,6 +164,7 @@ Per-`expand` keys, ignored by the other modes:
 | `recommend_age_floor` | `0.15` | `recommended` | the discount an ancient recommendation bottoms out at |
 | `affinity` | see below | `recommended`, `channel_latest` | see below |
 | `max_channels` | `12` | `channel_latest`, `channel_popular` | channels to poll per run |
+| `skip_news` | `false` | `channel_popular` | leave out the channels [`news_channels`](#news_channels) reads as news, and sweep out what the lane already holds from them |
 | `max_age_days` | `21` | `channel_latest`, `topic_burst` | how new an upload must be |
 
 ⚠️ **A `published` in the future is read as no date at all, not as a very new
