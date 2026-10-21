@@ -80,7 +80,8 @@ class WhoLeaves(unittest.TestCase):
 
     def lowest(self, lane, keep, scores, uploads=None):
         added, item_score = self.state(scores)
-        return self.mod.lowest_standing(keep, lane, added, item_score, uploads or {})
+        return self.mod.lowest_standing(keep, lane, self.mod.a_full_day(lane),
+                                        added, item_score, uploads or {})
 
     def test_a_lane_below_its_size_gives_up_nothing(self):
         """It grows into `size` rather than churning while it is still short."""
@@ -104,7 +105,8 @@ class WhoLeaves(unittest.TestCase):
                  "new_and_weak": self.now, "b": self.now, "c": self.now}
         scores = {"old_but_good": 9.0, "new_and_weak": 0.1, "b": 5.0, "c": 5.0}
         lane = dict(self.lane, grow_per_day=1)
-        got = self.mod.lowest_standing(self.keep(*scores), lane, added, scores, {})
+        got = self.mod.lowest_standing(self.keep(*scores), lane,
+                                       self.mod.a_full_day(lane), added, scores, {})
         self.assertEqual({"new_and_weak"}, got)
 
     def test_an_upload_with_no_date_is_ranked_as_old_not_as_missing(self):
@@ -127,19 +129,58 @@ class HowFast(unittest.TestCase):
 
     def test_no_rate_fills_every_empty_slot_at_once(self):
         lane = dict(self.mod.DEFAULTS, size=100, grow_per_day=0)
-        self.assertEqual(100, self.mod.room_for_new(lane, self.keep(0)))
+        self.assertEqual(100, self.mod.room_for_new(lane, self.keep(0), self.mod.a_full_day(lane)))
 
     def test_a_rate_is_what_stops_a_size_100_lane_costing_100_adds_tonight(self):
         lane = dict(self.mod.DEFAULTS, size=100, grow_per_day=6)
-        self.assertEqual(6, self.mod.room_for_new(lane, self.keep(30)))
+        self.assertEqual(6, self.mod.room_for_new(lane, self.keep(30), self.mod.a_full_day(lane)))
 
     def test_the_rate_never_overfills_a_nearly_full_lane(self):
         lane = dict(self.mod.DEFAULTS, size=100, grow_per_day=6)
-        self.assertEqual(2, self.mod.room_for_new(lane, self.keep(98)))
+        self.assertEqual(2, self.mod.room_for_new(lane, self.keep(98), self.mod.a_full_day(lane)))
 
     def test_a_full_lane_has_room_for_exactly_what_it_gave_up(self):
         lane = dict(self.mod.DEFAULTS, size=100, grow_per_day=6)
-        self.assertEqual(6, self.mod.room_for_new(lane, self.keep(94)))
+        self.assertEqual(6, self.mod.room_for_new(lane, self.keep(94), self.mod.a_full_day(lane)))
+
+
+class SharedAcrossTheDaysRuns(unittest.TestCase):
+    """Three runs a day turn a lane over once a day, not three times."""
+
+    DAY = 86400.0
+    MIDNIGHT = 20000 * DAY
+
+    def setUp(self):
+        self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+
+    def spent_over_a_day(self, per_day, runs_a_day):
+        gap = self.DAY / runs_a_day
+        previous, spent = self.MIDNIGHT - gap / 3, 0
+        for i in range(runs_a_day):
+            now = previous + gap
+            spent += self.mod.share_of_a_daily_rate(per_day, previous, now)
+            previous = now
+        return spent
+
+    def test_three_runs_a_day_spend_the_rate_once_between_them(self):
+        for per_day in (1, 2, 5, 6, 8):
+            self.assertEqual(per_day, self.spent_over_a_day(per_day, 3), per_day)
+
+    def test_one_run_a_day_still_gets_the_whole_rate(self):
+        self.assertEqual(6, self.spent_over_a_day(6, 1))
+
+    def test_a_lane_that_never_ran_gets_the_whole_rate(self):
+        self.assertEqual(6, self.mod.share_of_a_daily_rate(6, 0.0, self.MIDNIGHT))
+
+    def test_missed_runs_do_not_pile_up_into_one_big_turnover(self):
+        self.assertEqual(6, self.mod.share_of_a_daily_rate(
+            6, self.MIDNIGHT - 3 * self.DAY, self.MIDNIGHT))
+
+    def test_a_zero_share_of_a_set_rate_means_no_room_not_unlimited_room(self):
+        lane = dict(self.mod.DEFAULTS, size=100, grow_per_day=6)
+        none_left = self.mod.Allowance(0, 0)
+        self.assertEqual(0, self.mod.room_for_new(
+            lane, [({"videoId": "a"}, None)], none_left))
 
 
 class WhichModel(unittest.TestCase):
@@ -155,7 +196,7 @@ class WhichModel(unittest.TestCase):
         lane = dict(self.mod.DEFAULTS, id="l", size=4, refresh_per_day=1)
         now = self.mod.time.time()
         got, why = self.mod.what_this_run_gives_up(
-            self.keep("early", "late"), lane, "PL1",
+            self.keep("early", "late"), lane, "PL1", self.mod.a_full_day(lane),
             {"early": now - 86400, "late": now}, {"early": 9.0, "late": 0.1})
         self.assertEqual(({"early"}, "rotated"), (got, why))
 
@@ -165,7 +206,7 @@ class WhichModel(unittest.TestCase):
                     shuffle=dict(self.mod.SHUFFLE_DEFAULTS))
         now = self.mod.time.time()
         got, why = self.mod.what_this_run_gives_up(
-            self.keep("early", "late"), lane, "PL1",
+            self.keep("early", "late"), lane, "PL1", self.mod.a_full_day(lane),
             {"early": now - 86400, "late": now}, {"early": 9.0, "late": 0.1})
         self.assertEqual(({"late"}, "displaced"), (got, why))
 

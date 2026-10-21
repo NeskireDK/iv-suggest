@@ -155,10 +155,10 @@ DEFAULTS = {
     "policy": "refill",       # refill | last_played | mix
     "privacy": "unlisted",    # only "private" breaks /feed/playlist/<plid> (RSS)
     "fetch_cap": 80,          # most fetches one lane may take from the run budget
-    "refresh_per_day": 0,     # retire this many of the oldest entries every run
+    "refresh_per_day": 0,     # retire this many of the oldest entries a day, shared by the day's runs
     "rotate_cooldown_days": 21,
     "keep_min": 0,            # never rotate the lane below this many videos
-    "grow_per_day": 0,        # most a run may add. 0 = fill every empty slot at once
+    "grow_per_day": 0,        # most the day's runs may add between them. 0 = fill every empty slot at once
     # Retire nothing on a clock: let the lane grow into `size`, then let each
     # new video displace the worst one already there. `grow_per_day` is the
     # rate, and the decays are what put a video at the bottom to be displaced.
@@ -1976,9 +1976,41 @@ def why_it_leaves(v, lane, run, added_at, ttl_cutoff, stale_cutoff="",
     return None
 
 
-def oldest_survivors(keep, lane, added_ts, item_score):
-    """The ids a forced daily turnover retires, oldest and lowest scoring first."""
-    rotate = min(lane["refresh_per_day"], max(0, len(keep) - lane["keep_min"]))
+SECONDS_PER_DAY = 86400.0
+
+Allowance = namedtuple("Allowance", "rotate grow")
+
+
+def a_full_day(lane):
+    """The lane's whole daily turnover, as a run a day or more after the last one gets it."""
+    return Allowance(lane["refresh_per_day"], lane["grow_per_day"])
+
+
+def share_of_a_daily_rate(per_day, previous_run, now):
+    """What this run may spend of a per-day rate, so the day's runs spend it once between them.
+    Counted against fixed day boundaries, so the fractions carry over instead of rounding up each run."""
+    if not previous_run or now - previous_run >= SECONDS_PER_DAY:
+        return per_day
+    return max(0, int(per_day * now / SECONDS_PER_DAY)
+               - int(per_day * previous_run / SECONDS_PER_DAY))
+
+
+def this_runs_allowance(lane, previous_run, now):
+    """The part of the lane's daily turnover that is this run's to spend."""
+    return Allowance(share_of_a_daily_rate(lane["refresh_per_day"], previous_run, now),
+                     share_of_a_daily_rate(lane["grow_per_day"], previous_run, now))
+
+
+def previous_run_of(lane_id):
+    """Epoch of this lane's last recorded run for the current account, or 0.0 if it never ran."""
+    started = one("SELECT extract(epoch FROM max(started)) FROM suggest.runs "
+                  "WHERE account=%s AND lane=%s;" % (acct(), lit(lane_id)))
+    return float(started) if started else 0.0
+
+
+def oldest_survivors(keep, lane, allowance, added_ts, item_score):
+    """The ids a forced turnover retires, oldest and lowest scoring first."""
+    rotate = min(allowance.rotate, max(0, len(keep) - lane["keep_min"]))
     if rotate <= 0:
         return set()
     stale = sorted(keep, key=lambda vw: (added_ts.get(vw[0]["videoId"], 0.0),
@@ -2004,10 +2036,10 @@ def standing_score(stored, days_in_lane, days_since_upload, cfg):
                          cfg["unwatched_floor"]))
 
 
-def lowest_standing(keep, lane, added_ts, item_score, upload_days):
+def lowest_standing(keep, lane, allowance, added_ts, item_score, upload_days):
     """The ids a full lane gives up so better ones can take their place, worst first.
     A lane below `size` gives up nothing: it grows into its size rather than churning."""
-    room_wanted = lane["grow_per_day"]
+    room_wanted = allowance.grow
     if len(keep) < lane["size"] or room_wanted <= 0:
         return set()
     now, cfg = time.time(), lane["shuffle"]
@@ -2022,12 +2054,12 @@ def lowest_standing(keep, lane, added_ts, item_score, upload_days):
     return {vw[0]["videoId"] for vw in sorted(keep, key=standing)[:room_wanted]}
 
 
-def what_this_run_gives_up(keep, lane, plid, added_ts, item_score):
+def what_this_run_gives_up(keep, lane, plid, allowance, added_ts, item_score):
     """Which entries leave to make room, and the word for why they did."""
     if lane["displace_when_full"]:
-        return lowest_standing(keep, lane, added_ts, item_score,
+        return lowest_standing(keep, lane, allowance, added_ts, item_score,
                                upload_age_in(plid)), "displaced"
-    return oldest_survivors(keep, lane, added_ts, item_score), "rotated"
+    return oldest_survivors(keep, lane, allowance, added_ts, item_score), "rotated"
 
 
 def uploaded_too_long_ago(lane, plid):
@@ -2038,10 +2070,10 @@ def uploaded_too_long_ago(lane, plid):
                      if days > lane["max_age_days"])
 
 
-def room_for_new(lane, keep):
-    """Slots this run may fill: what the lane is short, capped by how fast it may grow."""
+def room_for_new(lane, keep, allowance):
+    """Slots this run may fill: what the lane is short, capped by this run's share of its growth."""
     short = lane["size"] - len(keep)
-    return min(short, lane["grow_per_day"]) if lane["grow_per_day"] else short
+    return min(short, allowance.grow) if lane["grow_per_day"] else short
 
 
 def sweep_lane(lane, current, plid, run):
@@ -2059,7 +2091,9 @@ def sweep_lane(lane, current, plid, run):
         why = why_it_leaves(v, lane, run, added_at, old, stale, news, too_old)
         (drop if why else keep).append((v, why))
 
-    retire, gave_up = what_this_run_gives_up(keep, lane, plid, added_ts, item_score)
+    allowance = this_runs_allowance(lane, previous_run_of(lane_id), time.time())
+    retire, gave_up = what_this_run_gives_up(keep, lane, plid, allowance,
+                                             added_ts, item_score)
     if retire:
         drop.extend((v, gave_up) for v, _ in keep if v["videoId"] in retire)
         keep = [vw for vw in keep if vw[0]["videoId"] not in retire]
@@ -2068,7 +2102,7 @@ def sweep_lane(lane, current, plid, run):
         log("  - %-9s %s" % (why, v["title"][:60]))
         if not run.dry:
             retire_item(lane_id, plid, v, cooldown_days_for(lane, why), why)
-    room = room_for_new(lane, keep)
+    room = room_for_new(lane, keep, allowance)
     log("  swept %d, kept %d, room for %d" % (len(drop), len(keep), room))
     return drop, keep, room
 
@@ -4203,12 +4237,20 @@ def lane_target(lane):
     return 0 if lane["policy"] in COMPILED_POLICIES else lane["size"]
 
 
+def last_entry_by_lane():
+    """When a video last entered each lane, from the run log as well as what the lane still holds.
+    The items alone forget it the moment a lane empties, and an empty lane is the one to watch."""
+    return dict((r[0], float(r[1])) for r in query(
+        "SELECT lane, extract(epoch FROM max(entered)) FROM ("
+        "SELECT lane, added AS entered FROM suggest.items WHERE account=%s "
+        "UNION ALL SELECT lane, started FROM suggest.runs "
+        "WHERE account=%s AND added > 0) AS entries GROUP BY 1;" % (acct(), acct())))
+
+
 def lane_facts():
     """Everything the metrics need about the current account's lanes, one query per table."""
     return (tracked_by_lane(),
-            dict((r[0], float(r[1])) for r in query(
-                "SELECT lane, extract(epoch FROM max(added)) FROM suggest.items "
-                "WHERE account=%s GROUP BY 1;" % acct())),
+            last_entry_by_lane(),
             last_run_by_lane(),
             dict((r[0], r[1]) for r in query(
                 "SELECT lane, plid FROM suggest.lanes WHERE account=%s;" % acct())),

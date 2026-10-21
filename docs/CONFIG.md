@@ -137,9 +137,9 @@ only**. `init` and `run` name any inert key a lane sets:
 | **Turnover** | | |
 | `ttl_days` | `14` | drop an unwatched entry older than this, in calendar days. `0` = never |
 | `stale_after_active_days` | `0` | drop an unwatched entry once this many days **the account actually watched something** have passed since it was added. Days of use, not calendar days, so a fortnight away does not empty the lane. `0` = off, and `ttl_days` is the calendar backstop underneath it. Reads `suggest.plays`, so an account the harvest records no plays for never accrues a day and keeps everything until `ttl_days` |
-| `refresh_per_day` | `0` | retire this many of the oldest every run, whatever the TTL says |
+| `refresh_per_day` | `0` | retire this many of the oldest a day, whatever the TTL says. Several runs a day share it, against fixed day boundaries; a run a day or more after the last gets the whole day, never more |
 | `keep_min` | `0` | never let `refresh_per_day` rotate the lane below this many videos |
-| `grow_per_day` | `0` | most videos one run may add. `0` = fill every empty slot at once. What lets a lane have a big `size` without a night that tries to reach it |
+| `grow_per_day` | `0` | most videos a day may add, shared by its runs the same way. `0` = fill every empty slot at once. What lets a lane have a big `size` without a day that tries to reach it |
 | `displace_when_full` | `false` | turnover as displacement instead of expiry: retire nothing on a clock, let the lane grow into `size`, then let each new video take the place of the lowest **standing** one — its stored score at the same two decays `display_score` applies, minus the fatigue and jitter that mean only this hour. Refused with `grow_per_day: 0`, which would fill the lane once and freeze it |
 | `sample_pool` | `0` | pick from a weighted random draw over the top N candidates instead of the strict top. `0` or `1` = strict, as is any value when `expand: none` |
 | `cooldown_days` | `60` | a dropped video is not offered again for this long |
