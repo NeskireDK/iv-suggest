@@ -19,6 +19,8 @@ ExecStartPre=/usr/bin/timeout 120 sh -c 'until docker compose exec -T invidious-
 # -T because nothing here reads stdin, and it is stdin that compose decides
 # pseudo-TTY allocation from -- so without it a hand run from a terminal
 # produces different line endings than the timer does.
-ExecStart=/usr/bin/docker compose run --rm -T --no-deps --name iv-suggest-run iv-suggest run
+# Three runs a day share what one nightly run used to spend (~250-320), so the
+# day stays under IvSuggestFetchesHigh's 600 and YouTube sees the same load.
+ExecStart=/usr/bin/docker compose run --rm -T --no-deps --name iv-suggest-run iv-suggest run --budget 120
 ExecStopPost=-/usr/bin/docker rm -f iv-suggest-run
 TimeoutStartSec=2700
