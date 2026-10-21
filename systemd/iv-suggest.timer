@@ -1,8 +1,10 @@
 [Unit]
-Description=Nightly suggestion lanes (before the 05:00 invidious restart)
+Description=Fill the suggestion lanes three times a day (first run before the 05:00 invidious restart)
 
 [Timer]
 OnCalendar=03:30
+OnCalendar=11:30
+OnCalendar=19:30
 Persistent=true
 RandomizedDelaySec=600
 
