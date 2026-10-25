@@ -55,6 +55,13 @@ class Transport(unittest.TestCase):
     def query(self, mod):
         return mod.query("SELECT 1;")
 
+    def test_a_watched_array_past_csvs_default_field_limit_still_parses(self):
+        eleven_thousand_ids = " ".join(["dQw4w9WgXcQ"] * 11000)
+        mod = self.engine()
+        mod.subprocess = type("OneCall", (), {"run": staticmethod(
+            Ran(stdout=eleven_thousand_ids + "\n").run)})
+        self.assertEqual(eleven_thousand_ids, mod.one("SELECT 1;"))
+
     def test_it_connects_to_the_configured_host_and_port(self):
         cmd = self.ran(self.query).cmd
         self.assertEqual("psql", cmd[0])

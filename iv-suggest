@@ -645,6 +645,10 @@ def _psql(flags, sql):
     return r.stdout
 
 
+# One account's whole watched array comes back as one field; csv's default 128 KiB cap broke at ~10,900 videos.
+csv.field_size_limit(sys.maxsize)
+
+
 def query(sql):
     out = _psql(["--csv", "-t"], sql)
     return [row for row in csv.reader(io.StringIO(out)) if row]
