@@ -102,7 +102,8 @@ lanes:
   - id: music-watched
     title: "Music: watched"
     policy: last_played
-    seed: {scan: 700, genre: Music}
+    # Music fell to ~5% of plays in October 2026; 700 plays then held 38 songs, ~1000 hold 100.
+    seed: {scan: 2000, genre: Music}
     size: 100
     fetch_cap: 150              # fills over about 3 nights, then costs nothing
     # 100 videos competing for 10 visible slots churn the top far harder than a
@@ -115,8 +116,8 @@ lanes:
 
   - id: music-discover
     title: "Music: discover"
-    # shuffle_window 700 matches what music-watched already caches, so a
-    # shuffled seed almost never costs an extra genre fetch.
+    # shuffle_window 700 stays inside the history music-watched already caches,
+    # so a shuffled seed almost never costs an extra genre fetch.
     seed: {limit: 15, scan: 300, genre: Music, shuffle_window: 700}
     expand: recommended
     filter: {genre: Music}
