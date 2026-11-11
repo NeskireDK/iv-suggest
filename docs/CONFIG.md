@@ -47,7 +47,8 @@ Per account, because the playlist keys off its owner.
 
 ### `news_channels`
 
-Which channels a lane with `skip_news: true` leaves out.
+Which channels count as news: a lane with `skip_news: true` leaves them out
+entirely, and `max_age_days` ages their videos out of every lane.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -56,6 +57,12 @@ Which channels a lane with `skip_news: true` leaves out.
 | `min_share` | `0.8` | the share of those in `genres` that makes it news |
 | `always` | `{}` | channel id → name, news whatever its category says |
 | `never` | `{}` | channel id → name, never news whatever its category says |
+| `max_age_days` | `0` | a news video uploaded more than this many days ago leaves every lane, and is refused as a candidate; `0` keeps news as long as any other video |
+
+`max_age_days` reads the upload date the playlist stores, so the sweep costs no
+fetch. A candidate is judged by the date its listing carried; one with no date
+gets in and is judged by the next run's sweep. Old news leaves with reason
+`old_news` and no cooldown, because it can never qualify again.
 
 The category comes from the metadata cache, so it costs no fetch. Only rows
 from a full video fetch carry one, so a channel short of `min_videos` is not
@@ -298,11 +305,22 @@ both frequent now and rare then. Then one search per term.
 | `terms` | `2` | how many topics to search for, so also how many fetches the lane costs |
 | `min_recent` | `3` | a term must appear in at least this many recent titles |
 | `min_lift` | `20.0` | and be at least this many times commoner now than before |
+| `skip_genres` | `["Music"]` | watched videos in these categories are left out of both sides: a song played three times is a favourite, not a topic, and a search for it finds no new upload |
 
 **Both floors, because either alone is noise.** Lift on its own promotes a word
 watched twice; a raw count promotes whatever the account always watches. Between
 them they do the work a long stopword list would, which is why the shipped one
 is short.
+
+**A title's own channel name is not a topic.** It is cut out before terms are
+taken, because a vlogger who signs every title would otherwise burst on their
+own name. A pair is two words side by side in the title, so *"Hounds of Love"*
+gives no *"hounds love"*.
+
+**The search asks for recent uploads.** It sends Invidious's `date` filter, the
+narrowest of `today`, `week`, `month` and `year` that covers `max_age_days`.
+Without it the ~20 results are the most relevant of any age, and the age check
+threw away nearly all of them.
 
 **One term per topic.** Longer terms are preferred — a word pair makes a better
 search than either word alone — and a term is dropped when it shares a word with

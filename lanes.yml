@@ -13,6 +13,7 @@ news_channels:
   always:
     UCIr4vkCsn0tdTW2xZ1jRG1g: Liberal Hivemind
     UCagiBBx1prefrlsDzDxuA9A: Solving The Money Problem
+  max_age_days: 3               # news is wanted in every feed, but only while it is news
 
 # Every account on the instance, including ones registered later. `min_watched`
 # below is what stops a new account being handed a dozen playlists it cannot
@@ -92,7 +93,7 @@ lanes:
     title: "Suggested"
     seed: {limit: 30, recent: 10, shuffle_window: 300}
     expand: recommended
-    refresh_per_day: 5          # ~6 day rotation of the whole 30
+    refresh_per_day: 12         # 12 new a day, so the whole 30 turns over in under 3 days
     sample_pool: 40
     keep_min: 20                # never rotate below this, even on a thin night
 
@@ -146,24 +147,19 @@ lanes:
     # 30 lane, so the window widens with the lane, as music-watched's does.
     shuffle: {published_halflife_days: 0, visible: 40}
 
-  # Channels watched but never subscribed to. Everything else in this file
-  # recycles videos that already existed; this lane reads what those channels
-  # published since yesterday. ~60 uploads per fetch, ~a dozen fetches a refill.
+  # Channels watched but never subscribed to, and only their last 24 hours:
+  # `max_age_days: 1` is strict, so it takes "hours ago" and never "1 day ago".
+  # Emptied by upload age, so nothing older than a day stays.
   - id: fresh-uploads
     title: "Fresh uploads"
     seed: {limit: 400}
     expand: channel_latest
     size: 25
-    ttl_days: 10
-    refresh_per_day: 4
-    max_channels: 16
-    max_age_days: 30
-    min_age_days: 2             # younger belongs to just-uploaded
+    max_channels: 30            # a one-day window finds far fewer per channel than the 30 days it had
+    max_age_days: 1
+    expire_by_upload_age: true
     max_per_channel: 2
-    # 16 channels at one fetch each, plus headroom for the retries a channel
-    # listing now takes: at 20 the cap bound mid-lane on a rate-limited night
-    # and the lane read about half its channels.
-    fetch_cap: 30
+    fetch_cap: 40               # 30 channels plus retry headroom; just-uploaded rereads them free
 
   # The 5 biggest things the subscriptions put out in the last 48 hours. Every
   # other lane dedupes against that feed; this one IS it, so exclude_subscribed
@@ -195,13 +191,14 @@ lanes:
     recommend_max_age_days: 14
     size: 30
     ttl_days: 7                 # a fortnight-old ceiling needs a short TTL
-    refresh_per_day: 6
+    refresh_per_day: 12
     sample_pool: 40
     keep_min: 15
 
   # What Trending publishes. The fresh-uploads channels read for the last two
   # days only, emptied by upload age rather than by time in the lane, so it
-  # never holds anything older. Subscribed channels stay out: their new uploads
+  # never holds anything older. It shares fresh-uploads' last day, and
+  # dedupe_across_lanes hands each video to whichever lane takes it first. Subscribed channels stay out: their new uploads
   # are the subscription feed's. 60 channels because most post less than every
   # other day: at 20 on 2026-09-28 the lane held 7 real ones. Whatever
   # fresh-uploads already read comes on top, free.
@@ -435,9 +432,9 @@ lanes:
       published_halflife_days: 21
       published_floor: 0.15
 
-  # Trending carries the last two days and Popular what is older:
-  # just-uploaded is not a home-mix source, and fresh-uploads takes nothing
-  # younger than it, so the two feeds share no video.
+  # Trending carries the last two days. Popular shares no video with it:
+  # just-uploaded is not a home-mix source, and dedupe_across_lanes keeps
+  # fresh-uploads and just-uploaded from holding the same upload.
   - id: trending
     title: "Trending"
     policy: consensus

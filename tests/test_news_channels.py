@@ -6,6 +6,7 @@ YouTube's category catches the channels that file themselves as news, and
 `news_channels.always` catches the commentary channels that do not.
 """
 
+import time
 import unittest
 
 from support import load
@@ -114,3 +115,66 @@ class Sweep(unittest.TestCase):
 
     def test_it_carries_no_cooldown_so_a_never_override_is_instant(self):
         self.assertEqual(0, self.mod.cooldown_days_for(self.lane, "news"))
+
+
+class OldNewsAgesOut(unittest.TestCase):
+    """News is wanted while it is news. After `max_age_days` it leaves every lane."""
+
+    def setUp(self):
+        self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+        self.mod.news_channel_config = lambda: dict(
+            self.mod.NEWS_CHANNEL_DEFAULTS, always={"UCnews": "News"}, max_age_days=3)
+        self.news = self.mod.channels_whose_news_ages_out({})
+
+    def test_news_older_than_the_limit_is_old_news(self):
+        self.assertTrue(self.mod.is_old_news("UCnews", 3.5, self.news))
+
+    def test_news_inside_the_limit_stays(self):
+        self.assertFalse(self.mod.is_old_news("UCnews", 2.0, self.news))
+
+    def test_an_old_video_from_any_other_channel_stays(self):
+        self.assertFalse(self.mod.is_old_news("UCgame", 900.0, self.news))
+
+    def test_a_limit_of_zero_ages_nothing_out(self):
+        self.mod.news_channel_config = lambda: dict(
+            self.mod.NEWS_CHANNEL_DEFAULTS, always={"UCnews": "News"})
+        self.assertEqual(frozenset(), self.mod.channels_whose_news_ages_out({}))
+
+    def test_the_sweep_finds_old_news_by_the_playlists_upload_date(self):
+        self.mod.upload_age_in = lambda plid: {"v0000000001": 5.0, "v0000000002": 1.0,
+                                               "v0000000003": 9.0}
+        current = [{"videoId": "v0000000001", "authorId": "UCnews"},
+                   {"videoId": "v0000000002", "authorId": "UCnews"},
+                   {"videoId": "v0000000003", "authorId": "UCgame"}]
+        self.assertEqual({"v0000000001"},
+                         set(self.mod.old_news_in(current, "PL", self.news)))
+
+    def test_old_news_leaves_with_its_own_reason_and_no_cooldown(self):
+        lane = dict(self.mod.DEFAULTS)
+        run = self.mod.LaneRun([], set(), set(), {}, None, True, None, set())
+        why = self.mod.why_it_leaves({"videoId": "v0000000001", "authorId": "UCnews"},
+                                     lane, run, {}, "", "", frozenset(), frozenset(),
+                                     {"v0000000001"})
+        self.assertEqual("old_news", why)
+        self.assertEqual(0, self.mod.cooldown_days_for(lane, "old_news"))
+
+    def test_an_old_news_candidate_is_refused(self):
+        self.mod.query = lambda sql: []
+        self.mod.videos_on_cooldown = lambda lane_id, drop: set()
+        old = time.time() - 5 * 86400.0
+        fresh = time.time() - 3600.0
+        meta_seen = {"v0000000001": {"authorId": "UCnews", "published": old},
+                     "v0000000002": {"authorId": "UCnews", "published": fresh}}
+
+        class Fetcher:
+            meta, dead = {}, set()
+
+            def known(self, vid):
+                return None
+
+        run = self.mod.LaneRun([], set(), set(), {}, Fetcher(), True, None, set(),
+                               self.news)
+        lane = dict(self.mod.DEFAULTS, id="suggested", sample_pool=0)
+        chosen = self.mod.choose_candidates(
+            lane, {"v0000000001": 2.0, "v0000000002": 1.0}, meta_seen, [], [], 5, run)
+        self.assertEqual(["v0000000002"], [c[0] for c in chosen])

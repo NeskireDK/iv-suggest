@@ -434,7 +434,7 @@ class Seeds(LaneCase):
         self.assertEqual([], self.api.added())
 
     def test_a_subscription_feed_lane_needs_no_history(self):
-        db = Db(feed=[["s0000000001", "Feed One", "Author", "UC-s", "600", "900"]])
+        db = Db(feed=[["s0000000001", "Feed One", "Author", "UC-s", "600", "900", "0"]])
         feed = self.lane(expand="subscription_feed", exclude_subscribed=False)
         self.fill(feed, subs=["UC-s"], db=db, api=Api())
         self.assertEqual(["s0000000001"], self.api.added())
@@ -493,7 +493,7 @@ class Expand(LaneCase):
         self.assertEqual(["eeeeeeeeeee"], self.api.added())
 
     def test_the_subscription_feed_carries_the_view_count_it_came_with(self):
-        db = Db(feed=[["s0000000001", "Feed One", "Author", "UC-s", "600", "900"]])
+        db = Db(feed=[["s0000000001", "Feed One", "Author", "UC-s", "600", "900", "0"]])
         fetch = Fetch()
         feed = self.lane(expand="subscription_feed", exclude_subscribed=False)
         self.fill(feed, subs=["UC-s"], db=db, api=Api(), fetch=fetch)
@@ -1071,6 +1071,7 @@ class ARunRowThatCannotBeWritten(unittest.TestCase):
 
     def setUp(self):
         self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+        self.mod.news_channel_config = lambda: dict(self.mod.NEWS_CHANNEL_DEFAULTS)
         self.said = []
         self.ran = []
         self.mod.log = self.said.append
@@ -1137,6 +1138,7 @@ class TheClearRunsForTheWholeAccount(unittest.TestCase):
 
     def setUp(self):
         self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+        self.mod.news_channel_config = lambda: dict(self.mod.NEWS_CHANNEL_DEFAULTS)
         self.mod.log = lambda line: None
         self.written = []
         self.mod.execute = self.written.append
