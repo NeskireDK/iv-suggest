@@ -182,7 +182,7 @@ DEFAULTS = {
     # lift on its own promotes a word watched twice, and a raw count promotes
     # whatever the account always watches.
     "burst": {"recent": 200, "baseline": 1000, "terms": 2,
-              "min_recent": 3, "min_lift": 20.0},
+              "min_recent": 3, "min_lift": 20.0, "skip_genres": ["Music"]},
     # expand: recommended, drop a recommendation older than this. 0 = off, so
     # the existing lanes keep taking the whole graph.
     "recommend_max_age_days": 0,
@@ -736,6 +736,7 @@ def parse_published(rec):
 def listing_meta(rec):
     """Cache-shaped metadata from a listing entry, which carries no genre."""
     return {"genre": None, "genre_known": False,
+            "published": parse_published(rec),
             "seconds": rec.get("lengthSeconds") or 0,
             "authorId": rec.get("authorId"), "author": rec.get("author") or "",
             "title": rec.get("title") or "",
@@ -1196,15 +1197,18 @@ class Fetcher:
                 delay *= 2
         return None
 
-    def search(self, term):
-        """One page of search results for a term: one fetch for about 20 videos."""
+    def search(self, term, uploaded_within=""):
+        """One page of search results for a term: one fetch for about 20 videos.
+        `uploaded_within` is Invidious's `date` filter (hour, today, week, month, year)."""
         self._refuse_when_out_of_budget()
         delay = 5.0
+        date_filter = "&date=%s" % uploaded_within if uploaded_within else ""
         for attempt in range(3):
             self._pace()
             try:
-                data = bot_api("GET", "/api/v1/search?q=%s&type=video"
-                               % urllib.parse.quote(term), attempt=attempt)
+                data = bot_api("GET", "/api/v1/search?q=%s&type=video%s"
+                               % (urllib.parse.quote(term), date_filter),
+                               attempt=attempt)
                 self._spend_one_fetch()
                 self._upstream_answered()
                 return data or []
@@ -1703,7 +1707,8 @@ def read_user():
 
 
 NEWS_CHANNEL_DEFAULTS = {"genres": ["News & Politics"], "min_videos": 10,
-                         "min_share": 0.8, "always": {}, "never": {}}
+                         "min_share": 0.8, "always": {}, "never": {},
+                         "max_age_days": 0}
 
 
 def news_channel_config():
@@ -1737,6 +1742,32 @@ def news_channels_to_skip(lane, run):
     if not lane["skip_news"]:
         return frozenset()
     return news_channels(run.fetcher.meta, news_channel_config())
+
+
+def old_news_cutoff_days():
+    """How many days after upload a news video leaves every lane, or 0 when news never ages out."""
+    return float(news_channel_config()["max_age_days"] or 0)
+
+
+def channels_whose_news_ages_out(meta):
+    """The news channels whose videos age out of every lane; none when `max_age_days` is 0."""
+    if not old_news_cutoff_days():
+        return frozenset()
+    return frozenset(news_channels(meta, news_channel_config()))
+
+
+def is_old_news(author_id, upload_days, news):
+    return bool(news) and author_id in news and upload_days > old_news_cutoff_days()
+
+
+def old_news_in(current, plid, news):
+    """The entries from a news channel uploaded more than `max_age_days` ago."""
+    if not news or not plid:
+        return frozenset()
+    upload_days = upload_age_in(plid)
+    return frozenset(v["videoId"] for v in current
+                     if v["videoId"] in upload_days
+                     and is_old_news(v.get("authorId"), upload_days[v["videoId"]], news))
 
 
 def blocklist_config():
@@ -1848,6 +1879,7 @@ def cooldown_days_for(lane, why):
         return 0
     return {"dead": 0,
             "news": 0,
+            "old_news": 0,
             "aged_out": 0,
             "watched": lane["watched_cooldown_days"],
             "unwatched": lane["rotate_cooldown_days"],
@@ -1903,7 +1935,8 @@ def add_to_lane(lane_id, plid, vid, score, song, fetcher):
 # it. A compiled lane reads it without ever naming the fetcher, which is the
 # invariant test_the_consensus_run_never_touches_the_fetcher holds it to.
 LaneRun = namedtuple(
-    "LaneRun", "watched watched_set subs blocked fetcher dry seed_override dead")
+    "LaneRun", "watched watched_set subs blocked fetcher dry seed_override dead "
+    "aging_news", defaults=(frozenset(),))
 
 
 def run_lane(lane, run):
@@ -1960,13 +1993,15 @@ def date_this_many_active_days_ago(active_days):
 
 
 def why_it_leaves(v, lane, run, added_at, ttl_cutoff, stale_cutoff="",
-                  news=frozenset(), too_old=frozenset()):
+                  news=frozenset(), too_old=frozenset(), old_news=frozenset()):
     """Why this entry leaves the lane tonight, or None to keep it.
     Blocked and news are tested first: they are the reasons that carry no cooldown."""
     if v.get("authorId") in run.blocked:
         return "blocked"
     if v.get("authorId") in news:
         return "news"
+    if v["videoId"] in old_news:
+        return "old_news"
     if v["videoId"] in run.dead:
         return "dead"
     if v["videoId"] in too_old:
@@ -2089,10 +2124,12 @@ def sweep_lane(lane, current, plid, run):
     stale = date_this_many_active_days_ago(lane["stale_after_active_days"])
     news = news_channels_to_skip(lane, run)
     too_old = uploaded_too_long_ago(lane, plid)
+    old_news = old_news_in(current, plid, run.aging_news)
 
     drop, keep = [], []
     for v in current:
-        why = why_it_leaves(v, lane, run, added_at, old, stale, news, too_old)
+        why = why_it_leaves(v, lane, run, added_at, old, stale, news, too_old,
+                            old_news)
         (drop if why else keep).append((v, why))
 
     allowance = this_runs_allowance(lane, previous_run_of(lane_id), time.time())
@@ -2346,12 +2383,20 @@ will just but if then than so up out over into about after before
 """.split())
 
 
-def title_terms(title):
-    """The words and adjacent word pairs of one title, filler dropped."""
-    words = [w for w in re.findall(r"[a-z0-9']+", title.lower())
-             if w not in _TITLE_FILLER and len(w) > 2]
-    pairs = {" ".join(words[i:i + 2]) for i in range(len(words) - 1)}
-    return set(words) | pairs
+def is_topic_word(word):
+    return word not in _TITLE_FILLER and len(word) > 2
+
+
+def title_terms(title, author=""):
+    """The words and adjacent word pairs of one title, without filler or the channel's own name.
+    A pair is two words that sit side by side in the title, never two either side of a dropped one."""
+    text = title.lower()
+    if author.strip():
+        text = text.replace(author.strip().lower(), " | ")
+    tokens = re.findall(r"[a-z0-9']+|\|", text)
+    kept = [w if w != "|" and is_topic_word(w) else None for w in tokens]
+    pairs = {"%s %s" % (a, b) for a, b in zip(kept, kept[1:]) if a and b}
+    return {w for w in kept if w} | pairs
 
 
 # Half a hit stands in for none, so a term entirely new to the account is a
@@ -2366,19 +2411,21 @@ def term_lift(recent_hits, recent_total, older_hits, older_total):
     return (recent_hits / recent_total) / ((older_hits + HALF_A_HIT) / older_total)
 
 
-def watched_titles(recent, baseline):
-    """(titles of the newest `recent` watched, titles of the `baseline` before them).
+def watched_titles(recent, baseline, skip_genres=()):
+    """([(title, author)] of the newest `recent` watched, the same for the `baseline` before them).
     Straight from the metadata cache, so it costs no fetch."""
+    genre_filter = ("AND coalesce(m.genre,'') NOT IN (%s) "
+                    % ",".join(lit(g) for g in skip_genres)) if skip_genres else ""
     rows = query(
         "SELECT CASE WHEN w.pos > w.n - %d THEN 'recent' ELSE 'older' END, "
-        "coalesce(m.title,'') FROM ("
+        "coalesce(m.title,''), coalesce(m.author,'') FROM ("
         "  SELECT unnest(watched) AS vid, generate_subscripts(watched,1) AS pos, "
         "         array_length(watched,1) AS n FROM users WHERE email = %s) w "
         "JOIN suggest.video_meta m ON m.vid = w.vid "
-        "WHERE w.pos > w.n - %d AND coalesce(m.title,'') <> '';"
-        % (int(recent), acct(), int(recent) + int(baseline)))
-    now = [title for band, title in rows if band == "recent"]
-    before = [title for band, title in rows if band != "recent"]
+        "WHERE w.pos > w.n - %d AND coalesce(m.title,'') <> '' %s;"
+        % (int(recent), acct(), int(recent) + int(baseline), genre_filter))
+    now = [(title, author) for band, title, author in rows if band == "recent"]
+    before = [(title, author) for band, title, author in rows if band != "recent"]
     return now, before
 
 
@@ -2413,17 +2460,18 @@ def pick_distinct_terms(ranked, most):
 
 def bursting_terms(cfg):
     """Terms the account has started watching: (term, lift, hits), strongest first."""
-    now, before = watched_titles(cfg["recent"], cfg["baseline"])
+    now, before = watched_titles(cfg["recent"], cfg["baseline"],
+                                 cfg.get("skip_genres") or ())
     if len(now) < cfg["min_recent"] or not before:
         log("  %d recent and %d earlier titles cached, too few to compare"
             % (len(now), len(before)))
         return []
     seen_in, older_hits = {}, {}
-    for index, title in enumerate(now):
-        for term in title_terms(title):
+    for index, (title, author) in enumerate(now):
+        for term in title_terms(title, author):
             seen_in.setdefault(term, set()).add(index)
-    for title in before:
-        for term in title_terms(title):
+    for title, author in before:
+        for term in title_terms(title, author):
             older_hits[term] = older_hits.get(term, 0) + 1
     strong = [(term, term_lift(len(seen), len(now), older_hits.get(term, 0),
                                len(before)), seen)
@@ -2465,6 +2513,15 @@ def expand_by_channel_back_catalogue(lane, seeds, room, run):
     return scores, meta_seen
 
 
+SEARCH_DATE_FILTERS = ((1, "today"), (7, "week"), (31, "month"), (365, "year"))
+
+
+def search_date_filter(max_age_days):
+    """The narrowest search `date` filter that still covers `max_age_days`, or "" for none."""
+    return next((name for days, name in SEARCH_DATE_FILTERS
+                 if max_age_days and max_age_days <= days), "")
+
+
 def expand_by_topic_burst(lane, seeds, room, run):
     """Videos about a topic the account was not watching a month ago and is now.
     One search per term, so the whole lane costs as many fetches as it has terms."""
@@ -2477,9 +2534,10 @@ def expand_by_topic_burst(lane, seeds, room, run):
     log("  bursting: %s" % ", ".join("%s (x%.0f, %d plays)" % (t, lift, hits)
                                      for t, lift, hits in terms))
     cutoff = time.time() - lane["max_age_days"] * 86400.0
+    uploaded_within = search_date_filter(lane["max_age_days"])
     for term, lift, _ in terms:
         try:
-            found = run.fetcher.search(term)
+            found = run.fetcher.search(term, uploaded_within)
         except BudgetSpent as e:
             log("  %s, searched only %d terms" % (e, terms.index((term, lift, _))))
             break
@@ -2543,7 +2601,8 @@ def expand_by_subscription_feed(lane, seeds, room, run):
     order = "views DESC NULLS LAST" if rank_by == "views" else "published DESC"
     rows = query(
         "SELECT id, coalesce(title,''), coalesce(author,''), coalesce(ucid,''), "
-        "coalesce(length_seconds,0), coalesce(views,0) "
+        "coalesce(length_seconds,0), coalesce(views,0), "
+        "coalesce(extract(epoch FROM published),0) "
         "FROM channel_videos WHERE ucid IN (%s) AND kind IN (%s) %s "
         "ORDER BY %s LIMIT %d;"
         % (",".join(lit(u) for u in sorted(subscribed_and_not_blocked)),
@@ -2551,14 +2610,15 @@ def expand_by_subscription_feed(lane, seeds, room, run):
            max(60, room * 12)))
     log("  %s: %d candidate(s) over %d channel(s), ranked by %s"
         % (",".join(kinds), len(rows), len(subscribed_and_not_blocked), rank_by))
-    for rank, (rid, title, author, ucid, seconds, views) in enumerate(rows):
+    for rank, (rid, title, author, ucid, seconds, views, published) in enumerate(rows):
         if not VID_RE.match(rid):
             continue
         scores[rid] = rank_derived_score(rank)
         meta_seen.setdefault(rid, listing_meta(
             {"lengthSeconds": int(seconds or 0), "authorId": ucid or None,
              "author": author, "title": title,
-             "viewCount": int(views or 0) or None}))
+             "viewCount": int(views or 0) or None,
+             "published": float(published or 0)}))
     return scores, meta_seen
 
 
@@ -2615,6 +2675,13 @@ def genre_check_cap(room):
     return max(20, room * 3)
 
 
+def candidate_upload_days(vid, meta_seen):
+    """Days since upload from the listing that offered the video, or 0 when it carried no date.
+    0 lets an undated candidate in; the sweep reads the playlist's own date next run."""
+    published = (meta_seen.get(vid) or {}).get("published") or 0
+    return (time.time() - published) / SECONDS_PER_DAY if published else 0.0
+
+
 def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
     """The candidates that pass every filter, as [(vid, score, meta, song), ...]."""
     lane_id = lane["id"]
@@ -2649,7 +2716,7 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
     rejected = {"watched": 0, "subscribed": 0, "cooldown": 0, "in_lane": 0,
                 "other_lane": 0, "short": 0, "long": 0, "genre": 0,
                 "channel_cap": 0, "same_song": 0, "dead": 0, "blocked": 0,
-                "subs_feed": 0}
+                "subs_feed": 0, "old_news": 0}
     skip_subscribed, subscribed_refusal = subscribed_videos_to_skip(lane, run)
     chosen = []
     genre_wanted = (lane.get("filter") or {}).get("genre")
@@ -2675,6 +2742,10 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
         meta = run.fetcher.known(vid) or meta_seen.get(vid) or {}
         if meta.get("authorId") in run.blocked:
             rejected["blocked"] += 1
+            continue
+        if is_old_news(meta.get("authorId"), candidate_upload_days(vid, meta_seen),
+                       run.aging_news):
+            rejected["old_news"] += 1
             continue
         if meta.get("authorId") in run.subs and (
                 skip_subscribed is None or vid in skip_subscribed):
@@ -3288,7 +3359,8 @@ def run_account(user, all_lanes, fetcher, seed_override, args):
             log("\naccount %s: no lane %r" % (ACCOUNT, args.lane))
             return 0
     run = LaneRun(watched, set(watched), subs, read_blocked(), fetcher,
-                  args.dry_run, seed_override, fetcher.dead)
+                  args.dry_run, seed_override, fetcher.dead,
+                  channels_whose_news_ages_out(fetcher.meta))
     log_account_header(lanes, run)
     if held_back:
         log("held back until there is more history: %s" % ", ".join(held_back))

@@ -216,6 +216,7 @@ class Spent:
     lane_cache_hits = 0
     lane_lookups = 0
     dead = frozenset()
+    meta = {}
 
 
 class Args:
@@ -248,6 +249,7 @@ class ASpentBudget(unittest.TestCase):
 
     def setUp(self):
         self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+        self.mod.news_channel_config = lambda: dict(self.mod.NEWS_CHANNEL_DEFAULTS)
         self.mod.log = lambda line: None
         self.mod.load_users = lambda: [self.user()]
         self.mod.serve_account = lambda email: None

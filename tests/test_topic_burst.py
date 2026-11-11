@@ -15,7 +15,7 @@ ME = "andre@example.com"
 
 
 def titles(recent, older):
-    return [("recent", t) for t in recent] + [("older", t) for t in older]
+    return [("recent", t, "") for t in recent] + [("older", t, "") for t in older]
 
 
 class Terms(unittest.TestCase):
@@ -30,6 +30,23 @@ class Terms(unittest.TestCase):
 
     def test_filler_and_short_words_are_dropped(self):
         self.assertEqual({"beta"}, self.mod.title_terms("The New Beta"))
+
+    def test_no_pair_spans_a_dropped_filler_word(self):
+        """"Hounds of Love" is not a search for "hounds love"."""
+        self.assertEqual({"hounds", "love"},
+                         self.mod.title_terms("Hounds of Love"))
+
+    def test_the_channel_naming_itself_in_the_title_is_not_a_topic(self):
+        """A vlogger who signs every title is one channel, not a topic."""
+        terms = self.mod.title_terms("Small Goes to DUBAI! | Small Laude",
+                                     "Small Laude")
+        self.assertNotIn("small laude", terms)
+        self.assertNotIn("laude", terms)
+
+    def test_no_pair_spans_the_removed_channel_name(self):
+        self.assertNotIn("kraken beta",
+                         self.mod.title_terms("Kraken Some Channel Beta",
+                                              "Some Channel"))
 
     def test_a_term_new_to_the_account_lifts_rather_than_divides_by_zero(self):
         self.assertGreater(self.mod.term_lift(10, 100, 0, 1000), 100.0)
@@ -72,6 +89,19 @@ class WhatBursts(unittest.TestCase):
             ["Kraken Beta Impressions", "Kraken Beta Raids", "Bread", "Piano"],
             ["Sailing", "Barn Find", "Piano Practice", "Bread From Scratch"]))
         self.assertEqual([], self.mod.bursting_terms(self.cfg))
+
+    def test_the_skipped_genres_are_left_out_of_the_history_read(self):
+        """A song played three times is a favourite, not a topic."""
+        asked = []
+        self.mod.query = lambda sql: asked.append(sql) or []
+        self.mod.bursting_terms(dict(self.cfg, skip_genres=["Music"]))
+        self.assertIn("NOT IN ('Music')", asked[0])
+
+    def test_no_skipped_genre_reads_the_whole_history(self):
+        asked = []
+        self.mod.query = lambda sql: asked.append(sql) or []
+        self.mod.bursting_terms(dict(self.cfg, skip_genres=[]))
+        self.assertNotIn("NOT IN", asked[0])
 
     def test_too_little_history_says_so_rather_than_guessing(self):
         self.answering(titles(["Only One"], ["A", "B"]))
@@ -123,8 +153,8 @@ class TheExpander(unittest.TestCase):
         searched = self.searched
 
         class Fetcher:
-            def search(self, term):
-                searched.append(term)
+            def search(self, term, uploaded_within=""):
+                searched.append((term, uploaded_within))
                 return found
 
         run = type("Run", (), {"fetcher": Fetcher(), "subs": set(),
@@ -138,7 +168,14 @@ class TheExpander(unittest.TestCase):
 
     def test_it_searches_each_bursting_term_once(self):
         self.run_with([self.video()])
-        self.assertEqual(["kraken beta"], self.searched)
+        self.assertEqual(["kraken beta"], [t for t, _ in self.searched])
+
+    def test_it_asks_youtube_for_uploads_inside_the_lanes_age(self):
+        """Unfiltered, the ~20 results are the most relevant of any age, and
+        the lane's own age check then throws nearly all of them away."""
+        self.lane["max_age_days"] = 30
+        self.run_with([self.video()])
+        self.assertEqual([("kraken beta", "month")], self.searched)
 
     def test_a_found_video_is_scored_by_the_term_that_found_it(self):
         scores, meta = self.run_with([self.video()])
@@ -160,6 +197,20 @@ class TheExpander(unittest.TestCase):
         scores, meta = self.run_with([self.video()])
         self.assertEqual(({}, {}), (scores, meta))
         self.assertEqual([], self.searched)
+
+
+class SearchDateFilter(unittest.TestCase):
+
+    def setUp(self):
+        self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+
+    def test_the_narrowest_filter_that_still_covers_the_age(self):
+        self.assertEqual(["today", "week", "month", "year", ""],
+                         [self.mod.search_date_filter(d)
+                          for d in (1, 7, 30, 200, 1000)])
+
+    def test_no_age_limit_means_no_filter(self):
+        self.assertEqual("", self.mod.search_date_filter(0))
 
 
 class ItIsWiredIn(unittest.TestCase):
