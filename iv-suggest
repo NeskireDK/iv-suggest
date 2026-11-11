@@ -254,6 +254,10 @@ ALTER TABLE suggest.items ADD COLUMN IF NOT EXISTS top_hours double precision DE
 -- true, and what lets the shuffle interval move without retuning `fatigue`.
 ALTER TABLE suggest.items ALTER COLUMN top_hours TYPE double precision;
 ALTER TABLE suggest.items ADD COLUMN IF NOT EXISTS last_top timestamptz;
+-- The upload time the listing gave when the video entered the lane. A playlist
+-- row stores only the upload DATE, at midnight, so a one day window read off it
+-- dropped a video twelve hours old.
+ALTER TABLE suggest.items ADD COLUMN IF NOT EXISTS published timestamptz;
 -- false marks a row filled in from a recommendation or channel listing: every
 -- field is real EXCEPT genre, which those listings do not carry. A genre lane
 -- must treat such a row as a cache miss, everything else may use it.
@@ -1760,11 +1764,11 @@ def is_old_news(author_id, upload_days, news):
     return bool(news) and author_id in news and upload_days > old_news_cutoff_days()
 
 
-def old_news_in(current, plid, news):
+def old_news_in(current, lane_id, plid, news):
     """The entries from a news channel uploaded more than `max_age_days` ago."""
     if not news or not plid:
         return frozenset()
-    upload_days = upload_age_in(plid)
+    upload_days = youngest_possible_upload_age(lane_id, plid)
     return frozenset(v["videoId"] for v in current
                      if v["videoId"] in upload_days
                      and is_old_news(v.get("authorId"), upload_days[v["videoId"]], news))
@@ -1914,7 +1918,11 @@ def song_key_to_store(lane, meta):
     return song_key(meta.get("title"), meta.get("author"))
 
 
-def add_to_lane(lane_id, plid, vid, score, song, fetcher):
+def published_literal(published):
+    return "to_timestamp(%d)" % int(published) if published else "NULL"
+
+
+def add_to_lane(lane_id, plid, vid, score, song, fetcher, published=0.0):
     """Add one video to a lane and track it. False when Invidious refused the add.
     Invidious resolves the video as it writes the row, so a bad candidate fails only here."""
     try:
@@ -1923,11 +1931,19 @@ def add_to_lane(lane_id, plid, vid, score, song, fetcher):
         log("    add refused (%s), skipping this one" % e)
         fetcher.bury(vid, 30, "playlist add %s" % e.code)
         return False
-    execute("INSERT INTO suggest.items(account,lane,vid,score,song_key) VALUES "
-            "(%s,%s,%s,%s,%s) ON CONFLICT (account,lane,vid) DO UPDATE SET "
-            "added=now(), score=EXCLUDED.score, song_key=EXCLUDED.song_key;"
-            % (acct(), lit(lane_id), lit(vid),
-               round(score, STORED_SCORE_DECIMALS), lit(song)))
+    if column_exists("items", "published"):
+        execute("INSERT INTO suggest.items(account,lane,vid,score,song_key,published) "
+                "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (account,lane,vid) DO UPDATE SET "
+                "added=now(), score=EXCLUDED.score, song_key=EXCLUDED.song_key, "
+                "published=EXCLUDED.published;"
+                % (acct(), lit(lane_id), lit(vid), round(score, STORED_SCORE_DECIMALS),
+                   lit(song), published_literal(published)))
+    else:
+        execute("INSERT INTO suggest.items(account,lane,vid,score,song_key) VALUES "
+                "(%s,%s,%s,%s,%s) ON CONFLICT (account,lane,vid) DO UPDATE SET "
+                "added=now(), score=EXCLUDED.score, song_key=EXCLUDED.song_key;"
+                % (acct(), lit(lane_id), lit(vid),
+                   round(score, STORED_SCORE_DECIMALS), lit(song)))
     return True
 
 
@@ -2102,11 +2118,23 @@ def what_this_run_gives_up(keep, lane, plid, allowance, added_ts, item_score):
     return oldest_survivors(keep, lane, allowance, added_ts, item_score), "rotated"
 
 
+def youngest_possible_upload_age(lane_id, plid):
+    """Days since upload per entry, never more than the truth: the listing's exact time where the
+    lane stored one, otherwise the end of the stored upload date, since the playlist keeps no time."""
+    exact = ("i.published, " if column_exists("items", "published") else "")
+    return {r[0]: max(0.0, float(r[1])) for r in query(
+        "SELECT pv.id, extract(epoch FROM (now() - coalesce(%spv.published + interval '1 day')))"
+        "/86400.0 FROM playlist_videos pv LEFT JOIN suggest.items i "
+        "ON i.vid = pv.id AND i.account = %s AND i.lane = %s "
+        "WHERE pv.plid = %s AND pv.published IS NOT NULL;"
+        % (exact, acct(), lit(lane_id), lit(plid)))}
+
+
 def uploaded_too_long_ago(lane, plid):
     """Entries uploaded more than `max_age_days` ago; none unless the lane sets `expire_by_upload_age`."""
     if not lane["expire_by_upload_age"] or not plid:
         return frozenset()
-    return frozenset(vid for vid, days in upload_age_in(plid).items()
+    return frozenset(vid for vid, days in youngest_possible_upload_age(lane["id"], plid).items()
                      if days > lane["max_age_days"])
 
 
@@ -2125,7 +2153,7 @@ def sweep_lane(lane, current, plid, run):
     stale = date_this_many_active_days_ago(lane["stale_after_active_days"])
     news = news_channels_to_skip(lane, run)
     too_old = uploaded_too_long_ago(lane, plid)
-    old_news = old_news_in(current, plid, run.aging_news)
+    old_news = old_news_in(current, lane_id, plid, run.aging_news)
     topic_over = bool(current) and no_topic_is_bursting(lane)
 
     drop, keep = [], []
@@ -2681,6 +2709,11 @@ def genre_check_cap(room):
     return max(20, room * 3)
 
 
+def listing_published(vid, meta_seen):
+    """Unix seconds of upload from the listing that offered the video, or 0 when it carried none."""
+    return (meta_seen.get(vid) or {}).get("published") or 0.0
+
+
 def candidate_upload_days(vid, meta_seen):
     """Days since upload from the listing that offered the video, or 0 when it carried no date.
     0 lets an undated candidate in; the sweep reads the playlist's own date next run."""
@@ -2790,7 +2823,8 @@ def choose_candidates(lane, scores, meta_seen, keep, drop, room, run):
         if skey:
             songs.add(skey)
         per_channel[author] = per_channel.get(author, 0) + 1
-        chosen.append((vid, score, meta, skey))
+        chosen.append((vid, score, dict(meta, published=listing_published(vid, meta_seen)),
+                       skey))
 
     log("  candidates %d, rejected %s" % (len(ranked), {k: v for k, v in rejected.items() if v}))
     return chosen
@@ -2805,7 +2839,8 @@ def reconcile_playlist(lane, chosen, plid, run):
                                      (meta.get("author") or meta.get("authorId") or "")[:24]))
         if run.dry:
             continue
-        if not add_to_lane(lane_id, plid, vid, score, skey, run.fetcher):
+        if not add_to_lane(lane_id, plid, vid, score, skey, run.fetcher,
+                           meta.get("published") or 0.0):
             refused += 1
             continue
         landed.append((vid, meta))

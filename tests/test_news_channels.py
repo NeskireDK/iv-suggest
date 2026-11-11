@@ -141,13 +141,13 @@ class OldNewsAgesOut(unittest.TestCase):
         self.assertEqual(frozenset(), self.mod.channels_whose_news_ages_out({}))
 
     def test_the_sweep_finds_old_news_by_the_playlists_upload_date(self):
-        self.mod.upload_age_in = lambda plid: {"v0000000001": 5.0, "v0000000002": 1.0,
+        self.mod.youngest_possible_upload_age = lambda lane_id, plid: {"v0000000001": 5.0, "v0000000002": 1.0,
                                                "v0000000003": 9.0}
         current = [{"videoId": "v0000000001", "authorId": "UCnews"},
                    {"videoId": "v0000000002", "authorId": "UCnews"},
                    {"videoId": "v0000000003", "authorId": "UCgame"}]
         self.assertEqual({"v0000000001"},
-                         set(self.mod.old_news_in(current, "PL", self.news)))
+                         set(self.mod.old_news_in(current, "lane1", "PL", self.news)))
 
     def test_old_news_leaves_with_its_own_reason_and_no_cooldown(self):
         lane = dict(self.mod.DEFAULTS)

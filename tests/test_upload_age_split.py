@@ -96,8 +96,8 @@ class Sweeping(unittest.TestCase):
 
     def setUp(self):
         self.mod = load(IV_SUGGEST_ACCOUNT=ME)
-        self.mod.upload_age_in = lambda plid: {"young000001": 0.5, "old00000001": 2.4}
-        self.lane = dict(self.mod.DEFAULTS, max_age_days=2, expire_by_upload_age=True)
+        self.mod.youngest_possible_upload_age = lambda lane_id, plid: {"young000001": 0.5, "old00000001": 2.4}
+        self.lane = dict(self.mod.DEFAULTS, id="just-uploaded", max_age_days=2, expire_by_upload_age=True)
 
     def test_an_entry_past_max_age_leaves_however_recently_it_was_added(self):
         self.assertEqual({"old00000001"},
@@ -192,3 +192,65 @@ class RepeatChannelDiscount(unittest.TestCase):
         cfg = dict(self.mod.CONSENSUS_DEFAULTS)
         weights = self.mod.consensus_weights([{"vids": ["a", "b"]}], cfg)
         self.assertEqual({"a", "b"}, set(weights))
+
+
+class ExactUploadTime(unittest.TestCase):
+    """A playlist row stores the upload DATE at midnight, so a one day window read
+    off it alone dropped a twelve hour old video. The lane keeps the listing's time."""
+
+    def setUp(self):
+        self.mod = load(IV_SUGGEST_ACCOUNT="andre@example.com")
+        self.asked, self.written = [], []
+        self.mod.query = lambda sql: self.asked.append(sql) or []
+        self.mod.execute = self.written.append
+        self.mod.bot_api = lambda *a, **k: {}
+
+    def with_column(self, present):
+        self.mod.column_exists = lambda table, column: present
+
+    def test_the_expiry_age_prefers_the_stored_listing_time(self):
+        self.with_column(True)
+        self.mod.youngest_possible_upload_age("fresh-uploads", "PLx")
+        self.assertIn("coalesce(i.published, pv.published + interval '1 day')",
+                      self.asked[0])
+
+    def test_without_a_listing_time_the_date_counts_as_its_last_moment(self):
+        """The true upload is anywhere inside the stored day; ageing from its end
+        never calls a video older than it is."""
+        self.with_column(False)
+        self.mod.youngest_possible_upload_age("fresh-uploads", "PLx")
+        self.assertIn("coalesce(pv.published + interval '1 day')", self.asked[0])
+        self.assertNotIn("i.published", self.asked[0])
+
+    def test_an_added_video_stores_the_listing_time(self):
+        self.with_column(True)
+        self.mod.add_to_lane("fresh-uploads", "PLx", "aaaaaaaaaaa", 1.0, "", None,
+                             1762862400.0)
+        self.assertIn("to_timestamp(1762862400)", self.written[0])
+
+    def test_an_undated_listing_stores_no_time(self):
+        self.with_column(True)
+        self.mod.add_to_lane("fresh-uploads", "PLx", "aaaaaaaaaaa", 1.0, "", None)
+        self.assertIn("NULL)", self.written[0])
+
+    def test_before_the_migration_the_add_still_works(self):
+        self.with_column(False)
+        self.assertTrue(self.mod.add_to_lane("fresh-uploads", "PLx", "aaaaaaaaaaa",
+                                             1.0, "", None, 1762862400.0))
+        self.assertNotIn("published", self.written[0])
+
+    def test_a_chosen_candidate_carries_the_listing_time(self):
+        self.mod.videos_on_cooldown = lambda lane_id, drop: set()
+
+        class Fetcher:
+            meta, dead = {}, set()
+
+            def known(self, vid):
+                return {"authorId": "UCx", "title": "cached"}
+
+        run = self.mod.LaneRun([], set(), set(), {}, Fetcher(), True, None, set())
+        lane = dict(self.mod.DEFAULTS, id="fresh-uploads", sample_pool=0)
+        chosen = self.mod.choose_candidates(
+            lane, {"aaaaaaaaaaa": 1.0}, {"aaaaaaaaaaa": {"published": 1762862400.0}},
+            [], [], 5, run)
+        self.assertEqual(1762862400.0, chosen[0][2]["published"])
