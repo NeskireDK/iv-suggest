@@ -334,6 +334,22 @@ class Sweep(LaneCase):
         self.assertEqual([], self.db.cooldowns(),
                          "unblocking the channel must let it back the same night")
 
+    def test_a_topic_burst_lane_empties_when_no_topic_is_bursting(self):
+        """It is a tip-off about a topic; with none, every entry is stale."""
+        self.mod.bursting_terms = lambda cfg: []
+        api = Api(videos=[entry("aaaaaaaaaaa")])
+        db = Db(items={"aaaaaaaaaaa": (self.today(), 100.0, 1.0)})
+        self.fill(self.lane(expand="topic_burst"), db=db, api=api)
+        self.assertEqual(["ix-aaaaaaaaaaa"], self.api.removed())
+        self.assertEqual([], self.db.cooldowns())
+
+    def test_a_topic_burst_lane_keeps_its_entries_while_a_topic_bursts(self):
+        self.mod.bursting_terms = lambda cfg: [("kraken beta", 30.0, 6)]
+        api = Api(videos=[entry("aaaaaaaaaaa")])
+        db = Db(items={"aaaaaaaaaaa": (self.today(), 100.0, 1.0)})
+        self.fill(self.lane(expand="topic_burst", size=1), db=db, api=api)
+        self.assertEqual([], self.api.removed())
+
     def test_a_watched_entry_leaves_on_the_watched_cooldown(self):
         api = Api(videos=[entry("aaaaaaaaaaa")])
         db = Db(items={"aaaaaaaaaaa": (self.today(), 100.0, 1.0)})

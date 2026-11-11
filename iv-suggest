@@ -182,7 +182,7 @@ DEFAULTS = {
     # lift on its own promotes a word watched twice, and a raw count promotes
     # whatever the account always watches.
     "burst": {"recent": 200, "baseline": 1000, "terms": 2,
-              "min_recent": 3, "min_lift": 20.0, "skip_genres": ["Music"]},
+              "min_recent": 5, "min_lift": 20.0, "skip_genres": ["Music"]},
     # expand: recommended, drop a recommendation older than this. 0 = off, so
     # the existing lanes keep taking the whole graph.
     "recommend_max_age_days": 0,
@@ -1880,6 +1880,7 @@ def cooldown_days_for(lane, why):
     return {"dead": 0,
             "news": 0,
             "old_news": 0,
+            "topic_over": 0,
             "aged_out": 0,
             "watched": lane["watched_cooldown_days"],
             "unwatched": lane["rotate_cooldown_days"],
@@ -2125,11 +2126,13 @@ def sweep_lane(lane, current, plid, run):
     news = news_channels_to_skip(lane, run)
     too_old = uploaded_too_long_ago(lane, plid)
     old_news = old_news_in(current, plid, run.aging_news)
+    topic_over = bool(current) and no_topic_is_bursting(lane)
 
     drop, keep = [], []
     for v in current:
-        why = why_it_leaves(v, lane, run, added_at, old, stale, news, too_old,
-                            old_news)
+        why = (why_it_leaves(v, lane, run, added_at, old, stale, news, too_old,
+                             old_news)
+               or ("topic_over" if topic_over else None))
         (drop if why else keep).append((v, why))
 
     allowance = this_runs_allowance(lane, previous_run_of(lane_id), time.time())
@@ -2463,8 +2466,6 @@ def bursting_terms(cfg):
     now, before = watched_titles(cfg["recent"], cfg["baseline"],
                                  cfg.get("skip_genres") or ())
     if len(now) < cfg["min_recent"] or not before:
-        log("  %d recent and %d earlier titles cached, too few to compare"
-            % (len(now), len(before)))
         return []
     seen_in, older_hits = {}, {}
     for index, (title, author) in enumerate(now):
@@ -2520,6 +2521,11 @@ def search_date_filter(max_age_days):
     """The narrowest search `date` filter that still covers `max_age_days`, or "" for none."""
     return next((name for days, name in SEARCH_DATE_FILTERS
                  if max_age_days and max_age_days <= days), "")
+
+
+def no_topic_is_bursting(lane):
+    """Whether this is a topic_burst lane with no term clearing both floors. Silent: metrics call it."""
+    return lane.get("expand") == "topic_burst" and not bursting_terms(lane["burst"])
 
 
 def expand_by_topic_burst(lane, seeds, room, run):
@@ -4309,8 +4315,11 @@ def lane_video_count(policy, tracked, last_run):
 
 
 def lane_target(lane):
-    """The size to alert against; a compiled lane gets none, its sources set its size."""
-    return 0 if lane["policy"] in COMPILED_POLICIES else lane["size"]
+    """The size to alert against. A compiled lane gets none, its sources set its size;
+    a topic_burst lane gets none while nothing is bursting, because empty is then right."""
+    if lane["policy"] in COMPILED_POLICIES or no_topic_is_bursting(lane):
+        return 0
+    return lane["size"]
 
 
 def last_entry_by_lane():

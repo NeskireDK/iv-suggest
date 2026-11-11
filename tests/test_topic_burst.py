@@ -213,6 +213,33 @@ class SearchDateFilter(unittest.TestCase):
         self.assertEqual("", self.mod.search_date_filter(0))
 
 
+class AlertTarget(unittest.TestCase):
+    """An empty lane is right while nothing bursts, so the alert must not want one filled."""
+
+    def setUp(self):
+        self.mod = load(IV_SUGGEST_ACCOUNT=ME)
+        self.lane = dict(self.mod.DEFAULTS, expand="topic_burst", size=8)
+
+    def test_nothing_bursting_wants_no_videos(self):
+        self.mod.bursting_terms = lambda cfg: []
+        self.assertEqual(0, self.mod.lane_target(self.lane))
+
+    def test_a_bursting_topic_wants_the_full_lane(self):
+        self.mod.bursting_terms = lambda cfg: [("kraken beta", 30.0, 6)]
+        self.assertEqual(8, self.mod.lane_target(self.lane))
+
+    def test_another_lane_never_asks_whether_anything_bursts(self):
+        self.mod.bursting_terms = lambda cfg: self.fail("asked")
+        self.assertEqual(30, self.mod.lane_target(dict(self.mod.DEFAULTS, size=30)))
+
+    def test_the_check_prints_nothing_into_the_metrics_output(self):
+        said = []
+        self.mod.log = said.append
+        self.mod.query = lambda sql: []
+        self.mod.lane_target(self.lane)
+        self.assertEqual([], said)
+
+
 class ItIsWiredIn(unittest.TestCase):
 
     def setUp(self):
