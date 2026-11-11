@@ -303,7 +303,7 @@ both frequent now and rare then. Then one search per term.
 | `recent` | `200` | newest watch-history entries that count as "now" |
 | `baseline` | `1000` | the entries before those, which "now" is rare against |
 | `terms` | `2` | how many topics to search for, so also how many fetches the lane costs |
-| `min_recent` | `3` | a term must appear in at least this many recent titles |
+| `min_recent` | `5` | a term must appear in at least this many recent titles |
 | `min_lift` | `20.0` | and be at least this many times commoner now than before |
 | `skip_genres` | `["Music"]` | watched videos in these categories are left out of both sides: a song played three times is a favourite, not a topic, and a search for it finds no new upload |
 
@@ -311,6 +311,12 @@ both frequent now and rare then. Then one search per term.
 watched twice; a raw count promotes whatever the account always watches. Between
 them they do the work a long stopword list would, which is why the shipped one
 is short.
+
+**Empty when nothing bursts.** A run that finds no term clearing both floors
+sweeps the whole lane out (reason `topic_over`, no cooldown), and `metrics`
+reports `lane_target` 0 for it, so `IvSuggestLaneUnderfilled` stays quiet.
+Measured 2026-11-11, `min_recent: 3` let *"inside"* through on 3 of 181 titles
+and searched up Dutch TV and a football club; at 5 nothing passed that week.
 
 **A title's own channel name is not a topic.** It is cut out before terms are
 taken, because a vlogger who signs every title would otherwise burst on their
